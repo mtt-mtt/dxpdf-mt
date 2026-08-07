@@ -44,6 +44,9 @@ pub enum SubsetOutcome {
     /// `Typeface::to_font_data` returned `None` for a system font — never
     /// observed on macOS/Linux in Phase 0 but possible on other backends.
     NoBytesAvailable { id: TypefaceId },
+    /// A system font-link fallback selected for a missing glyph. Kept whole
+    /// because subsetting can preserve cmap coverage but discard its outline.
+    DynamicFallbackKept { id: TypefaceId },
     /// `fontcull` rejected the input or produced an error during subsetting.
     SubsetterError { id: TypefaceId, message: String },
     /// `FontMgr::new_from_data` failed to build a Skia typeface from the
@@ -143,6 +146,7 @@ impl SubsetOutcome {
             | Self::UnchangedNoSavings { id, .. }
             | Self::UnsupportedFormat { id, .. }
             | Self::NoBytesAvailable { id }
+            | Self::DynamicFallbackKept { id }
             | Self::SubsetterError { id, .. }
             | Self::SkiaRebuildFailed { id }
             | Self::UnshapeableSubset { id, .. } => id,
@@ -255,6 +259,12 @@ pub fn apply(usage: CodepointUsage, registry: &mut FontRegistry) -> SubsetReport
         };
 
         let outcome = process_one(id, &entry, cps, registry);
+        log::debug!(
+            "[subset] id={} origin={:?} -> {:?}",
+            id.0,
+            entry.origin,
+            outcome
+        );
         outcomes.push(outcome);
     }
 
@@ -270,6 +280,9 @@ fn process_one(
     let extracted = match extract(entry, registry) {
         Ok(e) => e,
         Err(ExtractionError::NoBytesAvailable) => return SubsetOutcome::NoBytesAvailable { id },
+        Err(ExtractionError::DynamicFallback) => {
+            return SubsetOutcome::DynamicFallbackKept { id };
+        }
         Err(ExtractionError::UnsupportedFormat(format)) => {
             return SubsetOutcome::UnsupportedFormat { id, format };
         }

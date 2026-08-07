@@ -125,6 +125,7 @@ silently swallowed:
 | `UnchangedNoSavings` | Nothing to drop — every glyph is referenced |
 | `UnsupportedFormat` | WOFF1 or TTC — capability boundary |
 | `NoBytesAvailable` | `to_font_data` returned `None` for a system font |
+| `DynamicFallbackKept` | A system font-link fallback is kept whole |
 | `SubsetterError` | `fontcull` rejected the input |
 | `SkiaRebuildFailed` | Skia would not build a typeface from the output |
 | `UnshapeableSubset` | Rebuilt, but coverage the original had was lost |
@@ -132,6 +133,12 @@ silently swallowed:
 The pass is **best-effort per typeface**: a failure leaves that entry's original
 in place (PDF gets bigger, text still renders) while other typefaces keep their
 savings. Add a state → add a variant.
+
+System font-link faces selected for a missing run-level glyph are pinned under
+a render-local alias and deliberately bypass subsetting. On Windows these faces
+can expose a valid cmap entry while their extracted/subset bytes no longer carry
+the linked glyph outline; retaining the original face prevents silent symbol
+loss.
 
 `SubsetReport::Display` emits the one-line `log::info!` summary.
 

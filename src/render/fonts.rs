@@ -23,6 +23,16 @@ use skia_safe::{Data, Font, FontMgr, FontStyle, Typeface};
 use crate::model::{EmbeddedFont, EmbeddedFontVariant};
 use crate::render::dimension::Pt;
 
+const NOTO_SANS_SYMBOLS_2_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/NotoSansSymbols2-Regular.ttf"
+));
+const NOTO_COLOR_EMOJI_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/fonts/NotoColorEmoji-COLRv1.ttf"
+));
+const BUNDLED_SYMBOL_FAMILY: &str = "__dxpdf_noto_sans_symbols_2";
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /// Stable id for an embedded font registered in the registry.
@@ -46,6 +56,22 @@ impl From<&Typeface> for TypefaceId {
     }
 }
 
+/// Font assets shipped with dxpdf to make symbols and emoji deterministic
+/// across hosts. The enum is also the key used to recover original bytes for
+/// PDF font subsetting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundledFont {
+    NotoSansSymbols2,
+    NotoColorEmoji,
+}
+
+pub fn bundled_font_bytes(font: BundledFont) -> &'static [u8] {
+    match font {
+        BundledFont::NotoSansSymbols2 => NOTO_SANS_SYMBOLS_2_BYTES,
+        BundledFont::NotoColorEmoji => NOTO_COLOR_EMOJI_BYTES,
+    }
+}
+
 /// Single source of truth for "where did this typeface come from?" — drives
 /// byte extraction during subsetting (Embedded → registry's bytes, System →
 /// `Typeface::to_font_data`).
@@ -57,6 +83,14 @@ pub enum TypefaceOrigin {
     /// system default fallback. The id is the original Skia typeface id
     /// at resolution time.
     System { typeface_id: TypefaceId },
+    /// A system face selected for a missing run-level glyph and pinned under
+    /// an internal alias. These composite/linked fallback faces are kept
+    /// whole because rebuilding them from subset bytes can retain the cmap
+    /// entry while losing the glyph outline.
+    SystemFallback { typeface_id: TypefaceId },
+    /// Loaded from a font asset distributed with dxpdf rather than from the
+    /// DOCX or host font collection.
+    Bundled { font: BundledFont },
 }
 
 #[derive(Clone, Debug)]
@@ -374,6 +408,8 @@ pub struct FontRegistry {
     font_mgr: FontMgr,
     embedded: Vec<EmbeddedRecord>,
     embedded_index: HashMap<(String, EmbeddedFontVariant), EmbeddedFontId>,
+    bundled_symbols: OnceCell<Option<TypefaceEntry>>,
+    bundled_color_emoji: OnceCell<Option<TypefaceEntry>>,
     system_face_aliases: OnceCell<FaceAliasIndex>,
     typefaces: RefCell<HashMap<TypefaceKey, TypefaceEntry>>,
 }
@@ -385,6 +421,8 @@ impl FontRegistry {
             font_mgr,
             embedded: Vec::new(),
             embedded_index: HashMap::new(),
+            bundled_symbols: OnceCell::new(),
+            bundled_color_emoji: OnceCell::new(),
             system_face_aliases: OnceCell::new(),
             typefaces: RefCell::new(HashMap::new()),
         }
@@ -615,6 +653,130 @@ impl FontRegistry {
         match_exact(&self.font_mgr, family, style).map(system_entry)
     }
 
+    /// The controlled color emoji face distributed with dxpdf. Keeping this
+    /// outside the host `FontMgr` lookup makes Windows and Linux choose the
+    /// same artwork without installing a system font.
+    pub fn bundled_color_emoji(&self) -> Option<TypefaceEntry> {
+        self.bundled_color_emoji
+            .get_or_init(|| bundled_entry(&self.font_mgr, BundledFont::NotoColorEmoji))
+            .clone()
+    }
+
+    /// Pin business-form symbols to the bundled monochrome Noto face.
+    ///
+    /// U+FE0F explicitly requests emoji presentation and therefore bypasses
+    /// this path. Plain or U+FE0E text-presentation checkbox/check-mark
+    /// characters remain monochrome even when DirectWrite would otherwise
+    /// choose the colored Segoe UI Emoji face.
+    pub fn bundled_symbol_family(&self, style: FontStyle, text: &str) -> Option<String> {
+        let base = monochrome_business_symbol_base(text)?;
+        let entry = self
+            .bundled_symbols
+            .get_or_init(|| bundled_entry(&self.font_mgr, BundledFont::NotoSansSymbols2))
+            .as_ref()?;
+        if entry.typeface.unichar_to_glyph(base as u32 as i32) == 0 {
+            return None;
+        }
+
+        self.typefaces.borrow_mut().insert(
+            TypefaceKey::new(BUNDLED_SYMBOL_FAMILY, style),
+            entry.clone(),
+        );
+        Some(BUNDLED_SYMBOL_FAMILY.to_string())
+    }
+
+    /// Resolve a system typeface for `text` only when the requested typeface
+    /// does not cover every Unicode scalar in that text.
+    ///
+    /// Word performs font fallback below the run level: a run tagged Arial
+    /// can still draw symbols such as U+2610 BALLOT BOX through Segoe UI
+    /// Symbol. Skia's `draw_str` does not do that fallback for a pre-resolved
+    /// [`Typeface`]; missing codepoints map to glyph 0 and silently disappear
+    /// from the PDF. Returning the actual fallback face lets layout split the
+    /// affected grapheme into its own measured fragment, keeping measurement
+    /// and paint on the same typeface.
+    ///
+    /// `None` means either the requested face already covers `text`, or the
+    /// host has no single fallback face that covers the complete grapheme.
+    pub fn resolve_text_fallback(
+        &self,
+        family: &str,
+        style: FontStyle,
+        text: &str,
+    ) -> Option<TypefaceEntry> {
+        let requested = self.resolve(family, style);
+        let codepoints: Vec<_> = text
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .map(|ch| ch as u32 as i32)
+            .collect();
+        if codepoints.is_empty()
+            || codepoints
+                .iter()
+                .all(|&ch| requested.typeface.unichar_to_glyph(ch) != 0)
+        {
+            return None;
+        }
+
+        let missing = codepoints
+            .iter()
+            .copied()
+            .find(|&ch| requested.typeface.unichar_to_glyph(ch) == 0)?;
+        let fallback = self
+            .font_mgr
+            .match_family_style_character(family, style, &["zh-CN", "en-US"], missing)
+            .or_else(|| {
+                self.font_mgr
+                    .match_family_style_character("", style, &["zh-CN", "en-US"], missing)
+            })?;
+
+        if TypefaceId::from(&fallback) == TypefaceId::from(&requested.typeface)
+            || !codepoints
+                .iter()
+                .all(|&ch| fallback.unichar_to_glyph(ch) != 0)
+        {
+            return None;
+        }
+
+        Some(system_entry(fallback))
+    }
+
+    /// Resolve and pin a text fallback face under a render-local family key.
+    ///
+    /// DirectWrite can return a fallback face whose reported `family_name`
+    /// equals the requested family even though it is a distinct typeface.
+    /// Re-resolving that name during paint then selects the original missing-
+    /// glyph face again. The synthetic key keeps the exact selected typeface
+    /// stable through layout, subsetting, and paint without exposing the key
+    /// outside this render.
+    pub fn text_fallback_family(
+        &self,
+        family: &str,
+        style: FontStyle,
+        text: &str,
+    ) -> Option<String> {
+        if let Some(symbol_family) = self.bundled_symbol_family(style, text) {
+            return Some(symbol_family);
+        }
+        let mut entry = self.resolve_text_fallback(family, style, text)?;
+        let id = TypefaceId::from(&entry.typeface);
+        entry.origin = TypefaceOrigin::SystemFallback { typeface_id: id };
+        let alias = format!("__dxpdf_fallback_{}", id.0);
+        log::debug!(
+            "[font] '{}' {:?} missing {:?} -> fallback '{}' as '{}' (id={})",
+            family,
+            style,
+            text,
+            entry.typeface.family_name(),
+            alias,
+            id.0
+        );
+        self.typefaces
+            .borrow_mut()
+            .insert(TypefaceKey::new(&alias, style), entry);
+        Some(alias)
+    }
+
     /// Pre-resolve all four style variants for each family.
     pub fn preload(&self, families: &[String]) {
         let styles = [
@@ -715,6 +877,33 @@ fn system_entry(tf: Typeface) -> TypefaceEntry {
         typeface: tf,
         origin: TypefaceOrigin::System { typeface_id: id },
     }
+}
+
+fn bundled_entry(font_mgr: &FontMgr, font: BundledFont) -> Option<TypefaceEntry> {
+    // SAFETY: `include_bytes!` gives both assets static storage, so the slice
+    // outlives Skia's reference-counted `Data` and every typeface created
+    // from it. Avoiding a copy saves ~12 MB of allocation per conversion.
+    let data = unsafe { Data::new_bytes(bundled_font_bytes(font)) };
+    let typeface = font_mgr.new_from_data(&data, 0);
+    if typeface.is_none() {
+        log::warn!("could not load bundled font asset {font:?}");
+    }
+    typeface.map(|typeface| TypefaceEntry {
+        typeface,
+        origin: TypefaceOrigin::Bundled { font },
+    })
+}
+
+fn monochrome_business_symbol_base(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let base = chars.next()?;
+    if !matches!(
+        base,
+        '\u{2610}' | '\u{2611}' | '\u{2612}' | '\u{2713}' | '\u{2714}'
+    ) {
+        return None;
+    }
+    chars.all(|ch| ch == '\u{FE0E}').then_some(base)
 }
 
 // ─── FontCache (per-component, not per-render) ──────────────────────────────
@@ -881,6 +1070,109 @@ mod tests {
 
     fn fmgr() -> FontMgr {
         FontMgr::new()
+    }
+
+    #[test]
+    fn covered_text_does_not_request_a_fallback_face() {
+        let manager = fmgr();
+        let family = manager
+            .legacy_make_typeface(None::<&str>, FontStyle::normal())
+            .expect("test host must expose a default typeface")
+            .family_name();
+        let registry = FontRegistry::new(manager);
+        assert!(registry
+            .resolve_text_fallback(&family, FontStyle::normal(), "A")
+            .is_none());
+    }
+
+    #[test]
+    fn business_checkboxes_use_bundled_monochrome_symbols() {
+        let registry = FontRegistry::new(fmgr());
+        for symbol in ['\u{2610}', '\u{2611}', '\u{2612}', '\u{2713}', '\u{2714}'] {
+            let family = registry
+                .text_fallback_family("Arial", FontStyle::normal(), &symbol.to_string())
+                .expect("bundled symbol face must cover business check marks");
+            let entry = registry.resolve(&family, FontStyle::normal());
+            assert!(matches!(
+                entry.origin,
+                TypefaceOrigin::Bundled {
+                    font: BundledFont::NotoSansSymbols2
+                }
+            ));
+            assert_ne!(
+                entry.typeface.unichar_to_glyph(symbol as u32 as i32),
+                0,
+                "bundled symbol face must contain {symbol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_presentation_selector_bypasses_monochrome_symbol_face() {
+        let registry = FontRegistry::new(fmgr());
+        assert!(registry
+            .bundled_symbol_family(FontStyle::normal(), "\u{2611}\u{FE0F}")
+            .is_none());
+        assert!(registry
+            .bundled_symbol_family(FontStyle::normal(), "\u{2611}\u{FE0E}")
+            .is_some());
+    }
+
+    #[test]
+    fn bundled_color_emoji_font_loads_and_covers_common_emoji() {
+        let registry = FontRegistry::new(fmgr());
+        let entry = registry
+            .bundled_color_emoji()
+            .expect("bundled Noto Color Emoji must load through Skia");
+        assert!(matches!(
+            entry.origin,
+            TypefaceOrigin::Bundled {
+                font: BundledFont::NotoColorEmoji
+            }
+        ));
+        assert_ne!(
+            entry.typeface.unichar_to_glyph('\u{1F4DE}' as u32 as i32),
+            0
+        );
+        let flag = crate::render::emoji::shape::ClusterShaper::new()
+            .expect("Skia HarfBuzz shaper must be available")
+            .shape(&entry.typeface, "\u{1F1E8}\u{1F1F3}", 32.0)
+            .expect("bundled full COLRv1 font must shape a flag sequence");
+        assert_eq!(flag.glyphs.len(), 1, "flag sequence must form one glyph");
+        assert_ne!(flag.glyphs[0].id, 0, "flag glyph must not be .notdef");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ballot_boxes_fall_back_from_arial_to_a_covering_face() {
+        let registry = FontRegistry::new(fmgr());
+        let requested = registry.resolve("Arial", FontStyle::normal());
+        for symbol in ['\u{2610}', '\u{2611}'] {
+            assert_eq!(
+                requested.typeface.unichar_to_glyph(symbol as u32 as i32),
+                0,
+                "the regression requires Arial to lack {symbol:?}"
+            );
+            let fallback = registry
+                .resolve_text_fallback("Arial", FontStyle::normal(), &symbol.to_string())
+                .expect("Windows must provide a symbol fallback face");
+            assert_ne!(
+                fallback.typeface.unichar_to_glyph(symbol as u32 as i32),
+                0,
+                "the selected fallback must contain {symbol:?}"
+            );
+            let alias = registry
+                .text_fallback_family("Arial", FontStyle::normal(), &symbol.to_string())
+                .expect("fallback face must be pinned under a render-local alias");
+            assert_ne!(
+                registry
+                    .resolve(&alias, FontStyle::normal())
+                    .typeface
+                    .unichar_to_glyph(symbol as u32 as i32),
+                0,
+                "the render-local alias must resolve to the selected fallback face"
+            );
+        }
     }
 
     fn test_alias(family: &str, weight: i32) -> FaceAlias {
@@ -1157,7 +1449,10 @@ mod tests {
 
         for (_, entry) in r.cached_entries() {
             match entry.origin {
-                TypefaceOrigin::Embedded { .. } | TypefaceOrigin::System { .. } => {}
+                TypefaceOrigin::Embedded { .. }
+                | TypefaceOrigin::System { .. }
+                | TypefaceOrigin::SystemFallback { .. }
+                | TypefaceOrigin::Bundled { .. } => {}
             }
         }
     }

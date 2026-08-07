@@ -1,7 +1,7 @@
 //! Emoji rendering pipeline.
 //!
 //! Three stages: cluster classification (UAX #29 + UTS #51) in [`cluster`],
-//! host-OS color emoji typeface resolution in [`resolve`], and Skia
+//! controlled/host color emoji typeface resolution in [`resolve`], and Skia
 //! raster-backend rasterization with a per-render cache in [`raster`];
 //! [`shape`] drives Skia's HarfBuzz so multi-codepoint sequences ligate.
 //!
@@ -11,7 +11,7 @@
 //! a text run.
 //!
 //! The rest of the renderer interacts with this module through typed ADTs;
-//! no string-name allowlists, no font bundling.
+//! no string-name allowlists, with one license-tracked controlled Noto asset.
 
 pub mod cluster;
 pub mod raster;

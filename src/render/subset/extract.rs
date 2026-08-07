@@ -4,14 +4,15 @@
 //! Steps:
 //! 1. Source bytes from the typeface's [`TypefaceOrigin`] —
 //!    `Embedded` reads from the registry (already deobfuscated per
-//!    ECMA-376 §17.8.1.4); `System` calls `Typeface::to_font_data`.
+//!    ECMA-376 §17.8.1.4); `System` calls `Typeface::to_font_data`; dynamic
+//!    system fallback faces are deliberately kept whole.
 //! 2. Classify with [`FontFormat::detect`].
 //! 3. Direct SFNT → return as-is. WOFF2 → decompress via `fontcull`. WOFF1
 //!    and TTC → return [`ExtractionError::UnsupportedFormat`] (documented
 //!    capability boundaries: ECMA-376 forbids WOFF in DOCX, and TTC bytes
 //!    are stripped to single-face by Skia's `openStream` in practice).
 
-use crate::render::fonts::{FontRegistry, TypefaceEntry, TypefaceOrigin};
+use crate::render::fonts::{bundled_font_bytes, FontRegistry, TypefaceEntry, TypefaceOrigin};
 use crate::render::subset::format::{FontFormat, FormatError, SfntFlavor};
 
 /// SFNT bytes verified ready for `fontcull::subset_font_data_unicode`. The
@@ -26,6 +27,8 @@ pub struct ExtractedSfnt {
 pub enum ExtractionError {
     #[error("system typeface returned no font data via Typeface::to_font_data")]
     NoBytesAvailable,
+    #[error("dynamic system fallback face is not safe to subset")]
+    DynamicFallback,
     #[error("font format detection failed: {0}")]
     Format(#[from] FormatError),
     #[error("unsupported font format for subsetting: {0:?}")]
@@ -48,6 +51,8 @@ pub fn extract(
             .to_font_data()
             .map(|(bytes, _ttc_index)| bytes)
             .ok_or(ExtractionError::NoBytesAvailable)?,
+        TypefaceOrigin::SystemFallback { .. } => return Err(ExtractionError::DynamicFallback),
+        TypefaceOrigin::Bundled { font } => bundled_font_bytes(font).to_vec(),
     };
 
     classify_and_unwrap(raw)
@@ -131,6 +136,18 @@ mod tests {
             SfntFlavor::TrueTypeStandard | SfntFlavor::TrueTypeApple | SfntFlavor::OpenTypeCff,
         ));
         assert!(!extracted.bytes.is_empty());
+    }
+
+    #[test]
+    fn dynamic_fallback_origin_is_kept_whole() {
+        let r = registry();
+        let mut entry = r.resolve("UnknownFallbackProbe", FontStyle::normal());
+        let id = crate::render::fonts::TypefaceId::from(&entry.typeface);
+        entry.origin = TypefaceOrigin::SystemFallback { typeface_id: id };
+        assert!(matches!(
+            extract(&entry, &r),
+            Err(ExtractionError::DynamicFallback)
+        ));
     }
 
     #[test]

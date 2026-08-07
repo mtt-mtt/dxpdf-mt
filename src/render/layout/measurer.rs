@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use rustc_hash::FxHashMap;
-use skia_safe::Font;
+use skia_safe::{Font, FontStyle};
 
 use crate::render::dimension::Pt;
 use crate::render::emoji::resolve::{EmojiFamily, EmojiResolver, EmojiTypeface, RegistryLookup};
@@ -176,6 +176,21 @@ impl<'r> TextMeasurer<'r> {
         let font = cache.get(self.registry, family, size, false, false);
         let (_, metrics) = font.metrics();
         Pt::new(-metrics.ascent + metrics.descent + metrics.leading.max(0.0))
+    }
+
+    /// Return the family of a host fallback face when the run's requested
+    /// face cannot render the complete grapheme. The caller then measures and
+    /// paints that grapheme through the returned family, avoiding a layout /
+    /// paint mismatch.
+    pub fn text_fallback_family(&self, text: &str, font_props: &FontProps) -> Option<String> {
+        let style = match (font_props.bold, font_props.italic) {
+            (true, true) => FontStyle::bold_italic(),
+            (true, false) => FontStyle::bold(),
+            (false, true) => FontStyle::italic(),
+            (false, false) => FontStyle::normal(),
+        };
+        self.registry
+            .text_fallback_family(&font_props.family, style, text)
     }
 
     // ─── Emoji pipeline integration ────────────────────────────────────────

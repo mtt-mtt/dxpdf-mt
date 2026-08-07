@@ -82,9 +82,7 @@ impl PackageContents {
                     limit: limits.max_part_uncompressed_bytes,
                 });
             }
-            let declared_total = total_uncompressed
-                .checked_add(declared_size)
-                .unwrap_or(u64::MAX);
+            let declared_total = total_uncompressed.saturating_add(declared_size);
             if declared_total > limits.max_total_uncompressed_bytes {
                 return Err(ParseError::ResourceLimit {
                     kind: ResourceLimitKind::TotalUncompressedBytes,

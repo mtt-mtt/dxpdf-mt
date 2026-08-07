@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::render::dimension::Pt;
 use crate::render::emoji::cluster::{self, EmojiCluster, InlineCluster};
@@ -165,7 +166,15 @@ pub(super) fn emit_text_fragments<F>(
     for cluster in cluster::classify(&cleaned) {
         match cluster {
             InlineCluster::Text(span) => {
-                emit_text_words(span, font, style, hyperlink_url, measure_text, fragments);
+                emit_text_with_glyph_fallback(
+                    span,
+                    font,
+                    style,
+                    hyperlink_url,
+                    measure_text,
+                    measurer,
+                    fragments,
+                );
             }
             InlineCluster::Emoji(emoji) => {
                 emit_emoji_or_fallback(
@@ -179,6 +188,89 @@ pub(super) fn emit_text_fragments<F>(
                 );
             }
         }
+    }
+}
+
+/// Split a plain-text span only where the requested run font lacks a complete
+/// grapheme. Word performs this fallback below the OOXML run level, while
+/// Skia requires the fallback typeface to be selected explicitly. Adjacent
+/// graphemes that resolve to the same family stay coalesced so ordinary text
+/// follows the unchanged word-splitting fast path.
+pub(super) fn emit_text_with_glyph_fallback<F>(
+    text: &str,
+    font: &FontProps,
+    style: &TextRunStyle,
+    hyperlink_url: Option<&LinkTarget>,
+    measure_text: &F,
+    measurer: &TextMeasurer<'_>,
+    fragments: &mut Vec<Fragment>,
+) where
+    F: Fn(&str, &FontProps) -> (Pt, TextMetrics),
+{
+    let mut span_start = 0;
+    let mut span_family: Option<String> = None;
+
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        let fallback = measurer.text_fallback_family(grapheme, font);
+        if offset == 0 {
+            span_family = fallback;
+            continue;
+        }
+        if fallback == span_family {
+            continue;
+        }
+
+        emit_text_family_span(
+            &text[span_start..offset],
+            font,
+            span_family.as_deref(),
+            style,
+            hyperlink_url,
+            measure_text,
+            fragments,
+        );
+        span_start = offset;
+        span_family = fallback;
+    }
+
+    emit_text_family_span(
+        &text[span_start..],
+        font,
+        span_family.as_deref(),
+        style,
+        hyperlink_url,
+        measure_text,
+        fragments,
+    );
+}
+
+fn emit_text_family_span<F>(
+    text: &str,
+    font: &FontProps,
+    fallback_family: Option<&str>,
+    style: &TextRunStyle,
+    hyperlink_url: Option<&LinkTarget>,
+    measure_text: &F,
+    fragments: &mut Vec<Fragment>,
+) where
+    F: Fn(&str, &FontProps) -> (Pt, TextMetrics),
+{
+    if text.is_empty() {
+        return;
+    }
+    if let Some(family) = fallback_family {
+        let mut fallback_font = font.clone();
+        fallback_font.family = Rc::from(family);
+        emit_text_words(
+            text,
+            &fallback_font,
+            style,
+            hyperlink_url,
+            measure_text,
+            fragments,
+        );
+    } else {
+        emit_text_words(text, font, style, hyperlink_url, measure_text, fragments);
     }
 }
 
@@ -225,12 +317,12 @@ pub(super) fn emit_text_words<F>(
     }
 }
 
-/// Resolve a host color emoji typeface for an emoji cluster and emit a
+/// Resolve the controlled color emoji typeface (or a host fallback) for an
+/// emoji cluster and emit a
 /// [`Fragment::Emoji`]. On `Unavailable`, log a one-time warning and route
 /// the cluster through the text path so its codepoints still appear in the
-/// PDF text stream. The converter never ships emoji font bytes and never
-/// degrades silently: it consumes whatever color typeface the host provides,
-/// and logs when there is none so an operator can install one.
+/// PDF text stream. The converter ships a license-tracked Noto color face and
+/// logs if neither that asset nor a host fallback can be loaded.
 pub(super) fn emit_emoji_or_fallback<F>(
     cluster: &EmojiCluster<'_>,
     font: &FontProps,
@@ -272,12 +364,13 @@ pub(super) fn emit_emoji_or_fallback<F>(
         }
         EmojiTypeface::Unavailable { attempted } => {
             measurer.warn_emoji_unavailable_once(cluster.text, &attempted);
-            emit_text_words(
+            emit_text_with_glyph_fallback(
                 cluster.text,
                 font,
                 style,
                 hyperlink_url,
                 measure_text,
+                measurer,
                 fragments,
             );
         }
@@ -386,6 +479,30 @@ mod tests {
             assert_eq!(fragments[0].width().raw(), 20.0);
             assert_eq!(fragments[0].trimmed_width().raw(), 20.0);
         }
+    }
+
+    #[test]
+    fn ballot_box_uses_the_bundled_monochrome_symbol_fragment() {
+        let registry = FontRegistry::new(FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let measure = |text: &str, fp: &FontProps| measurer.measure(text, fp);
+        let mut fragments = Vec::new();
+
+        emit_text_with_glyph_fallback(
+            "\u{2610}",
+            &font("Arial", 12.0),
+            &style(),
+            None,
+            &measure,
+            &measurer,
+            &mut fragments,
+        );
+
+        let Fragment::Text { font, width, .. } = &fragments[0] else {
+            panic!("ballot box must remain searchable text")
+        };
+        assert_eq!(font.family.as_ref(), "__dxpdf_noto_sans_symbols_2");
+        assert!(width.raw() > 0.0);
     }
 
     /// L1 — Run "hi 📞" produces `[Text("hi "), Emoji(...)]` when an emoji

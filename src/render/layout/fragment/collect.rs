@@ -10,8 +10,8 @@ use crate::render::resolve::color::RgbColor;
 
 use super::segment::{build_inline_units, InlineUnit, SegmentPiece};
 use super::text::{
-    emit_emoji_or_fallback, emit_text_fragments, emit_text_words, resolve_highlight_color,
-    TextRunStyle,
+    emit_emoji_or_fallback, emit_text_fragments, emit_text_with_glyph_fallback, emit_text_words,
+    resolve_highlight_color, TextRunStyle,
 };
 use super::{
     font_props_from_run, to_roman_lower, FontProps, Fragment, FragmentBorder, LinkTarget,
@@ -416,7 +416,7 @@ fn instruction_display_format_source<'a>(
     spans
         .iter()
         .find(|(range, _)| range.contains(&display_start))
-        .map(|(_, run)| FieldFormatSource::InstructionDisplayRun(*run))
+        .map(|(_, run)| FieldFormatSource::InstructionDisplayRun(run))
 }
 
 /// Locate the formatting source for the complex field whose `Separate`
@@ -753,16 +753,31 @@ where
                                     Some(text_part),
                                     measure_text,
                                 );
-                                // Pre-classified text: bypass cluster::classify
-                                // by going straight to the word-split path.
-                                emit_text_words(
-                                    text_part,
-                                    &font,
-                                    &text_style,
-                                    hyperlink_url,
-                                    measure_text,
-                                    &mut fragments,
-                                );
+                                // The segmenter already classified emoji, but
+                                // ordinary text can still need run-level glyph
+                                // fallback (for example ballot-box symbols in
+                                // Arial). Keep it out of emoji classification
+                                // while preserving the missing-glyph check.
+                                if let Some(measurer) = ctx.measurer {
+                                    emit_text_with_glyph_fallback(
+                                        text_part,
+                                        &font,
+                                        &text_style,
+                                        hyperlink_url,
+                                        measure_text,
+                                        measurer,
+                                        &mut fragments,
+                                    );
+                                } else {
+                                    emit_text_words(
+                                        text_part,
+                                        &font,
+                                        &text_style,
+                                        hyperlink_url,
+                                        measure_text,
+                                        &mut fragments,
+                                    );
+                                }
                             }
                         }
                         SegmentPiece::Emoji {

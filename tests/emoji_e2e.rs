@@ -25,10 +25,8 @@ fn parse_fixture() -> dxpdf::model::Document {
     dxpdf::docx::parse(&bytes).unwrap_or_else(|e| panic!("parse {FIXTURE}: {e}"))
 }
 
-/// True when this host actually resolves a color emoji typeface. Tests that
-/// assert the emoji-rasterization branch only fire on hosts that have one
-/// (the converter bundles no emoji fonts — it uses the host's or none).
-fn host_has_color_emoji() -> bool {
+/// True when the controlled bundled face or a host fallback resolves.
+fn has_color_emoji() -> bool {
     use dxpdf::render::emoji::resolve::{resolve, EmojiTypeface, RegistryLookup};
     use dxpdf::render::fonts::FontRegistry;
     let registry = FontRegistry::new(skia_safe::FontMgr::new());
@@ -104,7 +102,7 @@ fn e1_digits_are_not_rasterized() {
 /// `>= 2` and the keycap was missing.
 #[test]
 fn e2_real_emojis_reach_rasterizer() {
-    if !host_has_color_emoji() {
+    if !has_color_emoji() {
         eprintln!("skipping E2: no color emoji typeface on this host");
         return;
     }
@@ -151,7 +149,7 @@ fn e2_real_emojis_reach_rasterizer() {
 /// at a single point and viewers render nothing.
 #[test]
 fn e3_emoji_command_rects_are_non_degenerate() {
-    if !host_has_color_emoji() {
+    if !has_color_emoji() {
         eprintln!("skipping E3: no color emoji typeface on this host");
         return;
     }
@@ -186,7 +184,7 @@ fn e3_emoji_command_rects_are_non_degenerate() {
 /// or PDF-structure breakage from the emoji image-embedding path.
 #[test]
 fn e4_full_pdf_round_trip() {
-    if !host_has_color_emoji() {
+    if !has_color_emoji() {
         eprintln!("skipping E4: no color emoji typeface on this host");
         return;
     }
@@ -283,7 +281,7 @@ fn underline_explicit_none_emits_no_underline_commands() {
 /// reaches the painter as one `DrawCommand::EmojiCluster`.
 #[test]
 fn e_keycap_1_reassembles_into_one_emoji_command() {
-    if !host_has_color_emoji() {
+    if !has_color_emoji() {
         eprintln!("skipping E_keycap_1: no color emoji typeface on this host");
         return;
     }
@@ -311,7 +309,7 @@ fn e_keycap_1_reassembles_into_one_emoji_command() {
 /// known limitation that previously rendered them as text glyphs.
 #[test]
 fn e_keycap_2_no_constituent_text_remains() {
-    if !host_has_color_emoji() {
+    if !has_color_emoji() {
         eprintln!("skipping E_keycap_2: no color emoji typeface on this host");
         return;
     }
@@ -342,7 +340,7 @@ fn e_keycap_2_no_constituent_text_remains() {
 /// the body area: 👋, 1️⃣ raster, 👍🏿. Was 2 before the reassembly fix.
 #[test]
 fn e_keycap_3_pdf_image_count() {
-    if !host_has_color_emoji() {
+    if !has_color_emoji() {
         eprintln!("skipping E_keycap_3: no color emoji typeface on this host");
         return;
     }

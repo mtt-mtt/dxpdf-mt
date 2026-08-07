@@ -150,20 +150,27 @@ differs, check this chain first.
   embeds an emoji font, so a DOCX-embedded "Segoe UI Emoji" carries the right
   family name but **no color glyphs**. It must not satisfy emoji resolution.
 
-  This is a deliberate portability boundary, not an oversight: a document that
-  ships its own emoji font does not get it back, and the same document renders
-  with different emoji artwork on macOS, Windows and Linux. It applies only to
-  the color-emoji path — ordinary embedded text fonts (§17.8) are honoured
-  normally. See `src/render/emoji/resolve.rs`.
+  dxpdf now supplies a controlled Noto Color Emoji face before consulting this
+  host-only fallback. A document that embeds its own emoji font still does not
+  get the stripped color tables back, but the bundled face makes the normal
+  result identical on Windows, macOS, and Linux. It applies only to the
+  color-emoji path; ordinary embedded text fonts are honoured normally. See
+  `src/render/emoji/resolve.rs` and `assets/fonts/README.md`.
+
+Plain business-form symbols are a separate text-presentation path. `☐`, `☑`,
+`☒`, `✓`, and `✔` use the bundled monochrome Noto Sans Symbols 2 face so host
+fallback cannot turn them into colored platform emoji. U+FE0F explicitly opts
+back into the color-emoji path; U+FE0E stays monochrome.
 
 ## Typeface identity and the subsetting contract
 
 `TypefaceId` wraps Skia's `Typeface::unique_id` and is the join key with the
 subsetting pass's `CodepointUsage`.
 
-`TypefaceOrigin` records where a typeface came from — `Embedded { id }` or
-`System { typeface_id }` — which is what tells byte extraction whether to read
-the registry's own bytes or call `to_font_data`.
+`TypefaceOrigin` records whether a typeface came from the DOCX, the host, a
+dynamic system fallback, or a bundled controlled asset. That origin tells byte
+extraction whether to read registry bytes, call `to_font_data`, keep a linked
+fallback whole, or use the license-tracked bundled bytes.
 
 `replace_typeface_by_id` exists because **one typeface can be reachable from
 several cache keys**. A document using both `Calibri` and `Carlito` has two

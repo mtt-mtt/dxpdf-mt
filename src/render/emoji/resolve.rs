@@ -4,12 +4,13 @@
 //! OOXML §17.3.2.26), find the best color emoji typeface available on the
 //! host. The resolution chain is:
 //!
-//! 1. The requested family, if any.
-//! 2. The host OS's native color emoji families, in priority order.
+//! 1. The controlled Noto Color Emoji asset bundled with dxpdf.
+//! 2. The requested family, if the bundled asset cannot be loaded.
+//! 3. The host OS's native color emoji families, in priority order.
 //!
 //! When nothing matches we return [`EmojiTypeface::Unavailable`] with the
-//! full attempted list so the caller can log loudly. We never bundle fonts
-//! and never fall back to a non-emoji typeface — substituting (e.g.) Arial
+//! full attempted list so the caller can log loudly. We never fall back to a
+//! non-emoji typeface — substituting (e.g.) Arial
 //! for a missing color emoji font would produce visible junk, not a
 //! degradation the user can act on.
 
@@ -122,6 +123,13 @@ pub enum EmojiTypeface {
 /// a deterministic mock.
 pub trait EmojiTypefaceLookup {
     fn lookup(&self, family: EmojiFamily) -> Option<TypefaceEntry>;
+
+    /// Optional application-controlled face that takes precedence over host
+    /// fonts. Test lookups default to `None`; production supplies the Noto
+    /// face bundled with dxpdf.
+    fn preferred(&self) -> Option<(EmojiFamily, TypefaceEntry)> {
+        None
+    }
 }
 
 /// Production lookup adapter — bridges [`EmojiTypefaceLookup`] to
@@ -141,6 +149,12 @@ impl EmojiTypefaceLookup for RegistryLookup<'_> {
         self.registry
             .resolve_system_only(family.family_name(), FontStyle::normal())
     }
+
+    fn preferred(&self) -> Option<(EmojiFamily, TypefaceEntry)> {
+        self.registry
+            .bundled_color_emoji()
+            .map(|entry| (EmojiFamily::NotoColorEmoji, entry))
+    }
 }
 
 // ─── Resolution ──────────────────────────────────────────────────────────────
@@ -148,10 +162,15 @@ impl EmojiTypefaceLookup for RegistryLookup<'_> {
 /// Stateless resolution. Returns either the first successful match or
 /// `Unavailable` with the complete attempted list.
 ///
-/// Order: requested family first (deduped against the host default chain),
-/// then [`EmojiFamily::host_default`] in declaration order.
+/// Order: application-controlled preferred face, requested family (deduped
+/// against the host default chain), then [`EmojiFamily::host_default`] in
+/// declaration order.
 pub fn resolve(lookup: &impl EmojiTypefaceLookup, requested: Option<EmojiFamily>) -> EmojiTypeface {
     let mut attempted: Vec<EmojiFamily> = Vec::new();
+
+    if let Some((family, entry)) = lookup.preferred() {
+        return EmojiTypeface::Resolved { family, entry };
+    }
 
     if let Some(family) = requested {
         attempted.push(family);
@@ -264,10 +283,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_registry_prefers_bundled_noto_color_emoji() {
+        let registry = FontRegistry::new(FontMgr::new());
+        let result = resolve(
+            &RegistryLookup {
+                registry: &registry,
+            },
+            Some(EmojiFamily::SegoeUiEmoji),
+        );
+        assert!(matches!(
+            result,
+            EmojiTypeface::Resolved {
+                family: EmojiFamily::NotoColorEmoji,
+                entry: TypefaceEntry {
+                    origin: TypefaceOrigin::Bundled {
+                        font: crate::render::fonts::BundledFont::NotoColorEmoji
+                    },
+                    ..
+                }
+            }
+        ));
+    }
+
     // ─── Real-host tests (platform-conditional) ──────────────────────────────
 
-    /// R1 — macOS host with no requested family resolves to AppleColorEmoji.
-    /// Apple Color Emoji is always present on macOS, so no runtime guard.
+    /// R1 — the controlled bundled face wins over the macOS host default.
     #[cfg(target_os = "macos")]
     #[test]
     fn r1_macos_default_resolves_to_apple_color_emoji() {
@@ -280,16 +321,15 @@ mod tests {
             matches!(
                 result,
                 EmojiTypeface::Resolved {
-                    family: EmojiFamily::AppleColorEmoji,
+                    family: EmojiFamily::NotoColorEmoji,
                     ..
                 }
             ),
-            "expected Resolved(AppleColorEmoji), got {result:?}"
+            "expected controlled bundled NotoColorEmoji, got {result:?}"
         );
     }
 
-    /// R2 — macOS host, requested SegoeUiEmoji (Windows family) is missing,
-    /// falls through to AppleColorEmoji.
+    /// R2 — the controlled bundled face also wins over a requested host face.
     #[cfg(target_os = "macos")]
     #[test]
     fn r2_macos_falls_back_when_requested_missing() {
@@ -302,17 +342,16 @@ mod tests {
             matches!(
                 result,
                 EmojiTypeface::Resolved {
-                    family: EmojiFamily::AppleColorEmoji,
+                    family: EmojiFamily::NotoColorEmoji,
                     ..
                 }
             ),
-            "expected fallback to AppleColorEmoji, got {result:?}"
+            "expected controlled bundled NotoColorEmoji, got {result:?}"
         );
     }
 
-    /// R3 — Linux host with Noto Color Emoji installed resolves to
-    /// NotoColorEmoji. Skipped if Noto is absent (no font bundling — we
-    /// don't fail CI for hosts without the optional package).
+    /// R3 — Linux host lookup remains a valid secondary fallback after the
+    /// controlled face.
     #[cfg(target_os = "linux")]
     #[test]
     fn r3_linux_noto_when_installed() {
