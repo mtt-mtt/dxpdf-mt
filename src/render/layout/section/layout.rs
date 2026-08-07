@@ -598,8 +598,17 @@ fn paragraph_keep_next(block: &LayoutBlock) -> bool {
     matches!(block, LayoutBlock::Paragraph { style, .. } if style.keep_next)
 }
 
+fn paragraph_has_inline_page_break(block: &LayoutBlock) -> bool {
+    matches!(
+        block,
+        LayoutBlock::Paragraph { fragments, .. }
+            if fragments.iter().any(Fragment::is_page_break)
+    )
+}
+
 fn starts_keep_next_chain(blocks: &[LayoutBlock], block_idx: usize) -> bool {
     paragraph_keep_next(&blocks[block_idx])
+        && !paragraph_has_inline_page_break(&blocks[block_idx])
         && (block_idx == 0
             || matches!(
                 blocks[block_idx],
@@ -617,11 +626,14 @@ fn keep_next_terminal_table(blocks: &[LayoutBlock], start: usize) -> Option<&Lay
     while let Some(block) = blocks.get(index) {
         match block {
             LayoutBlock::Paragraph {
+                fragments,
                 style,
                 page_break_before,
                 ..
             } => {
-                if index > start && *page_break_before {
+                if fragments.iter().any(Fragment::is_page_break)
+                    || (index > start && *page_break_before)
+                {
                     return None;
                 }
                 if !style.keep_next {
@@ -703,7 +715,9 @@ fn measure_keep_next_group(
                 footnotes,
                 ..
             } => {
-                if index > start && *page_break_before {
+                if fragments.iter().any(Fragment::is_page_break)
+                    || (index > start && *page_break_before)
+                {
                     return None;
                 }
                 let effective = style.clone_for_layout();
@@ -1214,6 +1228,69 @@ fn prefix_adjusted_head(
     }
 }
 
+fn is_plain_empty_spacer(block: &LayoutBlock) -> bool {
+    matches!(
+        block,
+        LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before: false,
+            footnotes,
+            floating_images,
+            floating_shapes,
+        } if fragments.iter().all(|fragment| {
+            matches!(fragment, Fragment::LineBreak { .. } | Fragment::Bookmark { .. })
+        })
+            && style.borders.is_none()
+            && style.shading.is_none()
+            && footnotes.is_empty()
+            && floating_images.is_empty()
+            && floating_shapes.is_empty()
+    )
+}
+
+fn is_break_only_paragraph(block: &LayoutBlock) -> bool {
+    matches!(
+        block,
+        LayoutBlock::Paragraph { fragments, .. }
+            if fragments.iter().any(Fragment::is_page_break)
+                && fragments.iter().all(|fragment| {
+                    matches!(fragment, Fragment::PageBreak { .. } | Fragment::Bookmark { .. })
+                })
+    )
+}
+
+fn starts_with_inline_page_break(block: &LayoutBlock) -> bool {
+    matches!(
+        block,
+        LayoutBlock::Paragraph { fragments, .. }
+            if fragments
+                .iter()
+                .find(|fragment| !matches!(fragment, Fragment::Bookmark { .. }))
+                .is_some_and(Fragment::is_page_break)
+    )
+}
+
+/// Pure empty paragraphs immediately before an explicit page break are
+/// page-tail padding in Word. They may consume the remaining body height, but
+/// they do not create an intervening blank page before either
+/// `pageBreakBefore` or a break-only paragraph.
+fn followed_by_explicit_page_break(blocks: &[LayoutBlock], block_idx: usize) -> bool {
+    blocks[block_idx + 1..]
+        .iter()
+        .find(|block| !is_plain_empty_spacer(block))
+        .is_some_and(|block| {
+            starts_with_inline_page_break(block)
+                || matches!(
+                    block,
+                    LayoutBlock::Paragraph {
+                        page_break_before: true,
+                        ..
+                    }
+                )
+        })
+}
+
 /// Where a section begins in the document's page sequence.
 ///
 /// The three travel together because they answer one question — which page
@@ -1312,10 +1389,11 @@ pub(crate) fn layout_section_with_clearance(
         // forces this block onto a new page.
         if state.pending_page_break {
             state.pending_page_break = false;
-            if state.cursor_y > state.page_top {
-                state.push_new_page(block_idx, &ctx);
-                state.prev_space_after = Pt::ZERO;
-            }
+            // An explicit page break always advances exactly one page. In
+            // particular, a second break at the top of a page must preserve
+            // the intervening blank page instead of being collapsed.
+            state.push_new_page(block_idx, &ctx);
+            state.prev_space_after = Pt::ZERO;
         }
         refresh_page_replay_checkpoint(
             &state,
@@ -1451,7 +1529,8 @@ pub(crate) fn layout_section_with_clearance(
                     })
                     .unwrap_or("");
                 log::debug!(
-                    "[layout] block[{block_idx}] para style={:?} text={:?} cursor_y={:.1} col={} floats={} fwd_floats={}",
+                    "[layout] page={} block[{block_idx}] para style={:?} text={:?} cursor_y={:.1} col={} floats={} fwd_floats={}",
+                    state.page_index + 1,
                     effective_style.style_id, &first_text[..first_text.len().min(30)],
                     state.cursor_y.raw(), state.current_col,
                     state.page_floats.len(), state.current_page_abs_floats.len()
@@ -1536,6 +1615,40 @@ pub(crate) fn layout_section_with_clearance(
                 // after processing all chunks, so it can be deferred to the
                 // next block.
                 let mut unresolved_page_break = false;
+
+                // Word keeps a plain empty spacer immediately following a
+                // body table on the table's page when that spacer is the only
+                // block that no longer fits. The invisible paragraph mark may
+                // extend into the bottom margin; moving it to the next page
+                // creates a spurious blank line above the following content.
+                // Do not apply this to decorated paragraphs or paragraphs that
+                // own notes/floats, because those have visible page semantics.
+                let current_is_plain_empty_spacer = is_plain_empty_spacer(block);
+                // Word leaves the final invisible paragraph mark on the
+                // source page when the mark starts inside the text area but
+                // its line box crosses the bottom boundary.  This is not
+                // limited to the structural mark after a table: form-like
+                // documents commonly use an ordinary empty paragraph as
+                // response space. Moving that paragraph to the next page
+                // creates a visible blank band above the next question.
+                //
+                // The start-position guard matters for consecutive empty
+                // paragraphs. Only the mark that straddles the boundary may
+                // remain; a later mark whose start is already outside the
+                // text area must advance normally, otherwise an arbitrary run
+                // of empty paragraphs could disappear into the bottom margin.
+                let page_tail_empty_spacer_may_overflow =
+                    current_is_plain_empty_spacer && state.cursor_y < state.bottom;
+                let trailing_table_spacer_may_overflow = current_is_plain_empty_spacer
+                    && block_idx > 0
+                    && matches!(blocks[block_idx - 1], LayoutBlock::Table { .. });
+                let explicit_break_spacer_may_overflow = current_is_plain_empty_spacer
+                    && followed_by_explicit_page_break(blocks, block_idx);
+                // A break-only paragraph has no visible line of its own. Keep
+                // its bookmark/paragraph mark on the source page at the page
+                // tail and let the explicit break advance following content
+                // exactly once. Moving the mark first creates an empty page.
+                let break_only_paragraph_may_overflow = is_break_only_paragraph(block);
 
                 for (page_chunk_idx, page_chunk) in page_chunks.iter().enumerate() {
                     if page_chunk_idx > 0 {
@@ -1694,6 +1807,10 @@ pub(crate) fn layout_section_with_clearance(
                             // Column/page overflow: advance column, then page.
                             if state.cursor_y + para.size.height > state.bottom
                                 && state.cursor_y > state.column_top
+                                && !page_tail_empty_spacer_may_overflow
+                                && !trailing_table_spacer_may_overflow
+                                && !explicit_break_spacer_may_overflow
+                                && !break_only_paragraph_may_overflow
                             {
                                 // `placed` (which borrows `effective_style`) is no
                                 // longer needed; drop it before mutating the style
@@ -1728,6 +1845,16 @@ pub(crate) fn layout_section_with_clearance(
                                 } else {
                                     state.push_new_page(block_idx, &ctx);
                                 }
+                                // §17.3.1.33: Word suppresses space-before
+                                // when an ordinary paragraph is moved to the
+                                // top of a page/column by automatic overflow.
+                                // Explicit `pageBreakBefore` is handled before
+                                // this path and deliberately preserves it.
+                                // Re-place with the destination style so the
+                                // suppressed spacing is removed from both the
+                                // paragraph box and any paragraph-relative
+                                // float origin.
+                                effective_style.space_before = Pt::ZERO;
                                 let destination_para_start_y = state.cursor_y;
                                 // Re-register this paragraph's own floats at the
                                 // destination when none of its content has landed

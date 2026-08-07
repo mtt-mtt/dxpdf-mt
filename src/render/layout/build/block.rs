@@ -18,6 +18,46 @@ use super::floating::{extract_floating_images, AnchorFrame};
 use super::table::build_table;
 use super::{BuildContext, BuildState};
 
+fn should_apply_document_grid(
+    in_table: bool,
+    adjust_line_height_in_table: bool,
+    line_spacing: &crate::render::layout::paragraph::LineSpacingRule,
+    snap_to_grid: bool,
+) -> bool {
+    (!in_table || adjust_line_height_in_table)
+        && !matches!(
+            line_spacing,
+            crate::render::layout::paragraph::LineSpacingRule::Exact(_)
+        )
+        && snap_to_grid
+}
+
+/// Resolve the font used by an empty paragraph's paragraph mark.
+///
+/// §17.3.1.29 gives the otherwise empty paragraph a real line whose metrics
+/// come from `w:pPr/w:rPr`.  The mark participates in the normal run-property
+/// cascade; applying only its size while retaining the style's family makes
+/// missing-font substitutions use the wrong line box and compresses forms by
+/// several points for every spacer paragraph.
+fn paragraph_mark_font(
+    paragraph: &Paragraph,
+    resolved: &crate::render::resolve::ResolvedDocument,
+    run_defaults: &model::RunProperties,
+    default_family: String,
+    default_size: Pt,
+) -> (String, Pt) {
+    let mut mark = paragraph.mark_run_properties.clone().unwrap_or_default();
+    merge_run_properties(&mut mark, run_defaults);
+    if let Some(theme) = resolved.theme.as_ref() {
+        crate::render::resolve::fonts::resolve_font_set_themes(&mut mark.fonts, theme);
+    }
+    let family = crate::render::resolve::fonts::effective_font(&mark.fonts)
+        .map(str::to_owned)
+        .unwrap_or(default_family);
+    let size = mark.font_size.map(Pt::from).unwrap_or(default_size);
+    (family, size)
+}
+
 /// Recursively process a single model block into a layout block.
 ///
 /// Returns `None` for drop cap paragraphs (consumed by the next paragraph)
@@ -85,18 +125,14 @@ pub(super) fn build_paragraph_block(
     // Headers/footers have their own injection in
     // `build_header_footer_content` (§17.10.1) and do not call this.
     if fragments.is_empty() {
-        let (family, mut size, ..) = resolve_paragraph_defaults(
+        let (family, size, _, _, run_defaults) = resolve_paragraph_defaults(
             p,
             ctx.resolved,
             table_style.is_some(),
             state.shape_default_text_color,
             state.shape_default_font_family.as_deref(),
         );
-        if let Some(ref mrp) = p.mark_run_properties {
-            if let Some(fs) = mrp.font_size {
-                size = Pt::from(fs);
-            }
-        }
+        let (family, size) = paragraph_mark_font(p, ctx.resolved, &run_defaults, family, size);
         let line_height = ctx.measurer.default_line_height(&family, size);
         fragments.push(Fragment::LineBreak { line_height });
     }
@@ -210,7 +246,48 @@ pub(super) fn build_paragraph_block(
         super::convert::paragraph_locale(p, ctx.resolved),
         outline,
     );
-    style.style_id = p.style_id.clone();
+    // §17.6.5 / §17.3.1.33: Exact spacing and snapToGrid=false override the
+    // document grid. Auto and AtLeast do not: Word combines Auto with the grid
+    // multiplier and AtLeast with the grid-backed natural line box. This is
+    // deliberately represented as distinct layout rules instead of rounding
+    // the already-resolved line height to a grid multiple; that older shortcut
+    // over-expanded proportional spacing throughout the corpus.
+    //
+    // The grid does not affect table-cell lines unless the document
+    // compatibility setting `adjustLineHeightInTable` is enabled. `cond` is
+    // the reliable table-context marker here: a table can have no style, so
+    // `table_style.is_some()` cannot be used to decide whether this paragraph
+    // belongs to a cell.
+    let in_table = cond.is_some();
+    if should_apply_document_grid(
+        in_table,
+        ctx.resolved.adjust_line_height_in_table,
+        &style.line_spacing,
+        merged_props.snap_to_grid.unwrap_or(true),
+    ) {
+        if let Some(pitch) = state.doc_grid_line_pitch {
+            use crate::render::layout::paragraph::LineSpacingRule;
+            style.line_spacing = match style.line_spacing {
+                LineSpacingRule::Auto(multiplier) => {
+                    LineSpacingRule::GridAuto { pitch, multiplier }
+                }
+                LineSpacingRule::AtLeast(minimum) => {
+                    LineSpacingRule::GridAtLeast { pitch, minimum }
+                }
+                LineSpacingRule::Exact(_) => style.line_spacing,
+                LineSpacingRule::Grid { .. }
+                | LineSpacingRule::GridAuto { .. }
+                | LineSpacingRule::GridAtLeast { .. } => style.line_spacing,
+            };
+        }
+    }
+    // §17.7.4.17: omitting pStyle selects the document's default paragraph
+    // style. Keep that effective id in layout metadata so contextualSpacing
+    // can recognise adjacent implicit-Normal paragraphs as the same style.
+    style.style_id = p
+        .style_id
+        .clone()
+        .or_else(|| ctx.resolved.default_paragraph_style_id.clone());
 
     // Attach pending drop cap to this paragraph.
     if let Some(dc) = pending_dropcap.take() {
@@ -481,6 +558,7 @@ pub(super) fn build_fragments(
         &mut state.endnote_counter,
         state.field_ctx,
     );
+    crate::render::layout::vml::populate_inline_graphics(&mut fragments, ctx, state);
     populate_image_data(&mut fragments, ctx.media());
     populate_underline_metrics(&mut fragments, ctx.measurer);
 
@@ -514,6 +592,7 @@ mod tests {
             endnotes: HashMap::new(),
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
+            adjust_line_height_in_table: false,
         }
     }
 
@@ -597,6 +676,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_paragraph_uses_the_paragraph_marks_font_family_and_size() {
+        let resolved = empty_resolved();
+        let mut paragraph = para(vec![]);
+        paragraph.mark_run_properties = Some(model::RunProperties {
+            fonts: model::FontSet {
+                ascii: model::FontSlot::from_name("Century Schoolbook"),
+                ..Default::default()
+            },
+            font_size: Some(Dimension::new(24)),
+            ..Default::default()
+        });
+        let (family, size) = paragraph_mark_font(
+            &paragraph,
+            &resolved,
+            &model::RunProperties::default(),
+            "Calibri".to_owned(),
+            Pt::new(11.0),
+        );
+        assert_eq!(family, "Century Schoolbook");
+        assert_eq!(size, Pt::new(12.0));
+    }
+
+    #[test]
     fn paragraph_with_content_gets_no_injected_line_break() {
         let resolved = empty_resolved();
         with_ctx(&resolved, |ctx, state| {
@@ -618,6 +720,36 @@ mod tests {
                     .iter()
                     .any(|f| matches!(f, Fragment::LineBreak { .. })),
                 "no LineBreak injected when the paragraph has runs"
+            );
+        });
+    }
+
+    #[test]
+    fn omitted_paragraph_style_uses_the_default_style_id_for_layout() {
+        let mut resolved = empty_resolved();
+        resolved.default_paragraph_style_id = Some(model::StyleId::new("Normal"));
+        resolved.styles.insert(
+            model::StyleId::new("Normal"),
+            resolved_style(model::ParagraphProperties::default()),
+        );
+
+        with_ctx(&resolved, |ctx, state| {
+            let mut pending = None;
+            let block = build_paragraph_block(
+                &para(vec![text_run("implicit Normal")]),
+                ctx,
+                state,
+                &mut pending,
+                None,
+                None,
+            )
+            .expect("lays out");
+            let LayoutBlock::Paragraph { style, .. } = block else {
+                panic!("expected a paragraph block");
+            };
+            assert_eq!(
+                style.style_id.as_ref().map(model::StyleId::as_str),
+                Some("Normal")
             );
         });
     }
@@ -744,5 +876,20 @@ mod tests {
                 "direct pPr wins over every table layer"
             );
         });
+    }
+
+    #[test]
+    fn document_grid_respects_table_compatibility_and_paragraph_overrides() {
+        use crate::render::layout::paragraph::LineSpacingRule;
+
+        let auto = LineSpacingRule::Auto(1.5);
+        let at_least = LineSpacingRule::AtLeast(Pt::new(12.0));
+        let exact = LineSpacingRule::Exact(Pt::new(18.0));
+        assert!(should_apply_document_grid(false, false, &auto, true));
+        assert!(should_apply_document_grid(false, false, &at_least, true));
+        assert!(!should_apply_document_grid(false, false, &exact, true));
+        assert!(!should_apply_document_grid(true, false, &auto, true));
+        assert!(should_apply_document_grid(true, true, &auto, true));
+        assert!(!should_apply_document_grid(true, true, &auto, false));
     }
 }

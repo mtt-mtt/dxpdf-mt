@@ -79,6 +79,17 @@ pub(super) fn resolve_paragraph_defaults(
         }
     }
 
+    // A paragraph mark's run properties (`w:pPr/w:rPr`) are direct
+    // formatting for the paragraph and therefore sit above the paragraph
+    // style/document defaults.  They are especially important for legacy
+    // complex fields (for example MACROBUTTON placeholders) that have no
+    // result run from which to recover character formatting.
+    if let Some(mark) = &para.mark_run_properties {
+        let mut merged_mark = mark.clone();
+        crate::render::resolve::properties::merge_run_properties(&mut merged_mark, &run_defaults);
+        run_defaults = merged_mark;
+    }
+
     // Merge doc defaults as lowest-priority fallback (unless deferred for table cascade).
     if !defer_doc_defaults {
         merge_paragraph_properties(&mut para_props, &resolved.doc_defaults_paragraph);
@@ -864,6 +875,7 @@ mod tests {
             endnotes: HashMap::new(),
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
+            adjust_line_height_in_table: false,
         }
     }
 

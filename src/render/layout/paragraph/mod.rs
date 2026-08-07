@@ -1735,6 +1735,77 @@ mod tests {
 
     // ── Absolute position tabs (§17.3.1.30) ──
 
+    #[test]
+    fn resolve_line_height_snaps_up_to_document_grid() {
+        assert_eq!(
+            resolve_line_height(
+                Pt::new(14.0),
+                Pt::new(17.1),
+                &LineSpacingRule::Grid {
+                    pitch: Pt::new(15.6),
+                },
+                crate::render::layout::ShapeAutoFit::NONE,
+            )
+            .raw(),
+            31.2,
+            "font metrics taller than one pitch must consume two grid lines"
+        );
+        assert_eq!(
+            resolve_line_height(
+                Pt::new(18.0),
+                Pt::new(18.0),
+                &LineSpacingRule::Grid {
+                    pitch: Pt::new(15.6),
+                },
+                crate::render::layout::ShapeAutoFit::NONE,
+            )
+            .raw(),
+            31.2
+        );
+        let auto_grid = resolve_line_height(
+            Pt::new(12.0),
+            Pt::new(12.0),
+            &LineSpacingRule::GridAuto {
+                pitch: Pt::new(15.6),
+                multiplier: 1.5,
+            },
+            crate::render::layout::ShapeAutoFit::NONE,
+        )
+        .raw();
+        assert!(
+            (auto_grid - 23.4).abs() < 0.001,
+            "Auto multiplies the grid pitch instead of rounding 18pt to 31.2pt"
+        );
+        assert_eq!(
+            resolve_line_height(
+                Pt::new(12.0),
+                Pt::new(12.0),
+                &LineSpacingRule::GridAtLeast {
+                    pitch: Pt::new(15.6),
+                    minimum: Pt::new(20.0),
+                },
+                crate::render::layout::ShapeAutoFit::NONE,
+            )
+            .raw(),
+            20.0,
+            "AtLeast may remain between grid pitches when its minimum is larger"
+        );
+        assert_eq!(
+            resolve_line_height(
+                Pt::new(27.0),
+                Pt::new(27.0),
+                &LineSpacingRule::GridAuto {
+                    pitch: Pt::new(15.6),
+                    multiplier: 1.5,
+                },
+                crate::render::layout::ShapeAutoFit::NONE,
+            )
+            .raw(),
+            31.2,
+            "large glyph boxes still reserve whole grid pitches"
+        );
+    }
+
     fn ptab_frag(align: PTabAlignment, relative_to: PTabRelativeTo) -> Fragment {
         Fragment::PTab {
             align,

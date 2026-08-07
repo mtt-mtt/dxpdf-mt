@@ -54,6 +54,9 @@ impl BuildContext<'_> {
 pub struct BuildState {
     /// Page configuration for the current section.
     pub page_config: crate::render::layout::page::PageConfig,
+    /// Active section's explicit line-grid pitch. Only `docGrid type="lines"`
+    /// is enabled; ambiguous/default grid modes remain unchanged.
+    pub doc_grid_line_pitch: Option<Pt>,
     /// §17.11.12: footnote display numbering plus the ordered record of which
     /// notes each paragraph referenced. Advanced by `collect_fragments` and
     /// drained per paragraph — see
@@ -110,6 +113,13 @@ pub fn build_section_blocks(
     ctx: &BuildContext,
     state: &mut BuildState,
 ) -> BuiltSection {
+    state.doc_grid_line_pitch = section
+        .properties
+        .doc_grid
+        .filter(|grid| grid.grid_type == Some(model::DocGridType::Lines))
+        .and_then(|grid| grid.line_pitch)
+        .map(Pt::from)
+        .filter(|pitch| *pitch > Pt::ZERO);
     let mut pending_dropcap: Option<crate::render::layout::paragraph::DropCapInfo> = None;
     let blocks: Vec<LayoutBlock> = section
         .blocks
@@ -371,6 +381,7 @@ mod tests {
             endnotes: HashMap::new(),
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
+            adjust_line_height_in_table: false,
         }
     }
 

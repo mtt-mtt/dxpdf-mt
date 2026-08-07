@@ -230,6 +230,46 @@ pub(crate) fn layout_table_paginated_with_page_heights(
 
     let groups = build_row_groups(rows, &measured);
 
+    // A vertical merge is normally kept as one atomic row group. That rule
+    // cannot be satisfied when the span itself is taller than a complete
+    // continuation page: emitting the oversized group on one slice lets the
+    // PDF page clip every later row. Word instead continues such merged cells
+    // across page boundaries. Fall back to physical row boundaries only for
+    // that impossible-to-keep-together case; the loop below also handles the
+    // common case where the first row fits the remaining page but the full
+    // span does not.
+    let continuation_height = page_height_for_slice(1);
+    let mut effective_groups = Vec::with_capacity(groups.len());
+    for group in groups {
+        let body_capacity = if group.start >= header_count {
+            continuation_height - header_height
+        } else {
+            continuation_height
+        };
+        if group.end - group.start > 1 && group.height > body_capacity {
+            log::debug!(
+                "[table] split oversized vMerge group {}-{} ({:.1}pt at {:.1}pt page body) at row boundaries",
+                group.start,
+                group.end,
+                group.height.raw(),
+                body_capacity.raw(),
+            );
+            for row_idx in group.start..group.end {
+                effective_groups.push(grid::RowGroup {
+                    start: row_idx,
+                    end: row_idx + 1,
+                    height: measured.rows[row_idx].height + measured.rows[row_idx].border_gap_below,
+                    // Splitting inside one row that participates in vMerge
+                    // still needs a full merged-cell continuation model.
+                    // Row-boundary pagination is sufficient for this fallback.
+                    splittable: false,
+                });
+            }
+        } else {
+            effective_groups.push(group);
+        }
+    }
+
     // Each slice is a list of items to emit in order: either a range of
     // measured rows (the common case) or a custom (split) row with its own
     // MeasuredRow data.
@@ -237,11 +277,45 @@ pub(crate) fn layout_table_paginated_with_page_heights(
     let mut current_slice: Vec<SliceItem> = Vec::new();
     let mut remaining = available_height;
 
-    for group in &groups {
+    let mut pending_groups: std::collections::VecDeque<_> = effective_groups.into();
+    while let Some(group) = pending_groups.pop_front() {
         if group.height <= remaining {
             current_slice.push(SliceItem::Range(group.start..group.end));
             remaining -= group.height;
             continue;
+        }
+
+        // A normal-sized vMerge span can still straddle a page when its first
+        // physical row fits in the remaining space but the whole span does
+        // not. Word keeps that row on the current page and continues the
+        // merged cell at the next row boundary. Do not do this when the first
+        // row itself cannot fit: the atomic span then moves intact, preserving
+        // the historical no-mid-cell rule and the single-row test contract.
+        if group.end - group.start > 1
+            && group.start >= header_count
+            // Explicit row geometry is the Word-compatible signal used by
+            // long regulatory tables that split a merged label at row edges.
+            // Synthetic/legacy spans without row heights retain the stricter
+            // atomic behavior exercised by the renderer's vMerge contract.
+            && rows[group.start].height_rule.is_some()
+        {
+            let first_end = group.start + 1;
+            let first_height =
+                measured.rows[group.start].height + measured.rows[group.start].border_gap_below;
+            if first_height <= remaining {
+                current_slice.push(SliceItem::Range(group.start..first_end));
+                remaining -= first_height;
+                for row_idx in (first_end..group.end).rev() {
+                    pending_groups.push_front(grid::RowGroup {
+                        start: row_idx,
+                        end: row_idx + 1,
+                        height: measured.rows[row_idx].height
+                            + measured.rows[row_idx].border_gap_below,
+                        splittable: false,
+                    });
+                }
+                continue;
+            }
         }
 
         // §17.4.49: header rows are atomic with respect to splitting — they
@@ -692,6 +766,36 @@ mod tests {
             result.size.height.raw(),
             40.0,
             "min height > content height"
+        );
+    }
+
+    #[test]
+    fn exact_row_height_reserves_word_bottom_cell_margin() {
+        let mut cell = simple_cell("x");
+        cell.margins = PtEdgeInsets::new(Pt::new(3.0), Pt::ZERO, Pt::new(4.0), Pt::ZERO);
+        let rows = vec![TableRowInput {
+            cells: vec![cell],
+            height_rule: Some(RowHeightRule::Exact(Pt::new(38.0))),
+            is_header: None,
+            cant_split: None,
+            grid_before: 0,
+            border_overrides: None,
+        }];
+
+        let result = layout_table(
+            &rows,
+            &[Pt::new(200.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            result.size.height.raw(),
+            42.0,
+            "Word adds the largest bottom cell margin after exact trHeight"
         );
     }
 
@@ -1672,6 +1776,72 @@ mod tests {
             .filter(|c| matches!(c, DrawCommand::Text { .. }))
             .count();
         assert_eq!(count0, 0, "vMerge span must not split across pages");
+    }
+
+    #[test]
+    fn oversized_vmerge_span_falls_back_to_row_boundary_pagination() {
+        let make_cell = |text: &str, vertical_merge| TableCellInput {
+            blocks: if text.is_empty() {
+                vec![]
+            } else {
+                vec![LayoutBlock::Paragraph {
+                    fragments: vec![text_frag(text, 20.0)],
+                    style: ParagraphStyle::default(),
+                    page_break_before: false,
+                    footnotes: vec![],
+                    floating_images: vec![],
+                    floating_shapes: vec![],
+                }]
+            },
+            margins: PtEdgeInsets::ZERO,
+            grid_span: 1,
+            shading: None,
+            cell_borders: None,
+            vertical_merge,
+            vertical_align: CellVAlign::Top,
+        };
+        let rows: Vec<TableRowInput> = (0..5)
+            .map(|row_idx| TableRowInput {
+                cells: vec![
+                    make_cell(
+                        if row_idx == 0 { "merged" } else { "" },
+                        Some(if row_idx == 0 {
+                            VerticalMergeState::Restart
+                        } else {
+                            VerticalMergeState::Continue
+                        }),
+                    ),
+                    make_cell(&format!("row{row_idx}"), None),
+                ],
+                height_rule: None,
+                is_header: None,
+                cant_split: None,
+                grid_before: 0,
+                border_overrides: None,
+            })
+            .collect();
+
+        let slices = layout_table_paginated(
+            &rows,
+            &[Pt::new(40.0), Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(35.0),
+                page_height: Pt::new(35.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert!(slices.len() >= 3, "the five-row span must continue");
+        let total_text = slices
+            .iter()
+            .flat_map(|slice| &slice.commands)
+            .filter(|command| matches!(command, DrawCommand::Text { .. }))
+            .count();
+        assert_eq!(total_text, 6, "merged label and all five rows survive");
     }
 
     /// Regression: a table whose every row has `tblHeader=1` (a Word template

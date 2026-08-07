@@ -14,6 +14,7 @@ pub mod page;
 pub mod paragraph;
 pub mod section;
 pub mod table;
+pub(crate) mod vml;
 
 use crate::render::dimension::Pt;
 use crate::render::geometry::{PtEdgeInsets, PtSize};

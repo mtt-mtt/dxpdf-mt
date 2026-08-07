@@ -313,9 +313,19 @@ pub(super) fn measure_table_rows(
             grid_idx += span;
         }
 
+        // Word's exact-row layout reserves the largest effective bottom cell
+        // margin after the declared `trHeight`. This is observable in Word and
+        // WPS pagination: a 38 pt exact row with the common 4 pt bottom cell
+        // margin occupies 42 pt. Keeping the margin outside the exact content
+        // budget also prevents the last line from colliding with the row edge.
+        let bottom_margin = row
+            .cells
+            .iter()
+            .map(|cell| cell.margins.bottom)
+            .fold(Pt::ZERO, Pt::max);
         match row.height_rule {
             Some(RowHeightRule::AtLeast(min_h)) => max_height = max_height.max(min_h),
-            Some(RowHeightRule::Exact(h)) => max_height = h,
+            Some(RowHeightRule::Exact(h)) => max_height = h + bottom_margin,
             None => {}
         }
 

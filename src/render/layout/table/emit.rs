@@ -34,6 +34,7 @@ pub(super) fn emit_table_rows(
 ) {
     let num_rows = measured.rows.len();
     let range_start = row_range.start;
+    let range_end = row_range.end;
     for row_idx in row_range {
         let mr = &measured.rows[row_idx];
         let is_first_in_range = row_idx == range_start;
@@ -54,7 +55,7 @@ pub(super) fn emit_table_rows(
                 None
             },
             has_reserved_bottom_gap,
-            Some((measured, rows, row_idx)),
+            Some((measured, rows, row_idx, Some(range_end))),
         );
     }
 }
@@ -101,7 +102,7 @@ fn emit_one_row(
     // For vMerge=Restart cells, resolve the full merged span height.
     // `None` disables the lookup (used for split rows and for standalone
     // emission paths that don't carry a merge context).
-    vmerge_ctx: Option<(&MeasuredTable, &[TableRowInput], usize)>,
+    vmerge_ctx: Option<(&MeasuredTable, &[TableRowInput], usize, Option<usize>)>,
 ) {
     // §17.4.44: the row's box starts one cell-spacing below the cursor; its
     // content box is what remains. Both are zero-cost when no spacing is set.
@@ -115,7 +116,9 @@ fn emit_one_row(
         // merged cell was coloured across its first row only.
         let effective_h = if cell_input.vertical_merge == Some(VerticalMergeState::Restart) {
             vmerge_ctx
-                .map(|(m, rs, row_idx)| merged_span_height(m, rs, row_idx, entry.grid_col))
+                .map(|(m, rs, row_idx, visible_end)| {
+                    merged_span_height(m, rs, row_idx, entry.grid_col, visible_end)
+                })
                 .unwrap_or(row_height)
         } else {
             row_height
@@ -170,8 +173,10 @@ fn emit_one_row(
             bufs.content_commands.push(cmd);
         }
 
-        let continues_below = vmerge_ctx.is_some_and(|(_, rows, row_idx)| {
-            row_idx + 1 < rows.len() && is_vmerge_continue(&rows[row_idx + 1], entry.grid_col)
+        let continues_below = vmerge_ctx.is_some_and(|(_, rows, row_idx, visible_end)| {
+            row_idx + 1 < rows.len()
+                && is_vmerge_continue(&rows[row_idx + 1], entry.grid_col)
+                && visible_end.is_none_or(|end| row_idx + 1 < end)
         });
         let bottom_border_gap = if has_reserved_bottom_gap {
             if continues_below {
@@ -210,13 +215,17 @@ fn merged_span_height(
     rows: &[TableRowInput],
     start_row: usize,
     grid_col: usize,
+    visible_end: Option<usize>,
 ) -> Pt {
     // The span starts below its own leading gap; every row it swallows
     // contributes that row's full height, gap included, because a merged cell
     // covers the spacing between the rows it spans.
     let mut total = measured.rows[start_row].height - measured.rows[start_row].leading_gap;
     let mut row = start_row + 1;
-    while row < rows.len() && is_vmerge_continue(&rows[row], grid_col) {
+    while row < rows.len()
+        && visible_end.is_none_or(|end| row < end)
+        && is_vmerge_continue(&rows[row], grid_col)
+    {
         total += measured.rows[row - 1].border_gap_below;
         total += measured.rows[row].height;
         row += 1;

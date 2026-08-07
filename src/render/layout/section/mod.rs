@@ -9,11 +9,74 @@ mod layout;
 mod stacker;
 mod types;
 
+use super::fragment::Fragment;
+
 pub use layout::layout_section;
 pub(crate) use layout::layout_section_with_clearance;
 pub(crate) use layout::SectionStart;
 pub use stacker::{stack_blocks, CellLine, StackResult};
 pub use types::*;
+
+/// Suppress a plain structural terminal paragraph mark.
+///
+/// Word stores a section break on the final paragraph mark of the outgoing
+/// section. A plain, otherwise empty mark does not create a separate page when
+/// it reaches the bottom margin; the following next/odd/even-page section
+/// break is the boundary. Laying out that invisible mark as an ordinary empty
+/// paragraph can create a spurious blank page before the next section.
+///
+/// The caller invokes this either when another hard-break section follows or
+/// for the final section, whose terminal mark has no following visible
+/// content to separate. Decorated or object-owning terminal paragraphs are
+/// kept.
+pub(crate) fn suppress_plain_terminal_section_mark(blocks: &mut Vec<LayoutBlock>) {
+    loop {
+        let Some(LayoutBlock::Paragraph {
+            fragments: terminal_fragments,
+            style: terminal_style,
+            page_break_before: false,
+            footnotes,
+            floating_images,
+            floating_shapes,
+        }) = blocks.last()
+        else {
+            return;
+        };
+
+        let terminal_has_tab = terminal_fragments
+            .iter()
+            .any(|fragment| matches!(fragment, Fragment::Tab { .. }));
+        let tabs_have_no_visible_leaders = !terminal_has_tab
+            || terminal_style
+                .tabs
+                .iter()
+                .all(|tab| tab.leader == crate::model::TabLeader::None);
+        let tabs_draw_no_vertical_rules = terminal_style
+            .tabs
+            .iter()
+            .all(|tab| tab.alignment != crate::model::TabAlignment::Bar);
+        let terminal_is_plain_section_mark = terminal_fragments.iter().all(|fragment| {
+            matches!(
+                fragment,
+                Fragment::LineBreak { .. } | Fragment::Bookmark { .. } | Fragment::Tab { .. }
+            ) || matches!(fragment, Fragment::Text { text, .. } if text.is_empty())
+        }) && tabs_have_no_visible_leaders
+            && tabs_draw_no_vertical_rules
+            && terminal_style.borders.is_none()
+            && terminal_style.shading.is_none()
+            && footnotes.is_empty()
+            && floating_images.is_empty()
+            && floating_shapes.is_empty();
+        if !terminal_is_plain_section_mark {
+            return;
+        }
+
+        // Some producers pad a section with several empty paragraphs. They
+        // are all invisible terminal marks: retaining all but the last still
+        // creates a contentless overflow page in a grid-aligned document.
+        blocks.pop();
+    }
+}
 
 // ── Footnote rendering constants ─────────────────────────────────────────────
 
@@ -45,7 +108,7 @@ mod tests {
     use crate::render::layout::fragment::{FontProps, TextMetrics};
     use crate::render::layout::header_footer::HeaderFooterClearance;
     use crate::render::layout::page::PageConfig;
-    use crate::render::layout::paragraph::ParagraphStyle;
+    use crate::render::layout::paragraph::{ParagraphStyle, TabStopDef};
     use crate::render::layout::table::{
         TableBorderConfig, TableBorderLine, TableBorderStyle, TableCellInput, TableRowInput,
     };
@@ -133,6 +196,19 @@ mod tests {
     fn para_block(text: &str, width: f32) -> LayoutBlock {
         LayoutBlock::Paragraph {
             fragments: vec![text_frag(text, width, 14.0)],
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        }
+    }
+
+    fn empty_spacer_block(height: f32) -> LayoutBlock {
+        LayoutBlock::Paragraph {
+            fragments: vec![Fragment::LineBreak {
+                line_height: Pt::new(height),
+            }],
             style: ParagraphStyle::default(),
             page_break_before: false,
             footnotes: vec![],
@@ -349,6 +425,332 @@ mod tests {
             .filter(|c| matches!(c, DrawCommand::Text { .. }))
             .count();
         assert_eq!(text_count, 1);
+    }
+
+    #[test]
+    fn consecutive_break_only_paragraphs_preserve_blank_page() {
+        let break_only = || LayoutBlock::Paragraph {
+            fragments: vec![Fragment::PageBreak {
+                line_height: Pt::new(14.0),
+            }],
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        };
+        let blocks = vec![
+            para_block("before", 30.0),
+            break_only(),
+            break_only(),
+            para_block("after", 30.0),
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 3, "the middle page must remain blank");
+        assert!(pages[1].commands.is_empty());
+    }
+
+    #[test]
+    fn hard_section_break_suppresses_plain_terminal_section_mark() {
+        let mut blocks = vec![
+            LayoutBlock::Paragraph {
+                fragments: vec![
+                    Fragment::Bookmark {
+                        name: "before".into(),
+                    },
+                    Fragment::PageBreak {
+                        line_height: Pt::new(14.0),
+                    },
+                ],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+            empty_spacer_block(14.0),
+        ];
+
+        suppress_plain_terminal_section_mark(&mut blocks);
+
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the redundant section-mark paragraph is removed"
+        );
+    }
+
+    #[test]
+    fn hard_section_break_suppresses_plain_mark_without_an_inline_break() {
+        let mut blocks = vec![para_block("before", 30.0), empty_spacer_block(14.0)];
+
+        suppress_plain_terminal_section_mark(&mut blocks);
+
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn terminal_structural_padding_is_suppressed_as_a_run() {
+        let mut blocks = vec![
+            para_block("before", 30.0),
+            empty_spacer_block(14.0),
+            empty_spacer_block(14.0),
+            empty_spacer_block(14.0),
+        ];
+
+        suppress_plain_terminal_section_mark(&mut blocks);
+
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn terminal_tab_only_padding_without_a_leader_is_suppressed() {
+        let Fragment::Text { font, color, .. } = text_frag("seed", 10.0, 14.0) else {
+            unreachable!();
+        };
+        let tab_only = LayoutBlock::Paragraph {
+            fragments: vec![Fragment::Tab {
+                line_height: Pt::new(14.0),
+                font,
+                color,
+                fitting_width: None,
+            }],
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        };
+        let mut blocks = vec![para_block("before", 30.0), tab_only];
+
+        suppress_plain_terminal_section_mark(&mut blocks);
+
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn terminal_zero_length_text_section_mark_is_suppressed() {
+        let mut blocks = vec![
+            para_block("before", 30.0),
+            LayoutBlock::Paragraph {
+                fragments: vec![text_frag("", 0.0, 14.0)],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+        ];
+
+        suppress_plain_terminal_section_mark(&mut blocks);
+
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn unused_dotted_tab_stop_does_not_make_a_section_mark_visible() {
+        let mut structural_mark = empty_spacer_block(14.0);
+        let LayoutBlock::Paragraph { style, .. } = &mut structural_mark else {
+            unreachable!();
+        };
+        style.tabs.push(TabStopDef {
+            position: Pt::new(448.0),
+            alignment: crate::model::TabAlignment::Right,
+            leader: crate::model::TabLeader::Dot,
+        });
+        let mut blocks = vec![para_block("before", 30.0), structural_mark];
+
+        suppress_plain_terminal_section_mark(&mut blocks);
+
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn hard_section_break_keeps_decorated_terminal_paragraph() {
+        let mut decorated = empty_spacer_block(14.0);
+        let LayoutBlock::Paragraph { style, .. } = &mut decorated else {
+            unreachable!();
+        };
+        style.shading = Some(RgbColor::BLACK);
+        let mut blocks = vec![
+            LayoutBlock::Paragraph {
+                fragments: vec![Fragment::PageBreak {
+                    line_height: Pt::new(14.0),
+                }],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+            decorated,
+        ];
+
+        suppress_plain_terminal_section_mark(&mut blocks);
+
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn empty_page_tail_before_page_break_before_does_not_create_blank_page() {
+        let mut destination = para_block("after", 30.0);
+        let LayoutBlock::Paragraph {
+            page_break_before, ..
+        } = &mut destination
+        else {
+            unreachable!();
+        };
+        *page_break_before = true;
+        let blocks = vec![
+            para_block("before", 30.0),
+            empty_spacer_block(60.0),
+            empty_spacer_block(20.0),
+            destination,
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(
+            pages.len(),
+            2,
+            "the page-tail padding must not become page 2"
+        );
+        assert!(pages[1].commands.iter().any(
+            |command| matches!(command, DrawCommand::Text { text, .. } if text.as_ref() == "after")
+        ));
+    }
+
+    #[test]
+    fn empty_page_tail_before_break_only_paragraph_does_not_create_blank_page() {
+        let blocks = vec![
+            para_block("before", 30.0),
+            empty_spacer_block(60.0),
+            empty_spacer_block(20.0),
+            LayoutBlock::Paragraph {
+                fragments: vec![Fragment::PageBreak {
+                    line_height: Pt::new(14.0),
+                }],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+            para_block("after", 30.0),
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(
+            pages.len(),
+            2,
+            "the page-tail padding must not become page 2"
+        );
+        assert!(pages[1].commands.iter().any(
+            |command| matches!(command, DrawCommand::Text { text, .. } if text.as_ref() == "after")
+        ));
+    }
+
+    #[test]
+    fn empty_page_tail_before_leading_inline_break_does_not_create_blank_page() {
+        let blocks = vec![
+            para_block("before", 30.0),
+            empty_spacer_block(60.0),
+            empty_spacer_block(20.0),
+            LayoutBlock::Paragraph {
+                fragments: vec![
+                    Fragment::PageBreak {
+                        line_height: Pt::new(14.0),
+                    },
+                    text_frag("after", 30.0, 14.0),
+                ],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2, "the leading break must advance only once");
+        assert!(pages[1].commands.iter().any(
+            |command| matches!(command, DrawCommand::Text { text, .. } if text.as_ref() == "after")
+        ));
+    }
+
+    #[test]
+    fn break_only_keep_next_paragraph_at_page_tail_does_not_create_blank_page() {
+        let blocks = vec![
+            empty_spacer_block(70.0),
+            LayoutBlock::Paragraph {
+                fragments: vec![
+                    Fragment::Bookmark {
+                        name: "page-tail".into(),
+                    },
+                    Fragment::PageBreak {
+                        line_height: Pt::new(14.0),
+                    },
+                ],
+                style: ParagraphStyle {
+                    keep_next: true,
+                    keep_lines: true,
+                    ..Default::default()
+                },
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+            styled_para_block("after", true, false),
+            one_column_table(&[("row", false)]),
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2, "the break must advance only once");
+        let per_page = texts_per_page(&pages);
+        assert!(per_page[0].iter().all(|text| text != "after"));
+        assert!(per_page[1].iter().any(|text| text == "after"));
+        assert!(per_page[1].iter().any(|text| text == "row"));
     }
 
     // ── §17.3.1.14 keepLines / §17.3.1.44 widow-orphan: across-page splitting ──
@@ -829,6 +1231,96 @@ mod tests {
 
         assert_eq!(page1_texts.len(), 5, "5 paras fit on page 1 (5*14=70 < 80)");
         assert_eq!(page2_texts.len(), 1, "1 para on page 2");
+    }
+
+    #[test]
+    fn trailing_table_empty_spacer_stays_on_source_page_when_it_overflows() {
+        let table = one_column_table(&[
+            ("r1", false),
+            ("r2", false),
+            ("r3", false),
+            ("r4", false),
+            ("r5", false),
+        ]);
+        let blocks = vec![table, empty_spacer_block(14.0), para_block("next", 30.0)];
+        let config = small_config();
+        let pages = layout_section(&blocks, &config, None, Pt::ZERO, Pt::new(14.0), None);
+        let fresh = layout_section(
+            &[para_block("next", 30.0)],
+            &config,
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        let next_y = pages[1]
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Text { text, position, .. } if text.as_ref() == "next" => {
+                    Some(position.y)
+                }
+                _ => None,
+            })
+            .expect("following paragraph should render on page 2");
+        let fresh_y = fresh[0]
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Text { text, position, .. } if text.as_ref() == "next" => {
+                    Some(position.y)
+                }
+                _ => None,
+            })
+            .expect("fresh-page paragraph should render");
+        assert_eq!(next_y, fresh_y, "the spacer must not consume page-2 height");
+    }
+
+    #[test]
+    fn ordinary_empty_spacer_straddling_page_tail_stays_on_source_page() {
+        // Five 14pt lines leave 10pt in the 80pt body. The following 14pt
+        // empty paragraph begins on page 1 but its invisible mark crosses the
+        // bottom boundary. Word consumes that mark on page 1; moving it would
+        // leave a 14pt blank band above `next` on page 2.
+        let mut blocks: Vec<_> = (0..5).map(|i| para_block(&format!("p{i}"), 30.0)).collect();
+        blocks.push(empty_spacer_block(14.0));
+        blocks.push(para_block("next", 30.0));
+
+        let config = small_config();
+        let pages = layout_section(&blocks, &config, None, Pt::ZERO, Pt::new(14.0), None);
+        let fresh = layout_section(
+            &[para_block("next", 30.0)],
+            &config,
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        let next_y = pages[1]
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Text { text, position, .. } if text.as_ref() == "next" => {
+                    Some(position.y)
+                }
+                _ => None,
+            })
+            .expect("following paragraph should render on page 2");
+        let fresh_y = fresh[0]
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Text { text, position, .. } if text.as_ref() == "next" => {
+                    Some(position.y)
+                }
+                _ => None,
+            })
+            .expect("fresh-page paragraph should render");
+        assert_eq!(next_y, fresh_y, "the page-tail spacer stays on page 1");
     }
 
     #[test]
@@ -1971,6 +2463,45 @@ mod tests {
             heading_y.raw() > config.margins.top.raw() + 20.0,
             "space_before should be preserved for pageBreakBefore: y={}",
             heading_y.raw(),
+        );
+    }
+
+    #[test]
+    fn space_before_is_suppressed_after_automatic_page_overflow() {
+        let heading = || LayoutBlock::Paragraph {
+            fragments: vec![text_frag("heading", 50.0, 14.0)],
+            style: ParagraphStyle {
+                space_before: Pt::new(24.0),
+                ..Default::default()
+            },
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        };
+        let mut blocks: Vec<_> = (0..5).map(|i| para_block(&format!("p{i}"), 30.0)).collect();
+        blocks.push(heading());
+
+        let config = small_config();
+        let pages = layout_section(&blocks, &config, None, Pt::ZERO, Pt::new(14.0), None);
+        let fresh = layout_section(&[heading()], &config, None, Pt::ZERO, Pt::new(14.0), None);
+
+        assert_eq!(pages.len(), 2);
+        let y = |page: &crate::render::layout::draw_command::LayoutedPage| {
+            page.commands
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::Text { text, position, .. } if text.as_ref() == "heading" => {
+                        Some(position.y)
+                    }
+                    _ => None,
+                })
+                .expect("heading should be emitted")
+        };
+        assert_eq!(
+            y(&pages[1]),
+            y(&fresh[0]),
+            "automatic overflow starts at the fresh-page position"
         );
     }
 

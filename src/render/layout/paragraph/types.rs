@@ -210,6 +210,17 @@ pub enum LineSpacingRule {
     Exact(Pt),
     /// Minimum line height in points.
     AtLeast(Pt),
+    /// Default automatic line spacing snapped upward to an integer number of
+    /// section document-grid lines (§17.3.1.34 / §17.6.5).
+    Grid { pitch: Pt },
+    /// Proportional line spacing while `snapToGrid` is active. Word applies
+    /// the multiplier to the grid pitch, while still reserving whole grid
+    /// lines for glyphs or inline objects taller than one pitch.
+    GridAuto { pitch: Pt, multiplier: f32 },
+    /// Minimum line spacing while `snapToGrid` is active. The authored
+    /// minimum may sit between grid lines; only the natural glyph/object box
+    /// is rounded upward to whole grid pitches.
+    GridAtLeast { pitch: Pt, minimum: Pt },
 }
 
 /// Result of laying out a paragraph.
