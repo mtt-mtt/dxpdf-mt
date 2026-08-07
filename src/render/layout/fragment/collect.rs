@@ -98,6 +98,49 @@ pub(super) fn run_border_to_fragment(
     })
 }
 
+/// Split one OOXML run when its text switches between the East Asian and
+/// Latin/high-ANSI font slots. Neutral punctuation and whitespace stay with
+/// the nearest preceding strong script; leading neutral characters follow the
+/// first strong script.
+fn split_text_for_font_slots(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut current: Option<bool> = None;
+
+    for (index, ch) in text.char_indices() {
+        // Unicode blocks also contain CJK punctuation. Treat punctuation as
+        // neutral before deciding which OOXML font slot owns the character,
+        // otherwise a full-width colon can spuriously start an East Asian run.
+        let next = if !ch.is_alphanumeric() {
+            None
+        } else if crate::render::resolve::fonts::is_east_asian_char(ch) {
+            Some(true)
+        } else {
+            Some(false)
+        };
+        let Some(next) = next else { continue };
+        match current {
+            None => current = Some(next),
+            Some(previous) if previous != next => {
+                if index > start {
+                    parts.push(&text[start..index]);
+                }
+                start = index;
+                current = Some(next);
+            }
+            Some(_) => {}
+        }
+    }
+
+    if start < text.len() {
+        parts.push(&text[start..]);
+    }
+    if parts.is_empty() && !text.is_empty() {
+        parts.push(text);
+    }
+    parts
+}
+
 /// §17.7.2: resolve the effective styling of a single run by walking the
 /// cascade (direct → character style → paragraph run defaults), then
 /// translating to render-side `FontProps` + `TextRunStyle`.
@@ -122,6 +165,7 @@ fn resolve_run_styling<F>(
     paragraph_run_defaults: Option<&RunProperties>,
     theme: Option<&crate::model::Theme>,
     auto_fit: crate::render::layout::ShapeAutoFit,
+    text_hint: Option<&str>,
     measure_text: &F,
 ) -> (FontProps, TextRunStyle)
 where
@@ -144,7 +188,18 @@ where
         crate::render::resolve::properties::merge_run_properties(&mut effective_props, para_run);
     }
 
+    let selected_family = text_hint.and_then(|text| {
+        crate::render::resolve::fonts::effective_font_for_text(
+            &effective_props.fonts,
+            text,
+            effective_props.lang.as_ref(),
+            theme,
+        )
+    });
     let mut font = font_props_from_run(&effective_props, default_family, default_size, auto_fit);
+    if let Some(family) = selected_family {
+        font.family = Rc::from(family);
+    }
     let color = effective_props
         .color
         .map(|c| {
@@ -223,6 +278,59 @@ fn evaluate_field_instruction(
     }
 }
 
+/// Return the visible display text carried by a legacy `MACROBUTTON` field.
+///
+/// Word uses these fields as editable placeholders in many Chinese thesis
+/// templates.  The placeholder is stored in the field *instruction* rather
+/// than in a result run, and these fields commonly omit `separate`, so the
+/// normal dynamic-field path would discard it.  A macro cannot be executed by
+/// a PDF renderer; showing its display argument is the safe and useful Word
+/// compatible fallback.  Other unknown fields continue to use their existing
+/// result content (if any).
+fn fallback_field_instruction_text(instruction: &crate::field::FieldInstruction) -> Option<String> {
+    let crate::field::FieldInstruction::Unknown { field_type, raw } = instruction else {
+        return None;
+    };
+    if !field_type.eq_ignore_ascii_case("MACROBUTTON") {
+        return None;
+    }
+
+    // `MACROBUTTON <macro-name> <display-text>`; preserve whitespace inside
+    // the display text, while tolerating the extra spacing emitted by Word.
+    let mut parts = raw.trim().splitn(2, char::is_whitespace);
+    let _keyword = parts.next()?;
+    let rest = parts.next()?.trim_start();
+    let mut macro_and_display = rest.splitn(2, char::is_whitespace);
+    let _macro_name = macro_and_display.next()?;
+    let display = macro_and_display.next()?.trim();
+    if display.is_empty() {
+        return None;
+    }
+
+    // Some producers quote the display argument.  Word's bracketed Chinese
+    // placeholders are not quotes and must remain visible.
+    let display = display
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .unwrap_or(display);
+    (!display.is_empty()).then(|| display.to_owned())
+}
+
+/// Pick a safe fallback face for field text when the field has no result run
+/// from which to inherit `w:rPr`. Legacy Chinese templates put their visible
+/// placeholder in `MACROBUTTON` instruction text, so the paragraph's Latin
+/// default is not sufficient for Han characters in that display string.
+fn field_fallback_family<'a>(text: &str, default_family: &'a str) -> &'a str {
+    if text
+        .chars()
+        .any(crate::render::resolve::fonts::is_east_asian_char)
+    {
+        "SimSun"
+    } else {
+        default_family
+    }
+}
+
 /// §17.16.19 MERGEFORMAT — source of formatting for a complex field's
 /// substituted dynamic value. Resolved when the `Separate` fldChar is
 /// reached so the lookup honors the OOXML "first result run wins" rule
@@ -236,10 +344,79 @@ pub(super) enum FieldFormatSource<'a> {
     /// `End` at the outer field's nesting level. Its `<w:rPr>` provides
     /// font family, size, bold, italic, color per §17.16.19.
     FirstResultRun(&'a TextRun),
+    /// Run containing the first visible character of a legacy MACROBUTTON's
+    /// display argument. Such fields commonly have no result zone, so the
+    /// instruction run is the only faithful source of character formatting.
+    InstructionDisplayRun(&'a TextRun),
     /// No result TextRun is present at the outer level. The
     /// substitution falls back to paragraph default font properties at
     /// emission time.
     ParagraphDefaults,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComplexFieldPhase {
+    Instruction,
+    Result,
+}
+
+/// Mutable state for one level of a complex field.
+///
+/// Complex fields may be nested inside another field's result zone. Keeping a
+/// frame per level prevents the inner `Begin`/`Separate`/`End` sequence from
+/// overwriting the outer instruction, substitution, and formatting source.
+struct ComplexFieldFrame<'a> {
+    phase: ComplexFieldPhase,
+    instruction: String,
+    instruction_format_spans: Vec<(std::ops::Range<usize>, &'a TextRun)>,
+    substitution_pending: Option<String>,
+    substitution_emitted: bool,
+    had_separate: bool,
+    format_source: Option<FieldFormatSource<'a>>,
+}
+
+impl ComplexFieldFrame<'_> {
+    fn new() -> Self {
+        Self {
+            phase: ComplexFieldPhase::Instruction,
+            instruction: String::new(),
+            instruction_format_spans: Vec::new(),
+            substitution_pending: None,
+            substitution_emitted: false,
+            had_separate: false,
+            format_source: None,
+        }
+    }
+}
+
+/// Whether an enclosing field suppresses the current field's visible result.
+///
+/// A dynamic outer field replaces its complete result zone, including any
+/// nested field. An outer instruction zone is never visible either. The last
+/// frame is intentionally excluded because its pending substitution is the
+/// value the caller is about to emit.
+fn enclosing_field_suppresses(frames: &[ComplexFieldFrame<'_>]) -> bool {
+    frames
+        .get(..frames.len().saturating_sub(1))
+        .unwrap_or_default()
+        .iter()
+        .any(|frame| {
+            frame.phase == ComplexFieldPhase::Instruction
+                || frame.substitution_pending.is_some()
+                || frame.substitution_emitted
+        })
+}
+
+fn instruction_display_format_source<'a>(
+    instruction: &str,
+    display: &str,
+    spans: &[(std::ops::Range<usize>, &'a TextRun)],
+) -> Option<FieldFormatSource<'a>> {
+    let display_start = instruction.find(display)?;
+    spans
+        .iter()
+        .find(|(range, _)| range.contains(&display_start))
+        .map(|(_, run)| FieldFormatSource::InstructionDisplayRun(*run))
 }
 
 /// Locate the formatting source for the complex field whose `Separate`
@@ -313,37 +490,69 @@ fn emit_field_substitution<F>(
 ) where
     F: Fn(&str, &FontProps) -> (Pt, TextMetrics),
 {
-    let (font, text_style) = match source {
-        Some(FieldFormatSource::FirstResultRun(tr)) => resolve_run_styling(
-            tr,
-            default_family,
-            default_size,
-            default_color,
-            resolved_styles,
-            paragraph_run_defaults,
-            theme,
-            auto_fit,
-            measure_text,
-        ),
-        _ => (
-            FontProps {
-                family: Rc::from(default_family),
-                size: auto_fit.scale_font(default_size),
-                bold: false,
-                italic: false,
-                underline: false,
-                char_spacing: Pt::ZERO,
-                text_scale: 1.0,
-                underline_position: Pt::ZERO,
-                underline_thickness: Pt::ZERO,
-            },
-            TextRunStyle {
-                color: default_color,
-                shading: None,
-                border: None,
-                baseline_offset: Pt::ZERO,
-            },
-        ),
+    let source_run = match source {
+        Some(
+            FieldFormatSource::FirstResultRun(tr) | FieldFormatSource::InstructionDisplayRun(tr),
+        ) => Some(*tr),
+        _ => None,
+    };
+    // A legacy MACROBUTTON often has no result run at all. Keep the old
+    // paragraph-default fallback for model callers that do not preserve the
+    // instruction run, but prefer the actual source run whenever available.
+    let synthetic = paragraph_run_defaults.map(|props| TextRun {
+        style_id: None,
+        properties: props.clone(),
+        content: Vec::new(),
+        rsids: crate::model::RevisionIds::default(),
+    });
+
+    if let Some(run) = source_run.or(synthetic.as_ref()) {
+        // Character formatting comes from one source run, while the font
+        // family still follows OOXML's per-script slots. This is why a single
+        // bold placeholder can use SimSun for Han text and Times New Roman for
+        // brackets/digits, matching normal run rendering.
+        for text_part in split_text_for_font_slots(text) {
+            let (font, text_style) = resolve_run_styling(
+                run,
+                default_family,
+                default_size,
+                default_color,
+                resolved_styles,
+                paragraph_run_defaults,
+                theme,
+                auto_fit,
+                Some(text_part),
+                measure_text,
+            );
+            emit_text_fragments(
+                text_part,
+                &font,
+                &text_style,
+                hyperlink_url,
+                measure_text,
+                measurer,
+                fragments,
+            );
+        }
+        return;
+    }
+
+    let font = FontProps {
+        family: Rc::from(field_fallback_family(text, default_family)),
+        size: auto_fit.scale_font(default_size),
+        bold: false,
+        italic: false,
+        underline: false,
+        char_spacing: Pt::ZERO,
+        text_scale: 1.0,
+        underline_position: Pt::ZERO,
+        underline_thickness: Pt::ZERO,
+    };
+    let text_style = TextRunStyle {
+        color: default_color,
+        shading: None,
+        border: None,
+        baseline_offset: Pt::ZERO,
     };
     emit_text_fragments(
         text,
@@ -369,7 +578,7 @@ where
     F: Fn(&str, &FontProps) -> (Pt, TextMetrics),
 {
     let font = FontProps {
-        family: Rc::from(default_family),
+        family: Rc::from(field_fallback_family(&text, default_family)),
         size: default_size,
         bold: false,
         italic: false,
@@ -446,13 +655,7 @@ where
     let theme = ctx.theme;
     let auto_fit = ctx.auto_fit;
     let mut fragments = Vec::new();
-    let mut field_depth: i32 = 0; // tracks nested complex field state
-    let mut field_instr = String::new(); // accumulated instruction text for current complex field
-                                         // §17.16.19: field substitution state for complex fields.
-                                         // Pending = substitution text waiting for the first result TextRun's formatting.
-                                         // Emitted = substitution was rendered, skip remaining result TextRuns until End.
-    let mut field_sub_pending: Option<String> = None;
-    let mut field_sub_emitted = false;
+    let mut field_stack: Vec<ComplexFieldFrame<'_>> = Vec::new();
 
     // §17.16.19 MERGEFORMAT — pre-resolve formatting for each complex
     // field's substitution against raw inlines, so empty placeholder
@@ -470,7 +673,6 @@ where
         })
         .collect();
     let mut field_format_idx: usize = 0;
-    let mut current_field_format: Option<FieldFormatSource<'_>> = None;
     // Pre-pass: join consecutive text-only TextRuns into segments so
     // UAX #29 grapheme clusters reassemble across `<w:rFonts>`-induced
     // run splits (keycap `1️⃣`, ZWJ family, modifier sequence, …).
@@ -481,16 +683,40 @@ where
                 // Field state (mirrors the per-run logic below). Field chars
                 // appear as Discrete Inlines and break segment joining, so
                 // a TextSegment is always entirely inside one field zone.
-                if field_depth > 0 || field_sub_emitted {
-                    continue;
+                if let Some(frame) = field_stack.last() {
+                    if enclosing_field_suppresses(&field_stack)
+                        || frame.phase == ComplexFieldPhase::Instruction
+                        || frame.substitution_emitted
+                    {
+                        continue;
+                    }
                 }
 
-                // §17.16.19: pending substitution uses the segment's first run
-                // for formatting (per cross-run cluster cascade rule).
-                if let Some(sub) = field_sub_pending.take() {
+                // §17.16.19: a dynamic substitution replaces the field's
+                // complete result zone. Prefer the pre-resolved first result
+                // run (which may be an empty run dropped by segment joining),
+                // then fall back to this segment's first run.
+                if field_stack
+                    .last()
+                    .is_some_and(|frame| frame.substitution_pending.is_some())
+                {
                     let base_run = seg.char_runs()[0];
-                    let (font, text_style) = resolve_run_styling(
-                        base_run,
+                    let source = match field_stack.last().and_then(|frame| frame.format_source) {
+                        Some(
+                            source @ (FieldFormatSource::FirstResultRun(_)
+                            | FieldFormatSource::InstructionDisplayRun(_)),
+                        ) => source,
+                        Some(FieldFormatSource::ParagraphDefaults) | None => {
+                            FieldFormatSource::FirstResultRun(base_run)
+                        }
+                    };
+                    let sub = field_stack
+                        .last_mut()
+                        .and_then(|frame| frame.substitution_pending.take())
+                        .expect("pending substitution checked above");
+                    emit_field_substitution(
+                        &sub,
+                        Some(&source),
                         default_family,
                         default_size,
                         default_color,
@@ -498,18 +724,14 @@ where
                         paragraph_run_defaults,
                         theme,
                         auto_fit,
-                        measure_text,
-                    );
-                    field_sub_emitted = true;
-                    emit_text_fragments(
-                        &sub,
-                        &font,
-                        &text_style,
                         hyperlink_url,
                         measure_text,
                         ctx.measurer,
                         &mut fragments,
                     );
+                    if let Some(frame) = field_stack.last_mut() {
+                        frame.substitution_emitted = true;
+                    }
                     continue;
                 }
 
@@ -518,27 +740,30 @@ where
                 for piece in seg.classify() {
                     match piece {
                         SegmentPiece::Text { run, text } => {
-                            let (font, text_style) = resolve_run_styling(
-                                run,
-                                default_family,
-                                default_size,
-                                default_color,
-                                resolved_styles,
-                                paragraph_run_defaults,
-                                theme,
-                                auto_fit,
-                                measure_text,
-                            );
-                            // Pre-classified text: bypass cluster::classify
-                            // by going straight to the word-split path.
-                            emit_text_words(
-                                &text,
-                                &font,
-                                &text_style,
-                                hyperlink_url,
-                                measure_text,
-                                &mut fragments,
-                            );
+                            for text_part in split_text_for_font_slots(&text) {
+                                let (font, text_style) = resolve_run_styling(
+                                    run,
+                                    default_family,
+                                    default_size,
+                                    default_color,
+                                    resolved_styles,
+                                    paragraph_run_defaults,
+                                    theme,
+                                    auto_fit,
+                                    Some(text_part),
+                                    measure_text,
+                                );
+                                // Pre-classified text: bypass cluster::classify
+                                // by going straight to the word-split path.
+                                emit_text_words(
+                                    text_part,
+                                    &font,
+                                    &text_style,
+                                    hyperlink_url,
+                                    measure_text,
+                                    &mut fragments,
+                                );
+                            }
                         }
                         SegmentPiece::Emoji {
                             base_run,
@@ -555,6 +780,7 @@ where
                                 paragraph_run_defaults,
                                 theme,
                                 auto_fit,
+                                Some(&text),
                                 measure_text,
                             );
                             if let Some(measurer) = ctx.measurer {
@@ -595,35 +821,65 @@ where
                     // branch handles runs whose content includes Tab,
                     // LineBreak, PageBreak, ColumnBreak, or
                     // LastRenderedPageBreak.
-                    if field_depth > 0 || field_sub_emitted {
-                        continue;
+                    if let Some(frame) = field_stack.last() {
+                        if enclosing_field_suppresses(&field_stack)
+                            || frame.phase == ComplexFieldPhase::Instruction
+                            || frame.substitution_emitted
+                        {
+                            continue;
+                        }
                     }
 
-                    let (font, text_style) = resolve_run_styling(
-                        tr,
-                        default_family,
-                        default_size,
-                        default_color,
-                        resolved_styles,
-                        paragraph_run_defaults,
-                        theme,
-                        auto_fit,
-                        measure_text,
-                    );
-
-                    if field_sub_pending.is_some() {
-                        let sub = field_sub_pending.take().unwrap();
-                        field_sub_emitted = true;
-                        emit_text_fragments(
-                            &sub,
-                            &font,
-                            &text_style,
-                            hyperlink_url,
-                            measure_text,
-                            ctx.measurer,
-                            &mut fragments,
-                        );
+                    if field_stack
+                        .last()
+                        .is_some_and(|frame| frame.substitution_pending.is_some())
+                    {
+                        let source = match field_stack.last().and_then(|frame| frame.format_source)
+                        {
+                            Some(
+                                source @ (FieldFormatSource::FirstResultRun(_)
+                                | FieldFormatSource::InstructionDisplayRun(_)),
+                            ) => source,
+                            Some(FieldFormatSource::ParagraphDefaults) | None => {
+                                FieldFormatSource::FirstResultRun(tr)
+                            }
+                        };
+                        if let Some(sub) = field_stack
+                            .last_mut()
+                            .and_then(|frame| frame.substitution_pending.take())
+                        {
+                            emit_field_substitution(
+                                &sub,
+                                Some(&source),
+                                default_family,
+                                default_size,
+                                default_color,
+                                resolved_styles,
+                                paragraph_run_defaults,
+                                theme,
+                                auto_fit,
+                                hyperlink_url,
+                                measure_text,
+                                ctx.measurer,
+                                &mut fragments,
+                            );
+                            if let Some(frame) = field_stack.last_mut() {
+                                frame.substitution_emitted = true;
+                            }
+                        }
                     } else {
+                        let (font, text_style) = resolve_run_styling(
+                            tr,
+                            default_family,
+                            default_size,
+                            default_color,
+                            resolved_styles,
+                            paragraph_run_defaults,
+                            theme,
+                            auto_fit,
+                            None,
+                            measure_text,
+                        );
                         for element in &tr.content {
                             match element {
                                 RunElement::Text(text) => {
@@ -749,27 +1005,45 @@ where
                     // Begin → InstrText... → Separate → result runs → End
                     match fc.field_char_type {
                         FieldCharType::Begin => {
-                            field_depth += 1;
-                            field_instr.clear();
-                            field_sub_pending = None;
-                            field_sub_emitted = false;
+                            field_stack.push(ComplexFieldFrame::new());
                         }
                         FieldCharType::Separate => {
+                            let format_source = field_format_sources.get(field_format_idx).copied();
+                            field_format_idx += 1;
                             // §17.16.4.1: parse accumulated instruction, evaluate
                             // PAGE/NUMPAGES if field context is available.
-                            if let Ok(parsed) = crate::field::parse(&field_instr) {
-                                field_sub_pending = evaluate_field_instruction(&parsed, field_ctx);
+                            if let Some(frame) = field_stack.last_mut() {
+                                if let Ok(parsed) = crate::field::parse(&frame.instruction) {
+                                    frame.substitution_pending =
+                                        evaluate_field_instruction(&parsed, field_ctx)
+                                            .or_else(|| fallback_field_instruction_text(&parsed));
+                                }
+                                frame.had_separate = true;
+                                frame.format_source = format_source;
+                                frame.phase = ComplexFieldPhase::Result;
                             }
-                            // §17.16.19: bind the formatting source resolved
-                            // against raw inlines, so the End fallback path
-                            // can recover an empty placeholder run's rPr
-                            // even though it was dropped by segment joining.
-                            current_field_format =
-                                field_format_sources.get(field_format_idx).copied();
-                            field_format_idx += 1;
-                            field_depth -= 1; // now collect result runs (unless substituted)
                         }
                         FieldCharType::End => {
+                            let Some(mut frame) = field_stack.pop() else {
+                                continue;
+                            };
+                            // Legacy MACROBUTTON placeholders often have no
+                            // `separate` marker at all.  Their visible text is
+                            // the instruction's display argument, so recover
+                            // it before closing the field instead of dropping
+                            // the whole placeholder.
+                            if !frame.had_separate && frame.substitution_pending.is_none() {
+                                if let Ok(parsed) = crate::field::parse(&frame.instruction) {
+                                    if let Some(text) = fallback_field_instruction_text(&parsed) {
+                                        frame.format_source = instruction_display_format_source(
+                                            &frame.instruction,
+                                            &text,
+                                            &frame.instruction_format_spans,
+                                        );
+                                        frame.substitution_pending = Some(text);
+                                    }
+                                }
+                            }
                             // Substitution still pending at End: the unit
                             // stream never carried a result run (either the
                             // placeholder was empty and got swallowed by
@@ -777,32 +1051,63 @@ where
                             // content at all). Use the pre-resolved format
                             // source — §17.16.19 first-result-run when
                             // present, paragraph defaults otherwise.
-                            if let Some(text) = field_sub_pending.take() {
-                                emit_field_substitution(
-                                    &text,
-                                    current_field_format.as_ref(),
-                                    default_family,
-                                    default_size,
-                                    default_color,
-                                    resolved_styles,
-                                    paragraph_run_defaults,
-                                    theme,
-                                    auto_fit,
-                                    hyperlink_url,
-                                    measure_text,
-                                    ctx.measurer,
-                                    &mut fragments,
-                                );
+                            let suppressed_by_enclosing = field_stack.iter().any(|outer| {
+                                outer.phase == ComplexFieldPhase::Instruction
+                                    || outer.substitution_pending.is_some()
+                                    || outer.substitution_emitted
+                            });
+                            if !suppressed_by_enclosing {
+                                if let Some(text) = frame.substitution_pending.take() {
+                                    emit_field_substitution(
+                                        &text,
+                                        frame.format_source.as_ref(),
+                                        default_family,
+                                        default_size,
+                                        default_color,
+                                        resolved_styles,
+                                        paragraph_run_defaults,
+                                        theme,
+                                        auto_fit,
+                                        hyperlink_url,
+                                        measure_text,
+                                        ctx.measurer,
+                                        &mut fragments,
+                                    );
+                                }
                             }
-                            current_field_format = None;
-                            field_sub_emitted = false;
                         }
                     }
                 }
                 Inline::InstrText(text) => {
                     // Accumulate instruction text for complex field parsing.
-                    if field_depth > 0 {
-                        field_instr.push_str(text);
+                    if let Some(frame) = field_stack
+                        .last_mut()
+                        .filter(|frame| frame.phase == ComplexFieldPhase::Instruction)
+                    {
+                        frame.instruction.push_str(text);
+                    }
+                }
+                Inline::InstrTextRun(run) => {
+                    // Preserve byte ranges back to the source runs so a
+                    // MACROBUTTON display value can use the format of its
+                    // first visible character, even when the instruction is
+                    // split across several differently formatted runs.
+                    if let Some(frame) = field_stack
+                        .last_mut()
+                        .filter(|frame| frame.phase == ComplexFieldPhase::Instruction)
+                    {
+                        let start = frame.instruction.len();
+                        for element in &run.content {
+                            if let RunElement::Text(text) = element {
+                                frame.instruction.push_str(text);
+                            }
+                        }
+                        let end = frame.instruction.len();
+                        if end > start {
+                            frame
+                                .instruction_format_spans
+                                .push((start..end, run.as_ref()));
+                        }
                     }
                 }
                 Inline::AlternateContent(ac) => {
@@ -947,6 +1252,22 @@ where
                     });
                 }
                 Inline::Pict(pict) => {
+                    let mut emitted_group = false;
+                    for primitive in &pict.primitives {
+                        if let crate::model::VmlPrimitive::Group(group) = primitive {
+                            if let Some(size) =
+                                crate::render::layout::vml::inline_group_extent(group)
+                            {
+                                fragments.push(Fragment::InlineGraphic {
+                                    size,
+                                    source: Rc::new((**group).clone()),
+                                    commands: Vec::new(),
+                                });
+                                emitted_group = true;
+                            }
+                        }
+                    }
+
                     // Render text content from VML text-box-bearing
                     // primitives inline. Every primitive variant
                     // (`<v:shape>`, `<v:rect>`, `<v:roundrect>`,
@@ -959,31 +1280,36 @@ where
                     //
                     // Does not handle absolute positioning — text
                     // appears inline with the surrounding paragraph.
-                    for primitive in &pict.primitives {
-                        let common = primitive.common();
-                        if let Some(ref text_box) = common.text_box {
-                            for block in &text_box.content {
-                                if let Block::Paragraph(p) = block {
-                                    let pict_ctx = FragmentCtx {
-                                        default_family,
-                                        default_size,
-                                        default_color,
-                                        resolved_styles,
-                                        paragraph_run_defaults: p.mark_run_properties.as_ref(),
-                                        theme,
-                                        measurer: ctx.measurer,
-                                        auto_fit: ctx.auto_fit,
-                                    };
-                                    let mut sub = collect_fragments(
-                                        &p.content,
-                                        &pict_ctx,
-                                        hyperlink_url,
-                                        measure_text,
-                                        footnotes,
-                                        endnote_counter,
-                                        field_ctx,
-                                    );
-                                    fragments.append(&mut sub);
+                    if !emitted_group {
+                        for primitive in &pict.primitives {
+                            let common = primitive.common();
+                            if common.style.position == Some(crate::model::CssPosition::Absolute) {
+                                continue;
+                            }
+                            if let Some(ref text_box) = common.text_box {
+                                for block in &text_box.content {
+                                    if let Block::Paragraph(p) = block {
+                                        let pict_ctx = FragmentCtx {
+                                            default_family,
+                                            default_size,
+                                            default_color,
+                                            resolved_styles,
+                                            paragraph_run_defaults: p.mark_run_properties.as_ref(),
+                                            theme,
+                                            measurer: ctx.measurer,
+                                            auto_fit: ctx.auto_fit,
+                                        };
+                                        let mut sub = collect_fragments(
+                                            &p.content,
+                                            &pict_ctx,
+                                            hyperlink_url,
+                                            measure_text,
+                                            footnotes,
+                                            endnote_counter,
+                                            field_ctx,
+                                        );
+                                        fragments.append(&mut sub);
+                                    }
                                 }
                             }
                         }
@@ -1001,6 +1327,15 @@ mod tests {
     use super::*;
     use crate::model::dimension::{Dimension, HalfPoints};
     use crate::model::*;
+
+    #[test]
+    fn mixed_latin_and_chinese_text_splits_by_font_slot() {
+        assert_eq!(
+            split_text_for_font_slots("ABC 123：中文，XYZ"),
+            vec!["ABC 123：", "中文，", "XYZ"]
+        );
+        assert_eq!(split_text_for_font_slots("（中文）"), vec!["（中文）"]);
+    }
 
     /// Dummy measurer: width = text.len() * 6.0, ascent = 10.0, descent = 2.0
     fn dummy_measure(text: &str, _font: &FontProps) -> (Pt, TextMetrics) {
@@ -1074,6 +1409,18 @@ mod tests {
         Inline::TextRun(Box::new(TextRun {
             style_id: None,
             properties: RunProperties::default(),
+            content: vec![RunElement::Text(text.into())],
+            rsids: RevisionIds::default(),
+        }))
+    }
+
+    fn instr_text_run(text: &str, bold: bool) -> Inline {
+        Inline::InstrTextRun(Box::new(TextRun {
+            style_id: None,
+            properties: RunProperties {
+                bold: Some(bold),
+                ..Default::default()
+            },
             content: vec![RunElement::Text(text.into())],
             rsids: RevisionIds::default(),
         }))
@@ -1293,6 +1640,193 @@ mod tests {
     }
 
     #[test]
+    fn outer_dynamic_field_suppresses_a_nested_result_field() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("PAGE".into()),
+            fld_char(FieldCharType::Separate),
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("NUMPAGES".into()),
+            fld_char(FieldCharType::Separate),
+            text_run("old inner result"),
+            fld_char(FieldCharType::End),
+            text_run("old outer result"),
+            fld_char(FieldCharType::End),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext {
+                page_number: Some(7),
+                num_pages: Some(99),
+            },
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "7");
+    }
+
+    #[test]
+    fn unknown_outer_field_preserves_a_nested_dynamic_field() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("UNKNOWN".into()),
+            fld_char(FieldCharType::Separate),
+            text_run("before "),
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("PAGE".into()),
+            fld_char(FieldCharType::Separate),
+            text_run("old page"),
+            fld_char(FieldCharType::End),
+            text_run(" after"),
+            fld_char(FieldCharType::End),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext {
+                page_number: Some(7),
+                num_pages: None,
+            },
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "before 7 after");
+    }
+
+    #[test]
+    fn legacy_field_without_separate_does_not_hide_following_text() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText(" FORMCHECKBOX ".into()),
+            fld_char(FieldCharType::End),
+            text_run("visible after control"),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "visible after control");
+    }
+
+    #[test]
+    fn macrobutton_without_separate_renders_its_display_argument() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText(" MACROBUTTON  AcceptAllChangesShown ".into()),
+            Inline::InstrText("［点此输入中文论文题目］".into()),
+            fld_char(FieldCharType::End),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "［点此输入中文论文题目］");
+    }
+
+    #[test]
+    fn macrobutton_uses_the_display_arguments_first_character_format() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            instr_text_run(" MACROBUTTON AcceptAllChangesShown ", false),
+            instr_text_run("[", true),
+            instr_text_run("placeholder]", false),
+            fld_char(FieldCharType::End),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+
+        assert!(frags.iter().all(|fragment| match fragment {
+            Fragment::Text { font, .. } => font.bold,
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn macrobutton_with_separate_and_empty_result_uses_display_argument() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("MACROBUTTON AcceptAllChangesShown [placeholder]".into()),
+            fld_char(FieldCharType::Separate),
+            text_run(""),
+            fld_char(FieldCharType::End),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered, "[placeholder]");
+    }
+
+    #[test]
     fn bookmarks_and_separators_skipped() {
         let inlines = vec![
             Inline::BookmarkStart {
@@ -1485,6 +2019,9 @@ mod tests {
     fn expect_first_run<'a>(src: FieldFormatSource<'a>) -> &'a TextRun {
         match src {
             FieldFormatSource::FirstResultRun(tr) => tr,
+            FieldFormatSource::InstructionDisplayRun(_) => {
+                panic!("expected FirstResultRun, got InstructionDisplayRun")
+            }
             FieldFormatSource::ParagraphDefaults => {
                 panic!("expected FirstResultRun, got ParagraphDefaults")
             }

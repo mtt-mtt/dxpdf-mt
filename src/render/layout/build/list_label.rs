@@ -123,10 +123,7 @@ pub(super) fn inject_list_label(
         fragments.insert(0, label_frag);
 
         if !drop_separator {
-            if let Some(lvl_left) = level_def
-                .and_then(|l| l.indentation.as_ref())
-                .and_then(|ind| ind.start)
-            {
+            if let Some(lvl_left) = effective_numbering_start(para, level_def) {
                 merged_props.tabs.insert(
                     0,
                     crate::model::TabStop {
@@ -305,10 +302,7 @@ fn inject_text_label(
             fragments.insert(0, label_frag);
 
             // Implicit tab stop at numLvl.left so the tab lands at body text.
-            if let Some(lvl_left) = level_def
-                .and_then(|l| l.indentation.as_ref())
-                .and_then(|ind| ind.start)
-            {
+            if let Some(lvl_left) = effective_numbering_start(para, level_def) {
                 merged_props.tabs.insert(
                     0,
                     crate::model::TabStop {
@@ -344,6 +338,28 @@ fn inject_text_label(
             fragments.insert(0, label_frag);
         }
     }
+}
+
+/// Effective body-text start for a numbered paragraph.
+///
+/// §17.9.23 gives the numbering level's indentation precedence over the
+/// paragraph style, but a value written directly in this paragraph's `pPr`
+/// wins over the level. The implicit separator tab must use the same effective
+/// start as the paragraph body; retaining the level's original start after a
+/// direct override leaves the label correctly placed but advances the body a
+/// second time.
+fn effective_numbering_start(
+    para: &model::Paragraph,
+    level_def: Option<&crate::render::resolve::numbering::ResolvedNumberingLevel>,
+) -> Option<crate::model::dimension::Dimension<crate::model::dimension::Twips>> {
+    para.properties
+        .indentation
+        .and_then(|indent| indent.start)
+        .or_else(|| {
+            level_def
+                .and_then(|level| level.indentation.as_ref())
+                .and_then(|indent| indent.start)
+        })
 }
 
 /// Extract the hanging indent from a numbering level definition.
@@ -529,6 +545,7 @@ mod tests {
             endnotes: HashMap::new(),
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
+            adjust_line_height_in_table: false,
         }
     }
 
@@ -677,6 +694,54 @@ mod tests {
                 "{suffix:?}"
             );
         }
+    }
+
+    #[test]
+    fn direct_paragraph_start_moves_the_numbering_separator_tab() {
+        let resolved = resolved_with(vec![ResolvedNumberingLevel {
+            indentation: Some(Indentation {
+                start: Some(Dimension::new(720)),
+                first_line: Some(FirstLineIndent::Hanging(Dimension::new(360))),
+                ..Default::default()
+            }),
+            ..decimal_level()
+        }]);
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+        let mut para = numbered_para();
+        para.properties.indentation = Some(Indentation {
+            start: Some(Dimension::new(360)),
+            ..Default::default()
+        });
+        let mut fragments = Vec::new();
+        let mut props = props_at(0);
+
+        inject_list_label(
+            &para,
+            &mut fragments,
+            &mut props,
+            &ctx,
+            &mut BuildState::default(),
+        );
+
+        assert!(
+            props
+                .tabs
+                .iter()
+                .any(|tab| tab.position == Dimension::new(360)),
+            "the separator tab follows the direct 18pt body indent"
+        );
+        assert!(
+            !props
+                .tabs
+                .iter()
+                .any(|tab| tab.position == Dimension::new(720)),
+            "the overridden 36pt numbering-level stop must not survive"
+        );
     }
 
     /// §17.9.7 `lvlJc`: the label is placed by shifting it within the hanging

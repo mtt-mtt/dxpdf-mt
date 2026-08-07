@@ -64,6 +64,12 @@ pub fn fit_lines_with_first(
     let mut lines = Vec::new();
     let mut line_start = 0;
     let mut line_width = Pt::ZERO;
+    // Width used only for overflow decisions. Unlike `line_width`, this
+    // excludes the complete trailing-whitespace suffix even when that suffix
+    // spans several run fragments. Word lets such spaces hang past the right
+    // margin; measuring only the current fragment's trimmed width can turn an
+    // earlier whitespace-only run into a spurious extra line.
+    let mut line_trimmed_width = Pt::ZERO;
     // §17.3.1.30: where the pen actually *is*, as opposed to how much width
     // the line has accumulated. The two differ only across a position tab,
     // which jumps the pen to its anchor while contributing a nominal width.
@@ -78,6 +84,11 @@ pub fn fit_lines_with_first(
             }
     };
     let mut pen_x = line_pen_start(true);
+    // Margin-relative position tabs use the physical pen rather than the
+    // accumulated line width. Track an equivalent pen with the complete
+    // trailing-space suffix removed so this path follows the same overflow
+    // rule as ordinary lines.
+    let mut pen_trimmed_x = pen_x;
     // §17.3.1.30: `relativeTo="margin"` measures against the full text area,
     // so once such a tab has placed content this line may legitimately use the
     // space a paragraph's own right indent excludes. Until then the ordinary
@@ -108,7 +119,9 @@ pub fn fit_lines_with_first(
             });
             line_start = i + 1;
             line_width = Pt::ZERO;
+            line_trimmed_width = Pt::ZERO;
             pen_x = line_pen_start(lines.is_empty());
+            pen_trimmed_x = pen_x;
             margin_span_active = false;
             line_height = Pt::ZERO;
             line_text_height = Pt::ZERO;
@@ -142,6 +155,7 @@ pub fn fit_lines_with_first(
             match placement {
                 crate::render::layout::paragraph::PTabPlacement::Placed(at) => {
                     pen_x = at;
+                    pen_trimmed_x = at;
                     margin_span_active |=
                         matches!(relative_to, crate::model::PTabRelativeTo::Margin);
                 }
@@ -164,7 +178,9 @@ pub fn fit_lines_with_first(
                         });
                         line_start = i;
                         line_width = Pt::ZERO;
+                        line_trimmed_width = Pt::ZERO;
                         pen_x = line_pen_start(lines.is_empty());
+                        pen_trimmed_x = pen_x;
                         margin_span_active = false;
                         line_height = Pt::ZERO;
                         line_text_height = Pt::ZERO;
@@ -179,6 +195,33 @@ pub fn fit_lines_with_first(
 
         let frag_width = frag.width();
         let new_width = line_width + frag_width;
+        let new_trimmed_width = match frag {
+            Fragment::Text { text, .. }
+                if text
+                    .chars()
+                    .all(crate::render::layout::fragment::is_trimmable_trailing_whitespace) =>
+            {
+                line_trimmed_width
+            }
+            Fragment::Text { .. } => line_width + frag.trimmed_width(),
+            _ => new_width,
+        };
+        let new_pen_x = if matches!(frag, Fragment::PTab { .. }) {
+            pen_x
+        } else {
+            pen_x + frag_width
+        };
+        let new_trimmed_pen_x = match frag {
+            Fragment::Text { text, .. }
+                if text
+                    .chars()
+                    .all(crate::render::layout::fragment::is_trimmable_trailing_whitespace) =>
+            {
+                pen_trimmed_x
+            }
+            Fragment::Text { .. } => pen_x + frag.trimmed_width(),
+            _ => new_pen_x,
+        };
 
         // Use first-line width for line 0, remaining width for subsequent lines.
         let current_max = if lines.is_empty() {
@@ -187,16 +230,16 @@ pub fn fit_lines_with_first(
             remaining_width
         };
 
-        // For overflow checking, use trimmed width — trailing whitespace on the
-        // last word is allowed to hang past the margin (standard Word behavior).
-        // The check uses: previous fragments' full widths + this fragment's trimmed width.
-        let check_width = line_width + frag.trimmed_width();
+        // For overflow checking, use the width with the line's entire
+        // trailing-whitespace suffix removed. The suffix may span multiple
+        // OOXML runs with different formatting.
+        let check_width = new_trimmed_width;
 
         // Check if adding this fragment overflows. Once a margin-relative tab
         // has placed content, the line's real right edge is the margin, and
         // the pen — not the accumulated width sum — says where we are.
         let overflows = if margin_span_active {
-            pen_x + frag.trimmed_width() > ptab_geometry.max_width
+            new_trimmed_pen_x > ptab_geometry.max_width
         } else {
             check_width > current_max
         };
@@ -215,13 +258,19 @@ pub fn fit_lines_with_first(
             });
             line_start = break_at;
             line_width = Pt::ZERO;
+            line_trimmed_width = Pt::ZERO;
             pen_x = line_pen_start(lines.is_empty());
+            pen_trimmed_x = pen_x;
             margin_span_active = false;
             line_height = Pt::ZERO;
             line_text_height = Pt::ZERO;
             line_ascent = Pt::ZERO;
             last_break_point = None;
-            // Don't advance i — re-evaluate this fragment on the new line.
+            // Refit every fragment after the chosen break point. When the
+            // last legal break is earlier than `i`, merely re-evaluating the
+            // current fragment skips the intervening fragments from width and
+            // height accounting even though emission still draws them.
+            i = break_at;
             continue;
         }
 
@@ -229,12 +278,12 @@ pub fn fit_lines_with_first(
         // allow it (it will be the only fragment on this line). The
         // paragraph renderer will clip/overflow as needed.
         line_width = new_width;
-        // A position tab has already jumped the pen to its anchor; every other
-        // fragment advances it by its own width. Done here, after the overflow
-        // check, so the check sees the pen *at* this fragment rather than past it.
-        if !matches!(frag, Fragment::PTab { .. }) {
-            pen_x += frag_width;
-        }
+        line_trimmed_width = new_trimmed_width;
+        // A position tab has already jumped the pen to its anchor. These
+        // values are assigned only after the overflow decision, so refitting a
+        // fragment starts from the correct pre-fragment position.
+        pen_x = new_pen_x;
+        pen_trimmed_x = new_trimmed_pen_x;
         line_height = line_height.max(frag.height());
         // §17.3.1.33: text_height is the Auto line spacing base — use
         // line_height() (includes leading) for text, glyph height for tabs.
@@ -243,7 +292,8 @@ pub fn fit_lines_with_first(
                 line_text_height = line_text_height.max(metrics.line_height());
                 line_ascent = line_ascent.max(metrics.ascent);
             }
-            Fragment::Image { .. } => {} // images don't contribute to text_height
+            Fragment::Image { .. } | Fragment::InlineGraphic { .. } => {}
+            // Inline graphics, like images, don't contribute to text_height.
             _ => {
                 line_text_height = line_text_height.max(frag.height());
             }
@@ -255,11 +305,7 @@ pub fn fit_lines_with_first(
         // and must not be broken.
         let is_break_point = match frag {
             Fragment::Text { text, .. } => {
-                text.ends_with(' ') || text.ends_with('\t')
-                    || text.ends_with('-')
-                    || text.ends_with('\u{2010}') // hyphen
-                    || text.ends_with('\u{2013}') // en-dash
-                    || text.ends_with('\u{2014}') // em-dash
+                crate::render::layout::fragment::text_allows_line_break_after(text)
             }
             _ => true, // tabs, images, line breaks are always break points
         };
@@ -357,6 +403,19 @@ mod tests {
         }
     }
 
+    fn text_frag_with_trimmed_width(text: &str, width: f32, trimmed_width: f32) -> Fragment {
+        let mut fragment = text_frag(text, width);
+        let Fragment::Text {
+            trimmed_width: measured_trimmed_width,
+            ..
+        } = &mut fragment
+        else {
+            unreachable!();
+        };
+        *measured_trimmed_width = Pt::new(trimmed_width);
+        fragment
+    }
+
     #[test]
     fn empty_fragments_no_lines() {
         let lines = fit_lines(&[], Pt::new(100.0));
@@ -386,6 +445,103 @@ mod tests {
     }
 
     #[test]
+    fn trailing_whitespace_across_runs_does_not_create_an_extra_line() {
+        let frags = vec![
+            text_frag("label", 80.0),
+            text_frag_with_trimmed_width("   ", 15.0, 0.0),
+            text_frag_with_trimmed_width("   ", 15.0, 0.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(90.0));
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].start, lines[0].end), (0, 3));
+        assert_eq!(
+            lines[0].width.raw(),
+            110.0,
+            "the spaces remain drawable even though they hang past the margin"
+        );
+    }
+
+    #[test]
+    fn non_breaking_spaces_are_not_removed_from_overflow_width() {
+        for space in ["\u{00A0}", "\u{202F}"] {
+            let frags = vec![
+                text_frag("label", 80.0),
+                text_frag_with_trimmed_width(space, 15.0, 15.0),
+            ];
+            let lines = fit_lines(&frags, Pt::new(90.0));
+
+            assert_eq!(lines.len(), 2, "{space:?} must occupy layout width");
+            assert_eq!((lines[0].start, lines[0].end), (0, 1));
+            assert_eq!((lines[1].start, lines[1].end), (1, 2));
+        }
+    }
+
+    #[test]
+    fn margin_ptab_ignores_the_complete_trailing_space_suffix() {
+        let ptab = Fragment::PTab {
+            align: crate::model::PTabAlignment::Left,
+            relative_to: crate::model::PTabRelativeTo::Margin,
+            leader: crate::model::TabLeader::None,
+            line_height: Pt::new(14.0),
+            font: Rc::new(FontProps {
+                family: Rc::from("Test"),
+                size: Pt::new(12.0),
+                bold: false,
+                italic: false,
+                underline: false,
+                char_spacing: Pt::ZERO,
+                text_scale: 1.0,
+                underline_position: Pt::ZERO,
+                underline_thickness: Pt::ZERO,
+            }),
+            color: RgbColor::BLACK,
+        };
+        let frags = vec![
+            ptab,
+            text_frag("label", 80.0),
+            text_frag_with_trimmed_width("   ", 15.0, 0.0),
+            text_frag_with_trimmed_width("   ", 15.0, 0.0),
+            text_frag_with_trimmed_width("   ", 15.0, 0.0),
+        ];
+        let lines = fit_lines_with_first(
+            &frags,
+            Pt::new(80.0),
+            Pt::new(80.0),
+            crate::render::layout::paragraph::PTabGeometry {
+                max_width: Pt::new(100.0),
+                indent_left: Pt::ZERO,
+                indent_first_line: Pt::ZERO,
+                content_width: Pt::new(80.0),
+                float_left: Pt::ZERO,
+                float_right: Pt::ZERO,
+            },
+        );
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].start, lines[0].end), (0, 5));
+        assert_eq!(
+            lines[0].width.raw(),
+            126.0,
+            "trailing spaces remain drawable after the margin-relative pTab"
+        );
+    }
+
+    #[test]
+    fn whitespace_between_text_runs_still_counts_towards_wrapping() {
+        let frags = vec![
+            text_frag("label", 70.0),
+            text_frag_with_trimmed_width("   ", 20.0, 0.0),
+            text_frag("value", 20.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(100.0));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].start, lines[0].end), (0, 2));
+        assert_eq!((lines[1].start, lines[1].end), (2, 3));
+    }
+
+    #[test]
     fn overflow_breaks_at_boundary() {
         let frags = vec![
             text_frag("hello ", 60.0),
@@ -399,6 +555,43 @@ mod tests {
         assert_eq!(lines[0].end, 1); // "hello " on first line
         assert_eq!(lines[1].start, 1);
         assert_eq!(lines[1].end, 3); // "world " + "end" on second line
+        assert_eq!(lines[1].width.raw(), 90.0);
+    }
+
+    #[test]
+    fn refitting_after_an_earlier_break_counts_all_intervening_fragments() {
+        let frags = vec![
+            text_frag("prefix ", 60.0),
+            text_frag("A", 20.0),
+            text_frag("B", 20.0),
+            text_frag("C", 20.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(100.0));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].start, lines[0].end), (0, 1));
+        assert_eq!((lines[1].start, lines[1].end), (1, 4));
+        assert_eq!(
+            lines[1].width.raw(),
+            60.0,
+            "the new line must re-account fragments between the old break and overflow"
+        );
+    }
+
+    #[test]
+    fn cjk_fragments_break_between_characters_without_whitespace() {
+        let frags = vec![
+            text_frag("1. ", 20.0),
+            text_frag("北", 20.0),
+            text_frag("京", 20.0),
+            text_frag("收", 20.0),
+            text_frag("费", 20.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(70.0));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].end, 3, "the first line keeps 1. 北京");
+        assert_eq!(lines[1].start, 3);
     }
 
     #[test]

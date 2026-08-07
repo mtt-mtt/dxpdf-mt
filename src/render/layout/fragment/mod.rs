@@ -9,6 +9,7 @@ use crate::render::dimension::Pt;
 use crate::render::emoji::cluster::{EmojiPresentation, EmojiStructure};
 use crate::render::fonts::TypefaceEntry;
 use crate::render::geometry::{PtRect, PtSize};
+use crate::render::layout::draw_command::DrawCommand;
 use crate::render::resolve::color::RgbColor;
 use crate::render::resolve::fonts::effective_font;
 use crate::render::resolve::images::MediaEntry;
@@ -165,6 +166,14 @@ pub enum Fragment {
         /// §20.1.10.48 `a:srcRect` — fractional source crop in `[0, 1]`.
         src_rect: Option<PtRect>,
     },
+    /// A VML group compiled in its own local coordinate system and placed as
+    /// one indivisible inline object. Keeping the source until the build pass
+    /// lets the compiler use the same layout context as the host paragraph.
+    InlineGraphic {
+        size: PtSize,
+        source: Rc<crate::model::VmlGroup>,
+        commands: Vec<DrawCommand>,
+    },
     /// One emoji grapheme cluster (UAX #29) classified as an emoji sequence
     /// (UTS #51), to be rasterized at paint time via Skia's raster backend
     /// and embedded as an inline PDF image, because Skia's PDF backend strips
@@ -248,11 +257,70 @@ pub enum Fragment {
     },
 }
 
+/// A compact UAX #14 subset for the East Asian text Word commonly receives.
+/// CJK text can break between ideographs without whitespace, but not directly
+/// after an opening mark or before a closing mark.
+pub(crate) fn east_asian_break_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2E80}'..='\u{A4CF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{323AF}'
+    )
+}
+
+pub(crate) fn east_asian_opening_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '（' | '〔' | '【' | '〈' | '《' | '「' | '『' | '〖' | '“' | '‘'
+    )
+}
+
+pub(crate) fn east_asian_closing_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '）' | '〕'
+            | '】'
+            | '〉'
+            | '》'
+            | '」'
+            | '』'
+            | '〗'
+            | '”'
+            | '’'
+            | '，'
+            | '。'
+            | '、'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+    )
+}
+
+/// Whitespace that Word permits to hang past the right edge of a line.
+/// Non-breaking spaces occupy real layout width and must never be trimmed.
+pub(crate) fn is_trimmable_trailing_whitespace(ch: char) -> bool {
+    ch.is_whitespace() && !matches!(ch, '\u{00A0}' | '\u{202F}')
+}
+
+pub(crate) fn text_allows_line_break_after(text: &str) -> bool {
+    let Some(last) = text.chars().next_back() else {
+        return false;
+    };
+    is_trimmable_trailing_whitespace(last)
+        || matches!(last, '-' | '\u{2010}' | '\u{2013}' | '\u{2014}')
+        || east_asian_closing_punctuation(last)
+        || (east_asian_break_char(last) && !east_asian_opening_punctuation(last))
+}
+
 impl Fragment {
     pub fn width(&self) -> Pt {
         match self {
             Fragment::Text { width, .. } => *width,
             Fragment::Image { size, .. } => size.width,
+            Fragment::InlineGraphic { size, .. } => size.width,
             Fragment::Emoji { advance, .. } => *advance,
             Fragment::Tab { fitting_width, .. } => fitting_width.unwrap_or(MIN_TAB_WIDTH),
             Fragment::PTab { .. } => MIN_TAB_WIDTH,
@@ -275,6 +343,7 @@ impl Fragment {
         match self {
             Fragment::Text { metrics, .. } => metrics.height(),
             Fragment::Image { size, .. } => size.height,
+            Fragment::InlineGraphic { size, .. } => size.height,
             Fragment::Emoji { line_metrics, .. } => line_metrics.height(),
             Fragment::Tab { line_height, .. }
             | Fragment::PTab { line_height, .. }

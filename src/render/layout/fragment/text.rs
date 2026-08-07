@@ -89,26 +89,22 @@ fn split_into_words(text: &str) -> Vec<&str> {
     let mut words = Vec::new();
     let mut start = 0;
 
-    for (i, ch) in text.char_indices() {
-        match ch {
-            // Whitespace: include with the preceding word.
-            ' ' | '\t' => {
-                let end = i + ch.len_utf8();
-                if end > start {
-                    words.push(&text[start..end]);
-                    start = end;
-                }
+    let chars = text.char_indices().collect::<Vec<_>>();
+    for (index, &(byte_index, ch)) in chars.iter().enumerate() {
+        let next = chars.get(index + 1).map(|(_, next)| *next);
+        let ordinary_break = matches!(
+            ch,
+            ' ' | '\t' | '-' | '\u{2010}' | '\u{2012}' | '\u{2013}' | '\u{2014}'
+        );
+        let east_asian_break = !super::east_asian_opening_punctuation(ch)
+            && !next.is_some_and(super::east_asian_closing_punctuation)
+            && (super::east_asian_break_char(ch) || next.is_some_and(super::east_asian_break_char));
+        if ordinary_break || east_asian_break {
+            let end = byte_index + ch.len_utf8();
+            if end > start {
+                words.push(&text[start..end]);
+                start = end;
             }
-            // Hyphen/dash: break AFTER the hyphen (UAX #14).
-            // The hyphen stays with the preceding word.
-            '-' | '\u{2010}' | '\u{2012}' | '\u{2013}' | '\u{2014}' => {
-                let end = i + ch.len_utf8();
-                if end > start {
-                    words.push(&text[start..end]);
-                    start = end;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -206,7 +202,7 @@ pub(super) fn emit_text_words<F>(
     let font = Rc::new(font.clone());
     for word in split_into_words(text) {
         let (w, m) = measure_text(word, &font);
-        let trimmed = word.trim_end();
+        let trimmed = word.trim_end_matches(super::is_trimmable_trailing_whitespace);
         let tw = if trimmed.len() < word.len() {
             measure_text(trimmed, &font).0
         } else {
@@ -314,6 +310,24 @@ mod tests {
         assert_eq!(split_into_words("ID‑001"), vec!["ID‑001"]);
     }
 
+    #[test]
+    fn cjk_text_exposes_breaks_without_whitespace() {
+        assert_eq!(split_into_words("收费管理"), vec!["收", "费", "管", "理"]);
+        assert_eq!(split_into_words("ABC收费"), vec!["ABC", "收", "费"]);
+    }
+
+    #[test]
+    fn cjk_opening_and_closing_punctuation_stays_with_adjacent_text() {
+        assert_eq!(
+            split_into_words("《北京》收费"),
+            vec!["《北", "京》", "收", "费"]
+        );
+        assert_eq!(
+            split_into_words("收费，管理"),
+            vec!["收", "费，", "管", "理"]
+        );
+    }
+
     // ── L1, L2, L4: emoji cluster integration ────────────────────────────
 
     use crate::render::emoji::cluster::EmojiPresentation;
@@ -342,6 +356,35 @@ mod tests {
             shading: None,
             border: None,
             baseline_offset: Pt::ZERO,
+        }
+    }
+
+    #[test]
+    fn non_breaking_spaces_keep_their_overflow_width() {
+        let measure = |text: &str, _font: &FontProps| {
+            (
+                Pt::new(text.chars().count() as f32 * 10.0),
+                TextMetrics {
+                    ascent: Pt::new(8.0),
+                    descent: Pt::new(2.0),
+                    leading: Pt::ZERO,
+                },
+            )
+        };
+
+        for text in ["x\u{00A0}", "x\u{202F}"] {
+            let mut fragments = Vec::new();
+            emit_text_words(
+                text,
+                &font("Test", 12.0),
+                &style(),
+                None,
+                &measure,
+                &mut fragments,
+            );
+            assert_eq!(fragments.len(), 1);
+            assert_eq!(fragments[0].width().raw(), 20.0);
+            assert_eq!(fragments[0].trimmed_width().raw(), 20.0);
         }
     }
 

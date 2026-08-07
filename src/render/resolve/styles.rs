@@ -39,11 +39,14 @@ pub struct ResolvedStyle {
 /// entry) and `toc` with no level, neither of which is an entry style.
 fn is_toc_entry_name(name: &str) -> bool {
     // OOXML style names compare case-insensitively.
-    let rest = if name.len() >= 4 && name[..4].eq_ignore_ascii_case("toc ") {
-        &name[4..]
-    } else {
+    // `get` also verifies that byte 4 is a UTF-8 character boundary. Direct
+    // slicing panics for localized names such as `页脚 Char`.
+    let (Some(prefix), Some(rest)) = (name.get(..4), name.get(4..)) else {
         return false;
     };
+    if !prefix.eq_ignore_ascii_case("toc ") {
+        return false;
+    }
     matches!(rest.parse::<u8>(), Ok(1..=9))
 }
 
@@ -504,7 +507,9 @@ mod tests {
             "toc 10",
             "toc 1x",
             "table of contents",
-            "TOCustom", // the false positive the old styleId prefix test hit
+            "TOCustom",  // the false positive the old styleId prefix test hit
+            "页脚 Char", // localized names must not panic on a byte boundary
+            "标题 1",
             "",
         ] {
             assert!(

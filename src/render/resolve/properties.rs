@@ -99,6 +99,7 @@ pub fn merge_paragraph_properties(target: &mut ParagraphProperties, base: &Parag
         contextual_spacing,
         bidi,
         word_wrap,
+        snap_to_grid,
         outline_level,
         text_alignment,
         cnf_style,
@@ -628,6 +629,7 @@ mod tests {
             contextual_spacing: Some(true),
             bidi: Some(true),
             word_wrap: Some(true),
+            snap_to_grid: Some(true),
             outline_level: Some(OutlineLevel::new(1)),
             text_alignment: Some(TextAlignment::Center),
             cnf_style: Some(CnfStyle::FIRST_ROW),
@@ -653,6 +655,7 @@ mod tests {
         assert!(target.contextual_spacing.is_some());
         assert!(target.bidi.is_some());
         assert!(target.word_wrap.is_some());
+        assert!(target.snap_to_grid.is_some());
         assert!(target.outline_level.is_some());
         assert!(target.text_alignment.is_some());
         assert!(target.cnf_style.is_some());

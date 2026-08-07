@@ -215,7 +215,7 @@ fn distribution_unit_count(fragment: &Fragment, terminal: bool) -> usize {
                 text.chars().count()
             }
         }
-        Fragment::Image { .. } | Fragment::Emoji { .. } => 1,
+        Fragment::Image { .. } | Fragment::InlineGraphic { .. } | Fragment::Emoji { .. } => 1,
         _ => 0,
     }
 }
@@ -230,6 +230,10 @@ fn distribution_gap_count_after(fragments: &[Fragment], frag_idx: usize, line_en
     } else {
         units.saturating_sub(1)
     }
+}
+
+fn inline_graphic_top(line_top: Pt, line_height: Pt, graphic_height: Pt) -> Pt {
+    line_top + line_height - graphic_height
 }
 
 fn distribution_extra_per_gap(
@@ -559,6 +563,24 @@ pub(super) fn emit_line_commands(
                             src_rect: *src_rect,
                         });
                     }
+                    x += size.width
+                        + distribution_extra
+                            * distribution_gap_count_after(fragments, frag_idx, line.end) as f32;
+                }
+                Fragment::InlineGraphic {
+                    size,
+                    commands: local_commands,
+                    ..
+                } => {
+                    // VML groups are baseline-aligned inline objects. When the
+                    // host paragraph has exact line spacing shorter than the
+                    // graphic, Word keeps the line box and lets the graphic
+                    // overhang upward instead of drawing it from the line top.
+                    let graphic_top = inline_graphic_top(*cursor_y, line_height, size.height);
+                    commands.extend(local_commands.iter().cloned().map(|mut command| {
+                        command.shift(x, graphic_top);
+                        command
+                    }));
                     x += size.width
                         + distribution_extra
                             * distribution_gap_count_after(fragments, frag_idx, line.end) as f32;
@@ -1187,6 +1209,18 @@ pub(super) fn resolve_line_height(
     rule: &LineSpacingRule,
     auto_fit: crate::render::layout::ShapeAutoFit,
 ) -> Pt {
+    let snap_natural_to_grid = |pitch: Pt| {
+        if pitch <= Pt::ZERO {
+            natural
+        } else {
+            // A precomputed line box can be shorter than the font's real
+            // ascent/descent. Reserve whole pitches for the larger box so
+            // glyphs and inline objects cannot overlap adjacent grid lines.
+            let required = natural.max(text_height);
+            let lines = (required.raw() / pitch.raw()).ceil().max(1.0);
+            pitch * lines
+        }
+    };
     let resolved = match rule {
         LineSpacingRule::Auto(multiplier) => {
             let scaled_text = text_height * *multiplier;
@@ -1196,6 +1230,19 @@ pub(super) fn resolve_line_height(
         }
         LineSpacingRule::Exact(h) => *h,
         LineSpacingRule::AtLeast(min) => natural.max(*min),
+        LineSpacingRule::Grid { pitch } => snap_natural_to_grid(*pitch),
+        LineSpacingRule::GridAuto { pitch, multiplier } => {
+            if *pitch <= Pt::ZERO {
+                let scaled_text = text_height * *multiplier;
+                scaled_text.max(natural)
+            } else {
+                let proportional = *pitch * multiplier.max(1.0);
+                snap_natural_to_grid(*pitch).max(proportional)
+            }
+        }
+        LineSpacingRule::GridAtLeast { pitch, minimum } => {
+            snap_natural_to_grid(*pitch).max(*minimum)
+        }
     };
     auto_fit.scale_line_height(resolved)
 }
@@ -1203,8 +1250,8 @@ pub(super) fn resolve_line_height(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_next_tab_stop, resolve_ptab, resolve_zone_anchor, Fragment, PTabGeometry,
-        PTabPlacement, ZoneAnchor,
+        find_next_tab_stop, inline_graphic_top, resolve_ptab, resolve_zone_anchor, Fragment,
+        PTabGeometry, PTabPlacement, ZoneAnchor,
     };
     use crate::model;
     use crate::render::dimension::Pt;
@@ -1424,5 +1471,18 @@ mod tests {
             );
             assert_eq!(calls.get(), 1, "{align:?} measures the zone once");
         }
+    }
+
+    #[test]
+    fn exact_line_spacing_baseline_aligns_a_tall_inline_graphic_upward() {
+        assert_eq!(
+            inline_graphic_top(Pt::new(470.0), Pt::new(28.0), Pt::new(365.4)),
+            Pt::new(132.6)
+        );
+        assert_eq!(
+            inline_graphic_top(Pt::new(100.0), Pt::new(50.0), Pt::new(50.0)),
+            Pt::new(100.0),
+            "an auto-sized line keeps the graphic at the line top"
+        );
     }
 }

@@ -95,6 +95,15 @@ pub enum RegisterError {
 /// Open-source metric-compatible substitutes for proprietary fonts. Tried
 /// in order when `match_family_style` for the requested family fails.
 const FONT_SUBSTITUTIONS: &[(&str, &[&str])] = &[
+    // Word on Windows maps the legacy Century Schoolbook family to Segoe
+    // Print when the requested face is absent.  This is not a cosmetic
+    // choice: Segoe Print's wider advances and taller line box materially
+    // change form pagination.  Keep conventional serif fallbacks behind the
+    // Word-compatible face for hosts that do not ship Segoe Print.
+    (
+        "Century Schoolbook",
+        &["Segoe Print", "Century", "Liberation Serif", "Noto Serif"],
+    ),
     ("Calibri", &["Carlito", "Liberation Sans", "Noto Sans"]),
     ("Cambria", &["Caladea", "Liberation Serif", "Noto Serif"]),
     ("Arial", &["Liberation Sans", "Noto Sans", "Helvetica"]),
@@ -115,6 +124,38 @@ const FONT_SUBSTITUTIONS: &[(&str, &[&str])] = &[
     ),
     ("Segoe UI", &["Noto Sans", "Liberation Sans"]),
 ];
+
+/// Canonical Windows family names for localized East Asian names commonly
+/// written into OOXML. Skia exposes the canonical English names on Windows,
+/// so an exact lookup for the localized spelling otherwise falls through to
+/// an unrelated default font and loses CJK glyphs.
+const LOCALIZED_FAMILY_ALIASES: &[(&str, &str)] = &[
+    ("宋体", "SimSun"),
+    ("微软雅黑", "Microsoft YaHei"),
+    ("等线", "DengXian"),
+    ("仿宋", "FangSong"),
+    ("仿宋_GB2312", "FangSong"),
+    ("方正仿宋_GBK", "FangSong"),
+    // 方正小标宋 is a proprietary Chinese title face frequently named in
+    // government and university forms but not embedded. SimSun is the narrow
+    // Windows Song-family fallback; unlike the generic Segoe UI fallback it
+    // retains CJK glyph coverage and a serif title character.
+    ("方正小标宋简体", "SimSun"),
+    ("方正小标宋_GBK", "SimSun"),
+    ("黑体", "SimHei"),
+    ("方正黑体_GBK", "SimHei"),
+    ("楷体", "KaiTi"),
+    ("楷体_GB2312", "KaiTi"),
+    ("方正楷体_GBK", "KaiTi"),
+    ("新細明體", "PMingLiU"),
+];
+
+fn localized_family_alias(family: &str) -> Option<&'static str> {
+    LOCALIZED_FAMILY_ALIASES
+        .iter()
+        .find(|(localized, _)| localized.eq_ignore_ascii_case(family.trim()))
+        .map(|(_, canonical)| *canonical)
+}
 
 #[derive(Debug, Clone)]
 struct EmbeddedRecord {
@@ -493,6 +534,18 @@ impl FontRegistry {
             }
         }
 
+        if let Some(canonical) = localized_family_alias(family) {
+            if let Some(tf) = match_exact(&self.font_mgr, canonical, style) {
+                log::debug!(
+                    "[font] '{}' {:?} -> localized family alias '{}'",
+                    family,
+                    style,
+                    canonical
+                );
+                return system_entry(tf);
+            }
+        }
+
         if let Some((matched, subs)) = substitutes_for(family) {
             for sub in subs {
                 if let Some(tf) = match_exact(&self.font_mgr, sub, style) {
@@ -675,6 +728,10 @@ struct FontKey {
     slant: skia_safe::font_style::Slant,
 }
 
+fn needs_synthetic_bold(requested_bold: bool, resolved_weight: i32) -> bool {
+    requested_bold && resolved_weight < *skia_safe::font_style::Weight::SEMI_BOLD
+}
+
 /// Raw (un-folded) inputs of the most recent [`FontCache::get`] call plus the
 /// slot its result lives in. Words within a run share one `FontProps`, so
 /// consecutive calls usually match this exactly and skip the `to_lowercase`
@@ -780,7 +837,14 @@ impl FontCache {
                     slant,
                 );
                 let entry = registry.resolve(font_family, resolve_style);
+                let resolved_weight = *entry.typeface.font_style().weight();
                 let mut font = Font::from_typeface(entry.typeface, f32::from(font_size));
+                // Families such as SimSun commonly ship only a regular face.
+                // FontMgr then returns that regular outline even for a bold
+                // request. Preserve the OOXML distinction by asking Skia to
+                // synthesize weight only when no semibold-or-heavier face was
+                // actually resolved; real bold fonts remain untouched.
+                font.set_embolden(needs_synthetic_bold(bold, resolved_weight));
                 font.set_subpixel(true);
                 font.set_linear_metrics(true);
                 font.set_hinting(skia_safe::FontHinting::None);
@@ -806,6 +870,15 @@ mod tests {
     use super::*;
     use skia_safe::font_style::{Slant, Weight, Width};
 
+    #[test]
+    fn synthetic_bold_is_used_only_when_a_bold_face_is_missing() {
+        assert!(needs_synthetic_bold(true, *Weight::NORMAL));
+        assert!(needs_synthetic_bold(true, *Weight::MEDIUM));
+        assert!(!needs_synthetic_bold(true, *Weight::SEMI_BOLD));
+        assert!(!needs_synthetic_bold(true, *Weight::BOLD));
+        assert!(!needs_synthetic_bold(false, *Weight::NORMAL));
+    }
+
     fn fmgr() -> FontMgr {
         FontMgr::new()
     }
@@ -815,6 +888,23 @@ mod tests {
             family: family.to_owned(),
             weight,
         }
+    }
+
+    #[test]
+    fn localized_cjk_family_names_map_to_windows_canonical_names() {
+        assert_eq!(localized_family_alias("宋体"), Some("SimSun"));
+        assert_eq!(
+            localized_family_alias(" 微软雅黑 "),
+            Some("Microsoft YaHei")
+        );
+        assert_eq!(localized_family_alias("等线"), Some("DengXian"));
+        assert_eq!(localized_family_alias("仿宋_GB2312"), Some("FangSong"));
+        assert_eq!(localized_family_alias("方正仿宋_GBK"), Some("FangSong"));
+        assert_eq!(localized_family_alias("方正小标宋简体"), Some("SimSun"));
+        assert_eq!(localized_family_alias("方正小标宋_GBK"), Some("SimSun"));
+        assert_eq!(localized_family_alias("方正黑体_GBK"), Some("SimHei"));
+        assert_eq!(localized_family_alias("方正楷体_GBK"), Some("KaiTi"));
+        assert_eq!(localized_family_alias("Calibri"), None);
     }
 
     #[test]
@@ -1256,6 +1346,14 @@ mod tests {
         // A family that is not in the table stays absent, stripped or not.
         assert!(substitutes_for("Wingdings").is_none());
         assert!(substitutes_for("Wingdings Light").is_none());
+    }
+
+    #[test]
+    fn century_schoolbook_uses_the_word_compatible_windows_fallback_first() {
+        let (matched, substitutes) =
+            substitutes_for("Century Schoolbook").expect("known legacy family");
+        assert_eq!(matched, "Century Schoolbook");
+        assert_eq!(substitutes.first(), Some(&"Segoe Print"));
     }
 
     // ─── Chain guards (H2#6) ──────────────────────────────────────────────
