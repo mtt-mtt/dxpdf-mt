@@ -35,7 +35,7 @@ reintroduce a global typeface cache.
 ## The resolution chain
 
 `FontRegistry::resolve(family, style)` is cached after first call. On a miss,
-`resolve_uncached` tries five steps in order:
+`resolve_uncached` tries six steps in order:
 
 1. **Embedded fonts** — anything in `word/fonts/*.odttf` wins outright. This is
    the highest-fidelity option: it is the exact font the author used.
@@ -43,7 +43,7 @@ reintroduce a global typeface cache.
    family name actually matches what was asked for (`is_exact_family`). Whether
    the matcher substitutes is **platform-dependent**: fontconfig routinely
    returns a fallback, so an unchecked match would swallow every miss and make
-   steps 3–5 unreachable; CoreText declines instead — measured on macOS, every
+   steps 3–6 unreachable; CoreText declines instead — measured on macOS, every
    unknown name tried returns `None`, including the CSS generics `sans-serif`,
    `serif` and `monospace`. So the guard is inert on macOS and load-bearing on
    Linux, which is also why it is tested on the predicate rather than through
@@ -53,7 +53,12 @@ reintroduce a global typeface cache.
    names to `(family, weight)`. This catches documents that name a *face*
    (`Arial-BoldMT`, `HelveticaNeue-Light`) where Skia indexes the *family*.
    Ambiguous names are recorded as `Ambiguous` and skipped rather than guessed.
-4. **Metric-compatible substitution** — `FONT_SUBSTITUTIONS`, tried in order.
+4. **Localized East Asian family aliases** — narrowly maps names that Windows
+   font APIs expose under a different canonical family. This includes common
+   localized system names and the frequently referenced, non-embedded
+   `方正小标宋简体`, which falls back to the Song-family `SimSun` instead of a
+   CJK-incapable generic UI font.
+5. **Metric-compatible substitution** — `FONT_SUBSTITUTIONS`, tried in order.
    The table is keyed by *family*, so a face-qualified name falls back to its
    base family first: `"Segoe UI Light"` → strip the trailing weight word →
    `"Segoe UI"` → that family's substitutes. Without it a document naming a face
@@ -62,10 +67,25 @@ reintroduce a global typeface cache.
    all from a face name to its family's substitutes. The longest weight suffix
    wins, and the suffix must be a separate trailing word — `"Highlight"` is not
    face-qualified.
-5. **System default** — `legacy_make_typeface(None, style)`.
+6. **System default** — `legacy_make_typeface(None, style)`.
 
 Every step logs at `debug`, so `RUST_LOG=debug` shows exactly which arm fired
 for each family — the fastest way to diagnose a font-fidelity complaint.
+
+### OOXML font slots and East Asian theme faces
+
+`w:rFonts` does not name one font for a whole run. It has separate `ascii`,
+`hAnsi`, `eastAsia`, and `cs` slots, and one `<w:r>` may contain characters
+from more than one slot. The fragment collector therefore splits mixed Latin
+and East Asian text at strong-script boundaries before measuring it. Neutral
+punctuation remains with the preceding strong script.
+
+For `majorEastAsia` and `minorEastAsia`, a DrawingML theme may leave the
+generic East Asian typeface empty and provide only script-specific faces such
+as `Hans`, `Hant`, `Jpan`, and `Hang`. Resolution checks those script faces
+using `w:lang/@w:eastAsia` plus the text itself. Documents that reference the
+standard Office theme but omit the theme part use the corresponding Office
+fallback family (`SimSun`, `PMingLiU`, `Yu Mincho`, or `Malgun Gothic`).
 
 > **Read that log with care: most of its lines describe fonts nothing draws.**
 > `FontRegistry::build` calls `preload`, which resolves all four style variants
@@ -102,6 +122,7 @@ used rather than a generic sans/serif.
 
 | Requested | Substitutes, in order |
 |---|---|
+| Century Schoolbook | Segoe Print, Century, Liberation Serif, Noto Serif |
 | Calibri | Carlito, Liberation Sans, Noto Sans |
 | Cambria | Caladea, Liberation Serif, Noto Serif |
 | Arial | Liberation Sans, Noto Sans, Helvetica |

@@ -34,7 +34,10 @@ With widths fixed, each cell is laid out under a tight width constraint via
 height is the max over its cells, then adjusted by:
 
 - **§17.4.81 `RowHeightRule`** — `AtLeast(Pt)` grows to fit content;
-  `Exact(Pt)` pins the height and lets content clip.
+  `Exact(Pt)` pins the content budget and lets content clip. Word/WPS reserve
+  the largest effective bottom cell margin after that exact budget, so the
+  measured row height is `exact + max(bottom cell margin)` (plus any table cell
+  spacing handled separately).
 - **§17.4.85 vertical merge** — `expand_rows_for_vmerge` grows the rows of a
   merge group so the `Restart` cell's content fits within the combined spanned
   height. The shortfall is spread **evenly** across every row in the span

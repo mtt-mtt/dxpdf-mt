@@ -128,6 +128,28 @@ the first segment by `prefix_adjusted_head` so a split never tears the glyph or
 strands a wrapped line, and the §17.9 list label is first-segment-only by
 construction (it lives on line 0).
 
+### Inline page breaks at hard section boundaries
+
+A section break is stored on the final paragraph mark of the outgoing section.
+For a following next/odd/even-page section, Word does not let a plain,
+otherwise empty section-mark paragraph create a page of its own. Before layout,
+the renderer suppresses only that terminal mark. A preceding inline page break
+therefore coalesces naturally with the hard section boundary. Decorated
+paragraphs, paragraphs with notes or floating objects, continuous sections, and
+next-column sections are not suppressed.
+
+Likewise, a run of plain empty paragraphs immediately before either a paragraph
+with `pageBreakBefore` or a paragraph whose first meaningful fragment is an
+inline page break may fill the tail of the current page but does not create a
+separate blank page. The explicit break remains authoritative. This rule does
+not collapse two real inline page breaks; authors can still create a deliberate
+blank page with consecutive break markers.
+
+A break-only paragraph may also keep its invisible bookmark or paragraph mark
+at the page tail. Its inline break terminates `keepNext` prediction and moves
+the following content forward once; the structural mark is not first moved to
+an otherwise empty page.
+
 ### Footnotes
 
 `reserve_footnotes` (§17.11.23) measures each footnote on the current page,
