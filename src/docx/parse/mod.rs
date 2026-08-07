@@ -21,12 +21,17 @@ use std::sync::Arc;
 use crate::docx::error::{ParseError, Result};
 use crate::docx::model::*;
 use crate::docx::relationships::{RelationshipType, Relationships};
-use crate::docx::zip::{self, PackageContents};
+use crate::docx::zip::{self, PackageContents, PackageLimits};
 
 /// Parse a DOCX file from raw bytes into a `Document`.
 pub fn parse(data: &[u8]) -> Result<Document> {
+    parse_with_limits(data, &PackageLimits::default())
+}
+
+/// Parse a DOCX while enforcing caller-supplied package resource limits.
+pub fn parse_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Document> {
     // Phase 1: Unzip
-    let mut package = PackageContents::from_bytes(data)?;
+    let mut package = PackageContents::from_bytes_with_limits(data, limits)?;
 
     // Phase 1b: Find main document part via package-level rels
     let pkg_rels_data = package.require_part("_rels/.rels")?;

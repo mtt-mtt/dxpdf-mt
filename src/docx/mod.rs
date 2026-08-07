@@ -30,3 +30,11 @@ pub mod zip;
 pub fn parse(data: &[u8]) -> error::Result<model::Document> {
     parse::parse(data)
 }
+
+/// Parse a DOCX with explicit ZIP/package resource limits.
+pub fn parse_with_limits(
+    data: &[u8],
+    limits: &zip::PackageLimits,
+) -> error::Result<model::Document> {
+    parse::parse_with_limits(data, limits)
+}

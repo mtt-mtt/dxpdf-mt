@@ -66,6 +66,17 @@ pub(super) fn parse_style(s: Option<String>) -> VmlStyle {
                     }
                 };
             }
+            "v-text-anchor" => {
+                style.text_anchor = match val {
+                    "top" => Some(VmlTextAnchor::Top),
+                    "middle" => Some(VmlTextAnchor::Middle),
+                    "bottom" => Some(VmlTextAnchor::Bottom),
+                    _ => {
+                        log::warn!("vml-style: unsupported v-text-anchor value {:?}", val);
+                        None
+                    }
+                };
+            }
             "mso-position-horizontal" => {
                 style.mso_position_horizontal = match val {
                     "absolute" => Some(MsoPositionH::Absolute),
@@ -252,6 +263,12 @@ mod tests {
         let s = parse_style(Some("flip:xy;visibility:hidden".into()));
         assert_eq!(s.flip, Some(VmlFlip::XY));
         assert_eq!(s.visibility, Some(CssVisibility::Hidden));
+    }
+
+    #[test]
+    fn text_anchor_is_preserved() {
+        let s = parse_style(Some("v-text-anchor:middle".into()));
+        assert_eq!(s.text_anchor, Some(VmlTextAnchor::Middle));
     }
 
     #[test]

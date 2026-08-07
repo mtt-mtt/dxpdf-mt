@@ -2,8 +2,11 @@ pub mod docx;
 pub mod error;
 pub mod field;
 pub mod model;
+#[doc(hidden)]
+pub mod path_io;
 pub mod render;
 
+pub use docx::zip::PackageLimits;
 pub use error::Error;
 pub use render::{RenderOptions, DEFAULT_IMAGE_DPI, MIN_IMAGE_DPI};
 
@@ -15,10 +18,19 @@ pub fn convert(docx_bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// Convert raw DOCX bytes into PDF bytes with caller-supplied [`RenderOptions`]
 /// (e.g. a non-default embedded-image DPI).
 pub fn convert_with_options(docx_bytes: &[u8], options: &RenderOptions) -> Result<Vec<u8>, Error> {
+    convert_with_options_and_limits(docx_bytes, options, &PackageLimits::default())
+}
+
+/// Convert DOCX bytes with explicit rendering and package resource limits.
+pub fn convert_with_options_and_limits(
+    docx_bytes: &[u8],
+    options: &RenderOptions,
+    limits: &PackageLimits,
+) -> Result<Vec<u8>, Error> {
     use std::time::Instant;
 
     let t0 = Instant::now();
-    let document = crate::docx::parse(docx_bytes)?;
+    let document = crate::docx::parse_with_limits(docx_bytes, limits)?;
     log::debug!("Parse:  {:?}", t0.elapsed());
 
     let t1 = Instant::now();
@@ -55,12 +67,12 @@ mod python {
     #[pyfunction]
     #[pyo3(signature = (input, output, image_dpi = crate::DEFAULT_IMAGE_DPI))]
     fn convert_file(input: &str, output: &str, image_dpi: f32) -> PyResult<()> {
-        let docx_bytes = std::fs::read(input)
+        let docx_bytes = crate::path_io::read(input)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to read {input}: {e}")))?;
         let options = crate::RenderOptions::default().with_image_dpi(image_dpi);
         let pdf_bytes = crate::convert_with_options(&docx_bytes, &options)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        std::fs::write(output, &pdf_bytes)
+        crate::path_io::write(output, &pdf_bytes)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to write {output}: {e}")))?;
         Ok(())
     }

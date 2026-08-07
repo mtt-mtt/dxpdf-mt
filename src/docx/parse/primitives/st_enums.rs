@@ -675,9 +675,12 @@ impl From<StPTabLeader> for PTabLeader {
 // ── StTblLayoutType (§17.18.87) ───────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum StTblLayoutType {
+    /// ECMA-376 spells the automatic layout value `autofit`. The `auto`
+    /// alias preserves compatibility with documents produced for older dxpdf.
+    #[serde(rename = "autofit", alias = "auto")]
     Auto,
+    #[serde(rename = "fixed")]
     Fixed,
 }
 
@@ -771,9 +774,11 @@ impl From<StTextDirection> for TextDirection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StTheme {
+    #[serde(alias = "majorAscii")]
     MajorHAnsi,
     MajorEastAsia,
     MajorBidi,
+    #[serde(alias = "minorAscii")]
     MinorHAnsi,
     MinorEastAsia,
     MinorBidi,
@@ -1169,6 +1174,10 @@ mod tests {
     #[test]
     fn tbl_layout_type_both() {
         assert_eq!(
+            de::<StTblLayoutType>("autofit").unwrap(),
+            StTblLayoutType::Auto
+        );
+        assert_eq!(
             de::<StTblLayoutType>("auto").unwrap(),
             StTblLayoutType::Auto
         );
@@ -1276,6 +1285,8 @@ mod tests {
         );
         assert_eq!(de::<StTheme>("majorBidi").unwrap(), StTheme::MajorBidi);
         assert_eq!(de::<StTheme>("minorHAnsi").unwrap(), StTheme::MinorHAnsi);
+        assert_eq!(de::<StTheme>("minorAscii").unwrap(), StTheme::MinorHAnsi);
+        assert_eq!(de::<StTheme>("majorAscii").unwrap(), StTheme::MajorHAnsi);
         assert_eq!(
             de::<StTheme>("minorEastAsia").unwrap(),
             StTheme::MinorEastAsia

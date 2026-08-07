@@ -8,7 +8,7 @@
 
 #![allow(dead_code, clippy::large_enum_variant)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::docx::model::{
     Block, Pict, RelId, VmlArc, VmlCommonAttrs, VmlConnectType, VmlCurve, VmlDashStyle,
@@ -127,8 +127,14 @@ pub(crate) struct CommonAttrsXml {
     pub style: Option<String>,
     #[serde(rename = "@fillcolor", default)]
     pub fillcolor: Option<String>,
+    #[serde(rename = "@filled", default)]
+    pub filled: Option<VmlBool>,
     #[serde(rename = "@stroked", default)]
     pub stroked: Option<VmlBool>,
+    #[serde(rename = "@strokecolor", default)]
+    pub strokecolor: Option<String>,
+    #[serde(rename = "@strokeweight", default)]
+    pub strokeweight: Option<String>,
     #[serde(rename = "stroke", default)]
     pub stroke: Option<StrokeXml>,
     #[serde(rename = "textbox", default)]
@@ -196,7 +202,10 @@ impl CommonAttrsXml {
             id: self.id.map(VmlShapeId::new),
             style: parse_style(self.style),
             fill_color: self.fillcolor.as_deref().and_then(parse_color),
+            filled: self.filled.map(|b| b.0),
             stroked: self.stroked.map(|b| b.0),
+            stroke_color: self.strokecolor.as_deref().and_then(parse_color),
+            stroke_weight: self.strokeweight.as_deref().and_then(parse_length),
             stroke: self.stroke.map(Into::into),
             text_box: self.textbox.map(|t| t.into_model(ctx)),
             wrap: self.wrap.map(Into::into),
@@ -274,8 +283,14 @@ pub(crate) struct ShapeXml {
     pub style: Option<String>,
     #[serde(rename = "@fillcolor", default)]
     pub fillcolor: Option<String>,
+    #[serde(rename = "@filled", default)]
+    pub filled: Option<VmlBool>,
     #[serde(rename = "@stroked", default)]
     pub stroked: Option<VmlBool>,
+    #[serde(rename = "@strokecolor", default)]
+    pub strokecolor: Option<String>,
+    #[serde(rename = "@strokeweight", default)]
+    pub strokeweight: Option<String>,
 
     #[serde(rename = "stroke", default)]
     pub stroke: Option<StrokeXml>,
@@ -298,7 +313,10 @@ impl ShapeXml {
                 id: self.id.map(VmlShapeId::new),
                 style: parse_style(self.style),
                 fill_color: self.fillcolor.as_deref().and_then(parse_color),
+                filled: self.filled.map(|b| b.0),
                 stroked: self.stroked.map(|b| b.0),
+                stroke_color: self.strokecolor.as_deref().and_then(parse_color),
+                stroke_weight: self.strokeweight.as_deref().and_then(parse_length),
                 stroke: self.stroke.map(Into::into),
                 text_box: self.textbox.map(|t| t.into_model(ctx)),
                 wrap: self.wrap.map(Into::into),
@@ -335,8 +353,14 @@ pub(crate) struct RectXml {
     pub style: Option<String>,
     #[serde(rename = "@fillcolor", default)]
     pub fillcolor: Option<String>,
+    #[serde(rename = "@filled", default)]
+    pub filled: Option<VmlBool>,
     #[serde(rename = "@stroked", default)]
     pub stroked: Option<VmlBool>,
+    #[serde(rename = "@strokecolor", default)]
+    pub strokecolor: Option<String>,
+    #[serde(rename = "@strokeweight", default)]
+    pub strokeweight: Option<String>,
     #[serde(rename = "stroke", default)]
     pub stroke: Option<StrokeXml>,
     #[serde(rename = "textbox", default)]
@@ -356,7 +380,10 @@ impl RectXml {
                 id: self.id.map(VmlShapeId::new),
                 style: parse_style(self.style),
                 fill_color: self.fillcolor.as_deref().and_then(parse_color),
+                filled: self.filled.map(|b| b.0),
                 stroked: self.stroked.map(|b| b.0),
+                stroke_color: self.strokecolor.as_deref().and_then(parse_color),
+                stroke_weight: self.strokeweight.as_deref().and_then(parse_length),
                 stroke: self.stroke.map(Into::into),
                 text_box: self.textbox.map(|t| t.into_model(ctx)),
                 wrap: self.wrap.map(Into::into),
@@ -375,8 +402,28 @@ pub(crate) struct RoundRectXml {
     /// `@arcsize` — corner radius as a fraction (e.g. "10923f" = ~16.7%
     /// in the spec's fixed-point format, or a plain decimal). We accept
     /// floats; downstream layout clamps to [0, 1].
-    #[serde(rename = "@arcsize", default)]
+    #[serde(
+        rename = "@arcsize",
+        default,
+        deserialize_with = "deserialize_optional_vml_fraction"
+    )]
     pub arcsize: Option<f32>,
+}
+
+fn deserialize_optional_vml_fraction<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Some(fixed) = raw.strip_suffix('f') {
+        let value = fixed.parse::<i64>().map_err(serde::de::Error::custom)?;
+        return Ok(Some(value as f32 / 65_536.0));
+    }
+    raw.parse::<f32>()
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 impl RoundRectXml {
@@ -545,6 +592,19 @@ pub(crate) struct GroupXml {
 
 impl GroupXml {
     fn into_model(self, ctx: &mut crate::docx::parse::body::ConvertCtx) -> VmlGroup {
+        let mut shape_types = Vec::new();
+        let mut children = Vec::new();
+        for child in self.children {
+            match child {
+                VmlPrimitiveXml::ShapeType(shape_type) => shape_types.push((*shape_type).into()),
+                other => {
+                    if let Some(primitive) = other.into_model(ctx) {
+                        children.push(primitive);
+                    }
+                }
+            }
+        }
+
         VmlGroup {
             common: VmlCommonAttrs {
                 id: self.id.map(VmlShapeId::new),
@@ -555,11 +615,8 @@ impl GroupXml {
             },
             coord_size: parse_vector2d(self.coord_size),
             coord_origin: parse_vector2d(self.coord_origin),
-            children: self
-                .children
-                .into_iter()
-                .filter_map(|c| c.into_model(ctx))
-                .collect(),
+            shape_types,
+            children,
         }
     }
 }
@@ -660,6 +717,10 @@ fn parse_inset(s: String) -> Option<VmlTextBoxInset> {
 
 #[derive(Deserialize)]
 pub(crate) struct StrokeXml {
+    #[serde(rename = "@color", default)]
+    pub color: Option<String>,
+    #[serde(rename = "@weight", default)]
+    pub weight: Option<String>,
     #[serde(rename = "@dashstyle", default)]
     pub dashstyle: Option<String>,
     #[serde(rename = "@joinstyle", default)]
@@ -669,6 +730,8 @@ pub(crate) struct StrokeXml {
 impl From<StrokeXml> for VmlStroke {
     fn from(x: StrokeXml) -> Self {
         Self {
+            color: x.color.as_deref().and_then(parse_color),
+            weight: x.weight.as_deref().and_then(parse_length),
             dash_style: x.dashstyle.as_deref().and_then(parse_dash_style),
             join_style: x.joinstyle.as_deref().and_then(parse_join_style),
         }
@@ -1075,6 +1138,71 @@ mod tests {
             panic!();
         };
         assert!((rr.arcsize.unwrap() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn primitive_visual_attributes_are_preserved() {
+        let p = parse(
+            r##"<pict>
+                <oval style="left:0;top:0;width:100;height:50"
+                      filled="f" stroked="t" strokecolor="blue [12]"
+                      strokeweight="1.5pt">
+                    <stroke color="#ff0000" weight="2pt" dashstyle="dash"/>
+                </oval>
+            </pict>"##,
+        );
+        let VmlPrimitive::Oval(oval) = &p.primitives[0] else {
+            panic!("expected oval");
+        };
+        assert_eq!(oval.common.filled, Some(false));
+        assert_eq!(oval.common.stroked, Some(true));
+        assert_eq!(
+            oval.common.stroke_color,
+            Some(VmlColor::Named(crate::model::VmlNamedColor::Blue))
+        );
+        assert_eq!(
+            oval.common.stroke_weight.unwrap().to_absolute_points(),
+            Some(1.5)
+        );
+        let stroke = oval.common.stroke.as_ref().unwrap();
+        assert_eq!(stroke.color, Some(VmlColor::Rgb(255, 0, 0)));
+        assert_eq!(stroke.weight.unwrap().to_absolute_points(), Some(2.0));
+        assert_eq!(stroke.dash_style, Some(VmlDashStyle::Dash));
+    }
+
+    #[test]
+    fn group_preserves_scoped_shape_types_separately_from_primitives() {
+        let p = parse(
+            r##"<pict>
+                <group id="g" coordsize="1000,500" style="width:200pt;height:100pt">
+                    <shapetype id="_x0000_t176" coordsize="21600,21600" path="m,l21600,0,21600,21600,0,21600xe"/>
+                    <shape id="s" type="#_x0000_t176" style="left:10;top:20;width:100;height:50"/>
+                    <line id="l" from="0,0" to="100,50"/>
+                </group>
+            </pict>"##,
+        );
+        let VmlPrimitive::Group(group) = &p.primitives[0] else {
+            panic!("expected group");
+        };
+        assert_eq!(group.shape_types.len(), 1);
+        assert_eq!(
+            group.shape_types[0].id.as_ref().map(VmlShapeId::as_str),
+            Some("_x0000_t176")
+        );
+        assert_eq!(group.children.len(), 2);
+        assert!(matches!(group.children[0], VmlPrimitive::Shape(_)));
+        assert!(matches!(group.children[1], VmlPrimitive::Line(_)));
+    }
+
+    #[test]
+    fn roundrect_accepts_vml_fixed_point_arcsize() {
+        let p = parse(
+            r#"<pict><roundrect id="rr" arcsize="6554f" style="width:50pt;height:30pt"/></pict>"#,
+        );
+        let VmlPrimitive::RoundRect(rr) = &p.primitives[0] else {
+            panic!();
+        };
+        assert!((rr.arcsize.unwrap() - 0.1).abs() < 1e-4);
     }
 
     #[test]

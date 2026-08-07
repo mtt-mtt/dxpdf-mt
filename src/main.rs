@@ -77,9 +77,9 @@ fn run() -> Result<(), dxpdf::Error> {
 
     let options = RenderOptions::default().with_image_dpi(cli.image_dpi);
 
-    let docx_bytes = std::fs::read(&cli.input)?;
+    let docx_bytes = dxpdf::path_io::read(&cli.input)?;
     let pdf_bytes = dxpdf::convert_with_options(&docx_bytes, &options)?;
-    std::fs::write(&output, &pdf_bytes)?;
+    dxpdf::path_io::write(&output, &pdf_bytes)?;
     eprintln!("Converted {} -> {}", cli.input.display(), output.display());
 
     Ok(())

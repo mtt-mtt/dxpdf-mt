@@ -23,7 +23,7 @@ impl<'de> Deserialize<'de> for IntegerMeasure {
     }
 }
 
-fn parse_integer_measure(raw: &str) -> Result<IntegerMeasure, &'static str> {
+pub(crate) fn parse_integer_measure(raw: &str) -> Result<IntegerMeasure, &'static str> {
     if let Ok(value) = raw.parse::<i64>() {
         return Ok(IntegerMeasure {
             value,

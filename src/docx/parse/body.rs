@@ -13,6 +13,7 @@ use crate::docx::model::*;
 use crate::docx::parse::body_schema::*;
 use crate::docx::parse::serde_xml::from_xml;
 use crate::docx::whitespace_workaround::restore_whitespace_sentinels;
+use std::collections::HashMap;
 
 /// Parse `w:document > w:body`, returning blocks and final section properties.
 pub fn parse_body(data: &[u8]) -> Result<(Vec<Block>, SectionProperties)> {
@@ -53,12 +54,31 @@ struct DocXml {
 /// inline. Kept as a type for future extensibility (e.g., if a later phase
 /// needs cross-node state during conversion).
 pub(crate) struct ConvertCtx {
-    _private: (),
+    /// OOXML specifies decimal bookmark IDs, while some third-party writers
+    /// emit opaque strings. Non-standard values receive stable negative IDs.
+    bookmark_ids: HashMap<String, BookmarkId>,
+    next_synthetic_bookmark_id: i64,
 }
 
 impl ConvertCtx {
     pub(crate) fn new() -> Self {
-        Self { _private: () }
+        Self {
+            bookmark_ids: HashMap::new(),
+            next_synthetic_bookmark_id: -1,
+        }
+    }
+
+    fn bookmark_id(&mut self, raw: &str) -> BookmarkId {
+        if let Ok(id) = raw.parse::<i64>() {
+            return BookmarkId::new(id);
+        }
+        if let Some(id) = self.bookmark_ids.get(raw) {
+            return *id;
+        }
+        let id = BookmarkId::new(self.next_synthetic_bookmark_id);
+        self.next_synthetic_bookmark_id -= 1;
+        self.bookmark_ids.insert(raw.to_owned(), id);
+        id
     }
 }
 
@@ -118,18 +138,15 @@ fn convert_paragraph(p: ParaXml, ctx: &mut ConvertCtx) -> (Paragraph, Option<Sec
         del: hex_rsid(p.rsid_del.as_deref()),
     };
 
-    // pPr may appear as either the dedicated field OR inside $value (serde
-    // collects all matching children; since `pPr` is named on the struct
-    // *and* in the enum, serde prefers the dedicated field — but just in
-    // case, we merge from both sources).
-    let p_pr = p.p_pr.or_else(|| {
-        p.content.iter().find_map(|c| {
-            if let ParaChildXml::PPr(pp) = c {
-                Some((**pp).clone())
-            } else {
-                None
-            }
-        })
+    // Keep paragraph children in one mixed-content stream. Some third-party
+    // writers place bookmarkStart before pPr. A separate named pPr field makes
+    // quick-xml reopen `$value` after pPr and fail with `duplicate field`.
+    let p_pr = p.content.iter().find_map(|c| {
+        if let ParaChildXml::PPr(pp) = c {
+            Some((**pp).clone())
+        } else {
+            None
+        }
     });
 
     let parsed_p_pr = p_pr.map(|pp| pp.split());
@@ -206,6 +223,10 @@ fn extend_from_run(r: RunXml, out: &mut Vec<Inline>, ctx: &mut ConvertCtx) {
                 flush(&mut acc, out);
                 out.push(Inline::Pict(p.into_model(ctx)));
             }
+            RunChildXml::Object(object) => {
+                flush(&mut acc, out);
+                out.push(Inline::Pict(object.into_model(ctx)));
+            }
             RunChildXml::Sym(s) => {
                 flush(&mut acc, out);
                 let char_code = u16::from_str_radix(&s.char, 16).unwrap_or_else(|_| {
@@ -219,7 +240,12 @@ fn extend_from_run(r: RunXml, out: &mut Vec<Inline>, ctx: &mut ConvertCtx) {
             }
             RunChildXml::InstrText(t) => {
                 flush(&mut acc, out);
-                out.push(Inline::InstrText(restore_whitespace_sentinels(&t.content)));
+                out.push(Inline::InstrTextRun(Box::new(TextRun {
+                    style_id: style_id.clone(),
+                    properties: props.clone(),
+                    content: vec![RunElement::Text(restore_whitespace_sentinels(&t.content))],
+                    rsids,
+                })));
             }
             RunChildXml::FldChar(fc) => {
                 flush(&mut acc, out);
@@ -253,6 +279,7 @@ fn extend_from_run(r: RunXml, out: &mut Vec<Inline>, ctx: &mut ConvertCtx) {
                 flush(&mut acc, out);
                 out.push(Inline::ContinuationSeparator);
             }
+            RunChildXml::CommentReference(_) => {}
             RunChildXml::AlternateContent(ac) => {
                 flush(&mut acc, out);
                 out.push(Inline::AlternateContent(convert_alt_content(ac, ctx)));
@@ -310,17 +337,22 @@ fn append_para_children(
                 content.push(Inline::Field(convert_fld_simple(f, ctx)));
             }
             ParaChildXml::BookmarkStart(b) => content.push(Inline::BookmarkStart {
-                id: BookmarkId::new(b.id),
+                id: ctx.bookmark_id(&b.id),
                 name: b.name,
             }),
             ParaChildXml::BookmarkEnd(b) => {
-                content.push(Inline::BookmarkEnd(BookmarkId::new(b.id)));
+                content.push(Inline::BookmarkEnd(ctx.bookmark_id(&b.id)));
             }
             // Insert-side revision + structural wrappers: flatten and render.
             ParaChildXml::Ins(w)
             | ParaChildXml::MoveTo(w)
             | ParaChildXml::SmartTag(w)
             | ParaChildXml::CustomXml(w) => append_para_children(w.content, content, ctx),
+            ParaChildXml::Sdt(sdt) => {
+                if let Some(sdt_content) = sdt.content {
+                    append_para_children(sdt_content.children, content, ctx);
+                }
+            }
             // Delete-side revision wrappers: content is deleted — drop it.
             ParaChildXml::Del(_) | ParaChildXml::MoveFrom(_) => {}
             ParaChildXml::PPr(_) => {} // already captured on the parent
@@ -606,6 +638,73 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[test]
+    fn bookmark_before_properties_with_opaque_id_is_tolerated() {
+        let xml = r#"<w:p xmlns:w="x">
+            <w:bookmarkStart w:id="wps-opaque-id" w:name="heading"/>
+            <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+            <w:r><w:t>Title</w:t></w:r>
+            <w:bookmarkEnd w:id="wps-opaque-id"/>
+        </w:p>"#;
+        let parsed: ParaXml = quick_xml::de::from_str(xml).unwrap();
+        let mut ctx = ConvertCtx::new();
+        let (paragraph, _) = convert_paragraph(parsed, &mut ctx);
+
+        assert_eq!(
+            paragraph.style_id.as_ref().map(StyleId::as_str),
+            Some("Heading2")
+        );
+        assert_eq!(collect_text(&paragraph.content), "Title");
+        let start_id = paragraph.content.iter().find_map(|inline| match inline {
+            Inline::BookmarkStart { id, .. } => Some(*id),
+            _ => None,
+        });
+        let end_id = paragraph.content.iter().find_map(|inline| match inline {
+            Inline::BookmarkEnd(id) => Some(*id),
+            _ => None,
+        });
+        assert_eq!(start_id, end_id);
+        assert!(start_id.is_some());
+    }
+
+    #[test]
+    fn comment_reference_inside_run_is_ignored() {
+        let xml = r#"<w:p xmlns:w="x">
+            <w:r>
+                <w:t>A</w:t>
+                <w:commentReference w:id="7"/>
+                <w:t>B</w:t>
+            </w:r>
+        </w:p>"#;
+        let parsed: ParaXml = quick_xml::de::from_str(xml).unwrap();
+        let mut ctx = ConvertCtx::new();
+        let (paragraph, _) = convert_paragraph(parsed, &mut ctx);
+
+        assert_eq!(collect_text(&paragraph.content), "AB");
+    }
+
+    #[test]
+    fn ole_object_uses_its_vml_preview() {
+        let xml = r##"<w:p xmlns:w="w" xmlns:v="v" xmlns:o="o" xmlns:r="r">
+            <w:r>
+                <w:object>
+                    <v:shape id="preview" style="width:40pt;height:20pt">
+                        <v:imagedata r:id="rId1"/>
+                    </v:shape>
+                    <o:OLEObject Type="Embed" ProgID="Excel.Sheet" r:id="rId2"/>
+                </w:object>
+            </w:r>
+        </w:p>"##;
+        let parsed: ParaXml = quick_xml::de::from_str(xml).unwrap();
+        let mut ctx = ConvertCtx::new();
+        let (paragraph, _) = convert_paragraph(parsed, &mut ctx);
+
+        let Some(Inline::Pict(preview)) = paragraph.content.into_iter().next() else {
+            panic!("expected the OLE object's VML preview");
+        };
+        assert_eq!(preview.primitives.len(), 1);
+    }
+
     // ── Revision & structural wrappers (accept-all-changes / final view) ──
 
     #[test]
@@ -672,6 +771,19 @@ mod tests {
                 r#"<w:p xmlns:w="x"><w:customXml><w:r><w:t>tagged</w:t></w:r></w:customXml></w:p>"#
             ),
             "tagged"
+        );
+    }
+
+    #[test]
+    fn inline_sdt_content_is_flattened() {
+        assert_eq!(
+            para_text(
+                r#"<w:p xmlns:w="x"><w:sdt>
+                     <w:sdtPr><w:id w:val="7"/></w:sdtPr>
+                     <w:sdtContent><w:r><w:t>visible</w:t></w:r></w:sdtContent>
+                   </w:sdt></w:p>"#
+            ),
+            "visible"
         );
     }
 

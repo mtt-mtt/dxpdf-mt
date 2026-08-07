@@ -132,12 +132,14 @@ impl FontSlot {
 
     /// Merge `base` into `self`: fill any `None` field from `base`.
     ///
-    /// Only the `explicit` name is propagated through inheritance — theme
-    /// references are resolved into `explicit` before the merge step, so
-    /// carrying the raw `ThemeFontRef` through the cascade is unnecessary.
+    /// A theme reference is normally resolved before this merge. Keep an
+    /// unresolved reference when the theme's generic East Asian face is empty,
+    /// though: the layout layer still needs it to select a per-script face
+    /// such as the theme's `Hans` font.
     pub fn merge_from(&mut self, base: &FontSlot) {
-        if self.explicit.is_none() {
+        if self.explicit.is_none() && self.theme.is_none() {
             self.explicit = base.explicit.clone();
+            self.theme = base.theme;
         }
     }
 }

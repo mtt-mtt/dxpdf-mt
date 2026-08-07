@@ -115,8 +115,16 @@ pub struct VmlCommonAttrs {
     pub style: VmlStyle,
     /// `@fillcolor` attribute fill color.
     pub fill_color: Option<VmlColor>,
+    /// Whether the primitive is filled (`@filled`). VML defaults this to true,
+    /// but renderers may still leave a primitive transparent when no explicit
+    /// fill colour or fill child is present.
+    pub filled: Option<bool>,
     /// Whether the shape has a stroke.
     pub stroked: Option<bool>,
+    /// Primitive-level `@strokecolor`.
+    pub stroke_color: Option<VmlColor>,
+    /// Primitive-level `@strokeweight`.
+    pub stroke_weight: Option<VmlLength>,
     /// VML §14.1.2.21: stroke child element.
     pub stroke: Option<VmlStroke>,
     /// VML §14.1.2.22: text box child element.
@@ -250,6 +258,12 @@ pub struct VmlGroup {
     pub coord_size: Option<VmlVector2D>,
     /// Origin of the group's coord space (`@coordorigin`).
     pub coord_origin: Option<VmlVector2D>,
+    /// Reusable shape definitions scoped to this group.
+    ///
+    /// Word commonly places a `<v:shapetype>` beside the group's primitive
+    /// children. Keeping those definitions on the group is required before a
+    /// child `<v:shape type="#...">` can resolve its geometry and defaults.
+    pub shape_types: Vec<VmlShapeType>,
     /// Child primitives in the group's coordinate system.
     pub children: Vec<VmlPrimitive>,
 }
@@ -564,6 +578,8 @@ pub struct VmlStyle {
     pub flip: Option<VmlFlip>,
     /// CSS `visibility`.
     pub visibility: Option<CssVisibility>,
+    /// VML `v-text-anchor` — vertical placement of text inside the shape.
+    pub text_anchor: Option<VmlTextAnchor>,
     /// Office `mso-position-horizontal`.
     pub mso_position_horizontal: Option<MsoPositionH>,
     /// Office `mso-position-horizontal-relative`.
@@ -582,6 +598,14 @@ pub struct VmlStyle {
     pub mso_wrap_distance_bottom: Option<VmlLength>,
     /// Office `mso-wrap-style`.
     pub mso_wrap_style: Option<MsoWrapStyle>,
+}
+
+/// VML text-box vertical anchor values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmlTextAnchor {
+    Top,
+    Middle,
+    Bottom,
 }
 
 // ── VML Color ────────────────────────────────────────────────────────────────
@@ -916,6 +940,10 @@ pub enum VmlLengthUnit {
 /// VML §14.1.2.21: stroke styling.
 #[derive(Clone, Debug)]
 pub struct VmlStroke {
+    /// Child-level `@color`, overriding the primitive's `@strokecolor`.
+    pub color: Option<VmlColor>,
+    /// Child-level `@weight`, overriding the primitive's `@strokeweight`.
+    pub weight: Option<VmlLength>,
     /// Dash pattern.
     pub dash_style: Option<VmlDashStyle>,
     /// Line join style.
@@ -1103,6 +1131,7 @@ mod tests {
                 common: common_with_id("j"),
                 coord_size: None,
                 coord_origin: None,
+                shape_types: vec![],
                 children: vec![],
             })),
         ];

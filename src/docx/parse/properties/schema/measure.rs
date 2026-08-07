@@ -6,11 +6,11 @@
 //! - `pct` → percentage (stored as thousandths-of-percent)
 //! - `auto` / `nil` → no explicit value
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::docx::model::dimension::{Dimension, ThousandthPercent};
 use crate::docx::model::TableMeasure;
-use crate::docx::parse::primitives::integer_measure::IntegerMeasure;
+use crate::docx::parse::primitives::integer_measure::{parse_integer_measure, IntegerMeasure};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,12 +21,51 @@ enum StTblWidthType {
     Pct,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct TableMeasureXml {
-    #[serde(rename = "@w", default)]
     w: Option<IntegerMeasure>,
-    #[serde(rename = "@type", default = "default_type")]
     ty: StTblWidthType,
+}
+
+impl<'de> Deserialize<'de> for TableMeasureXml {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(rename = "@w", default)]
+            w: Option<String>,
+            #[serde(rename = "@type", default = "default_type")]
+            ty: StTblWidthType,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let w = raw
+            .w
+            .as_deref()
+            .map(|value| parse_table_measure_value(value, raw.ty))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self { w, ty: raw.ty })
+    }
+}
+
+fn parse_table_measure_value(
+    raw: &str,
+    ty: StTblWidthType,
+) -> Result<IntegerMeasure, &'static str> {
+    let Some(percent) = raw.strip_suffix('%') else {
+        return parse_integer_measure(raw);
+    };
+    if !matches!(ty, StTblWidthType::Pct) {
+        return Err("percentage table width requires type=pct");
+    }
+    let percent = percent
+        .parse::<f64>()
+        .map_err(|_| "invalid percentage table width")?;
+    let fiftieths = percent * 50.0;
+    if !fiftieths.is_finite() || fiftieths < i64::MIN as f64 || fiftieths > i64::MAX as f64 {
+        return Err("percentage table width is outside the supported range");
+    }
+    parse_integer_measure(&format!("{:.0}", fiftieths.round()))
 }
 
 fn default_type() -> StTblWidthType {
@@ -95,6 +134,18 @@ mod tests {
     fn pct_thousandth_percent() {
         match parse(r#"<tblW w="2500" type="pct"/>"#) {
             TableMeasure::Pct(d) => assert_eq!(d.raw(), 2500),
+            other => panic!("expected Pct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pct_literal_percent_is_converted_to_ooxml_fiftieths() {
+        match parse(r#"<tblW w="100%" type="pct"/>"#) {
+            TableMeasure::Pct(d) => assert_eq!(d.raw(), 5000),
+            other => panic!("expected Pct, got {other:?}"),
+        }
+        match parse(r#"<tblW w="33.3%" type="pct"/>"#) {
+            TableMeasure::Pct(d) => assert_eq!(d.raw(), 1665),
             other => panic!("expected Pct, got {other:?}"),
         }
     }

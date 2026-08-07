@@ -100,6 +100,7 @@ fn rewrite_in_inlines(inlines: &mut [Inline], remap: &HashMap<RelId, RelId>) {
             | Inline::ContinuationSeparator
             | Inline::FieldChar(_)
             | Inline::InstrText(_)
+            | Inline::InstrTextRun(_)
             | Inline::FootnoteRefMark
             | Inline::EndnoteRefMark => {}
         }
@@ -765,6 +766,7 @@ mod tests {
                 common: VmlCommonAttrs::default(),
                 coord_size: None,
                 coord_origin: None,
+                shape_types: vec![],
                 children: vec![child],
             }))],
         };

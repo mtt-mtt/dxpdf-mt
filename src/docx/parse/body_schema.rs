@@ -103,8 +103,6 @@ pub(crate) struct ParaXml {
     #[serde(rename = "@rsidDel", default)]
     pub rsid_del: Option<String>,
 
-    #[serde(rename = "pPr", default)]
-    pub p_pr: Option<PPrXml>,
     #[serde(rename = "$value", default)]
     pub content: Vec<ParaChildXml>,
 }
@@ -118,7 +116,7 @@ pub(crate) struct ParaXml {
 /// modelled so `convert_para_children` can flatten them: insert-side and
 /// structural wrappers are rendered, delete-side wrappers are dropped (an
 /// "accept all changes" / final view). Remaining annotation elements
-/// (proofErr, permStart/End, commentRange*, sdt, ...) hit the `Other`
+/// (proofErr, permStart/End, commentRange*, ...) hit the `Other`
 /// catch-all and are discarded cleanly.
 #[derive(Deserialize)]
 pub(crate) enum ParaChildXml {
@@ -150,6 +148,10 @@ pub(crate) enum ParaChildXml {
     /// §17.5.1.6 `<w:customXml>` (CT_CustomXmlRun) — content is flattened.
     #[serde(rename = "customXml")]
     CustomXml(RunTrackChangeXml),
+    /// §17.5.2 inline structured-document tag. Its visible result lives in
+    /// `sdtContent` and participates in the paragraph's mixed content.
+    #[serde(rename = "sdt")]
+    Sdt(Box<SdtRunXml>),
     /// `<w:pPr>` is captured on `ParaXml` directly, but serde's untagged
     /// enum still has to handle it if it appears in `$value` ordering.
     #[serde(rename = "pPr")]
@@ -213,6 +215,11 @@ pub(crate) enum RunChildXml {
     Drawing(DrawingXml),
     #[serde(rename = "pict")]
     Pict(crate::docx::parse::vml::schema::PictXml),
+    /// `<w:object>` wraps an embedded OLE object together with a VML preview.
+    /// Its VML children use the same shape grammar as `<w:pict>`; unsupported
+    /// OLE metadata is absorbed by `VmlPrimitiveXml::Other`.
+    #[serde(rename = "object")]
+    Object(crate::docx::parse::vml::schema::PictXml),
     #[serde(rename = "sym")]
     Sym(SymXml),
     #[serde(rename = "instrText")]
@@ -231,6 +238,10 @@ pub(crate) enum RunChildXml {
     Separator,
     #[serde(rename = "continuationSeparator")]
     ContinuationSeparator,
+    /// `<w:commentReference>` is an annotation marker. Comments are not
+    /// painted into the document body, so accept and discard it.
+    #[serde(rename = "commentReference")]
+    CommentReference(IgnoredXml),
     #[serde(rename = "AlternateContent")]
     AlternateContent(AltContentXml),
     /// `<w:rPr>` captured separately; included here for serde ordering.
@@ -327,7 +338,7 @@ pub(crate) struct NoteRefXml {
 #[derive(Deserialize)]
 pub(crate) struct BookmarkStartXml {
     #[serde(rename = "@id")]
-    pub id: i64,
+    pub id: String,
     #[serde(rename = "@name", default)]
     pub name: String,
 }
@@ -335,7 +346,19 @@ pub(crate) struct BookmarkStartXml {
 #[derive(Deserialize)]
 pub(crate) struct BookmarkEndXml {
     #[serde(rename = "@id")]
-    pub id: i64,
+    pub id: String,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct SdtRunXml {
+    #[serde(rename = "sdtContent", default)]
+    pub content: Option<SdtRunContentXml>,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct SdtRunContentXml {
+    #[serde(rename = "$value", default)]
+    pub children: Vec<ParaChildXml>,
 }
 
 /// `<w:drawing>` wrapper — contains exactly one `<wp:inline>` or

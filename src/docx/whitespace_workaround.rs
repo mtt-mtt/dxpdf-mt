@@ -138,6 +138,7 @@ fn whitespace_only_wordprocessingml_text_spans(xml: &[u8]) -> Vec<(usize, usize)
     let mut spans = Vec::new();
     let mut depth: usize = 0;
     let mut text_depth = None;
+    let mut text_content_start = None;
 
     loop {
         let (namespace, event) = match reader.read_resolved_event() {
@@ -152,21 +153,37 @@ fn whitespace_only_wordprocessingml_text_spans(xml: &[u8]) -> Vec<(usize, usize)
                     && start.local_name().as_ref() == b"t"
                 {
                     text_depth = Some(depth);
+                    // `buffer_position` is now immediately after the opening
+                    // tag.  Keep that byte offset instead of deriving it from
+                    // `Event::Text::len()`: quick-xml may expose a normalized
+                    // text view whose length does not equal the original XML
+                    // byte span (notably after non-ASCII content).
+                    text_content_start = Some(reader.buffer_position() as usize);
                 }
             }
             Event::Text(text) if text_depth.is_some() => {
                 let content = text.as_ref();
                 if !content.is_empty() && content.iter().all(is_xml_whitespace_byte) {
                     let end = reader.buffer_position() as usize;
-                    let Some(start) = end.checked_sub(content.len()) else {
+                    let Some(start) = text_content_start else {
                         return Vec::new();
                     };
-                    spans.push((start, end));
+                    // Only mutate a source slice that is itself XML
+                    // whitespace. If a reader implementation ever reports a
+                    // normalized event over a different raw span, preserving
+                    // the original XML is safer than corrupting markup.
+                    if start <= end
+                        && end <= xml.len()
+                        && xml[start..end].iter().all(is_xml_whitespace_byte)
+                    {
+                        spans.push((start, end));
+                    }
                 }
             }
             Event::End(_) => {
                 if text_depth == Some(depth) {
                     text_depth = None;
+                    text_content_start = None;
                 }
                 depth = depth.saturating_sub(1);
             }
@@ -233,6 +250,19 @@ mod tests {
             WS_SENTINEL_SPACE
         );
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn whitespace_after_multibyte_text_uses_source_byte_offsets() {
+        let fragment = r#"<w:r><w:t>中文</w:t></w:r><w:r><w:t xml:space="preserve"> </w:t></w:r>"#;
+        let out = substitute_wml_fragment(fragment);
+        assert_eq!(
+            out,
+            format!(
+                r#"<w:r><w:t>中文</w:t></w:r><w:r><w:t xml:space="preserve">{}</w:t></w:r>"#,
+                WS_SENTINEL_SPACE
+            )
+        );
     }
 
     #[test]

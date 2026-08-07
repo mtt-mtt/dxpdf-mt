@@ -10,6 +10,9 @@ pub struct DocumentSettings {
     pub default_tab_stop: Dimension<Twips>,
     /// Whether even/odd headers/footers are enabled.
     pub even_and_odd_headers: bool,
+    /// §17.15.3.1: apply the active section's document-grid line pitch to
+    /// paragraphs inside table cells as well as body paragraphs.
+    pub adjust_line_height_in_table: bool,
     /// The rsid of the original editing session that created this document.
     pub rsid_root: Option<RevisionSaveId>,
     /// All revision save IDs recorded in this document's history.
@@ -25,6 +28,7 @@ impl Default for DocumentSettings {
             // tabs for any consumer that reads this field.
             default_tab_stop: Dimension::new(720),
             even_and_odd_headers: false,
+            adjust_line_height_in_table: false,
             rsid_root: None,
             rsids: Vec::new(),
         }
@@ -47,6 +51,7 @@ mod tests {
     fn remaining_defaults() {
         let s = DocumentSettings::default();
         assert!(!s.even_and_odd_headers);
+        assert!(!s.adjust_line_height_in_table);
         assert!(s.rsid_root.is_none());
         assert!(s.rsids.is_empty());
     }

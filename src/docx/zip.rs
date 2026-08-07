@@ -3,8 +3,37 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::docx::error::{ParseError, Result};
+use crate::docx::error::{ParseError, ResourceLimitKind, Result};
 use crate::docx::whitespace_workaround::substitute_whitespace_only_runs;
+
+const MIB: u64 = 1024 * 1024;
+
+/// Resource limits applied before and during OOXML ZIP extraction.
+///
+/// Defaults are deliberately generous for large business documents while
+/// bounding the memory amplification possible from an untrusted upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageLimits {
+    pub max_archive_bytes: u64,
+    pub max_parts: usize,
+    pub max_part_uncompressed_bytes: u64,
+    pub max_total_uncompressed_bytes: u64,
+    pub max_compression_ratio: u64,
+    pub compression_ratio_min_uncompressed_bytes: u64,
+}
+
+impl Default for PackageLimits {
+    fn default() -> Self {
+        Self {
+            max_archive_bytes: 256 * MIB,
+            max_parts: 4096,
+            max_part_uncompressed_bytes: 256 * MIB,
+            max_total_uncompressed_bytes: 512 * MIB,
+            max_compression_ratio: 1000,
+            compression_ratio_min_uncompressed_bytes: MIB,
+        }
+    }
+}
 
 /// The contents of a DOCX package, extracted from the ZIP archive.
 pub struct PackageContents {
@@ -15,15 +44,105 @@ pub struct PackageContents {
 impl PackageContents {
     /// Extract all parts from a DOCX ZIP archive.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        Self::from_bytes_with_limits(data, &PackageLimits::default())
+    }
+
+    /// Extract all parts while enforcing caller-supplied resource limits.
+    pub fn from_bytes_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Self> {
+        if data.len() as u64 > limits.max_archive_bytes {
+            return Err(ParseError::ResourceLimit {
+                kind: ResourceLimitKind::ArchiveBytes,
+                part: None,
+                actual: data.len() as u64,
+                limit: limits.max_archive_bytes,
+            });
+        }
         let cursor = std::io::Cursor::new(data);
         let mut archive = zip::ZipArchive::new(cursor)?;
+        if archive.len() > limits.max_parts {
+            return Err(ParseError::ResourceLimit {
+                kind: ResourceLimitKind::PartCount,
+                part: None,
+                actual: archive.len() as u64,
+                limit: limits.max_parts as u64,
+            });
+        }
         let mut parts = HashMap::with_capacity(archive.len());
+        let mut total_uncompressed = 0_u64;
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
             let name = normalize_path(file.name());
-            let mut buf = Vec::with_capacity(file.size() as usize);
-            file.read_to_end(&mut buf)?;
+            let declared_size = file.size();
+            if declared_size > limits.max_part_uncompressed_bytes {
+                return Err(ParseError::ResourceLimit {
+                    kind: ResourceLimitKind::PartBytes,
+                    part: Some(name),
+                    actual: declared_size,
+                    limit: limits.max_part_uncompressed_bytes,
+                });
+            }
+            let declared_total = total_uncompressed
+                .checked_add(declared_size)
+                .unwrap_or(u64::MAX);
+            if declared_total > limits.max_total_uncompressed_bytes {
+                return Err(ParseError::ResourceLimit {
+                    kind: ResourceLimitKind::TotalUncompressedBytes,
+                    part: Some(name),
+                    actual: declared_total,
+                    limit: limits.max_total_uncompressed_bytes,
+                });
+            }
+            let compressed_size = file.compressed_size();
+            if declared_size >= limits.compression_ratio_min_uncompressed_bytes
+                && (compressed_size == 0
+                    || declared_size > compressed_size.saturating_mul(limits.max_compression_ratio))
+            {
+                let actual_ratio = if compressed_size == 0 {
+                    u64::MAX
+                } else {
+                    declared_size
+                        .saturating_add(compressed_size - 1)
+                        .saturating_div(compressed_size)
+                };
+                return Err(ParseError::ResourceLimit {
+                    kind: ResourceLimitKind::CompressionRatio,
+                    part: Some(name),
+                    actual: actual_ratio,
+                    limit: limits.max_compression_ratio,
+                });
+            }
+
+            // Do not trust ZIP metadata as the only guard. Cap the decompressor
+            // itself so a malformed local/central-header size mismatch cannot
+            // allocate past the configured entry or cumulative limit.
+            let remaining_total = limits
+                .max_total_uncompressed_bytes
+                .saturating_sub(total_uncompressed);
+            let read_limit = limits.max_part_uncompressed_bytes.min(remaining_total);
+            let initial_capacity = declared_size.min(MIB) as usize;
+            let mut buf = Vec::with_capacity(initial_capacity);
+            (&mut file)
+                .take(read_limit.saturating_add(1))
+                .read_to_end(&mut buf)?;
+            if buf.len() as u64 > read_limit {
+                let kind = if remaining_total <= limits.max_part_uncompressed_bytes {
+                    ResourceLimitKind::TotalUncompressedBytes
+                } else {
+                    ResourceLimitKind::PartBytes
+                };
+                return Err(ParseError::ResourceLimit {
+                    kind,
+                    part: Some(name),
+                    actual: total_uncompressed.saturating_add(buf.len() as u64),
+                    limit: if matches!(kind, ResourceLimitKind::TotalUncompressedBytes) {
+                        limits.max_total_uncompressed_bytes
+                    } else {
+                        limits.max_part_uncompressed_bytes
+                    },
+                });
+            }
+            total_uncompressed = total_uncompressed.saturating_add(buf.len() as u64);
             // Apply the whitespace workaround only to XML parts. Binary parts
             // (images, fonts, embedded OLE) must not be touched.
             // See `whitespace_workaround` module docs for the rationale.
@@ -118,6 +237,124 @@ pub fn part_directory(part_path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
+
+    fn make_zip(parts: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().compression_method(method);
+        for (name, bytes) in parts {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn tiny_limits() -> PackageLimits {
+        PackageLimits {
+            max_archive_bytes: 1024 * 1024,
+            max_parts: 10,
+            max_part_uncompressed_bytes: 1024,
+            max_total_uncompressed_bytes: 2048,
+            max_compression_ratio: 100,
+            compression_ratio_min_uncompressed_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn package_limits_accept_a_small_archive() {
+        let data = make_zip(
+            &[("word/document.xml", b"<document/>")],
+            zip::CompressionMethod::Stored,
+        );
+        let package = PackageContents::from_bytes_with_limits(&data, &tiny_limits()).unwrap();
+        assert_eq!(
+            package.get_part("word/document.xml"),
+            Some(&b"<document/>"[..])
+        );
+    }
+
+    #[test]
+    fn package_limits_reject_archive_bytes_before_opening() {
+        let data = make_zip(&[("a.bin", b"1234")], zip::CompressionMethod::Stored);
+        let mut limits = tiny_limits();
+        limits.max_archive_bytes = data.len() as u64 - 1;
+        assert!(matches!(
+            PackageContents::from_bytes_with_limits(&data, &limits),
+            Err(ParseError::ResourceLimit {
+                kind: ResourceLimitKind::ArchiveBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn package_limits_reject_too_many_parts() {
+        let data = make_zip(
+            &[("a.bin", b"a"), ("b.bin", b"b")],
+            zip::CompressionMethod::Stored,
+        );
+        let mut limits = tiny_limits();
+        limits.max_parts = 1;
+        assert!(matches!(
+            PackageContents::from_bytes_with_limits(&data, &limits),
+            Err(ParseError::ResourceLimit {
+                kind: ResourceLimitKind::PartCount,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn package_limits_reject_an_oversized_part() {
+        let data = make_zip(&[("large.bin", b"12345")], zip::CompressionMethod::Stored);
+        let mut limits = tiny_limits();
+        limits.max_part_uncompressed_bytes = 4;
+        assert!(matches!(
+            PackageContents::from_bytes_with_limits(&data, &limits),
+            Err(ParseError::ResourceLimit {
+                kind: ResourceLimitKind::PartBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn package_limits_reject_excessive_total_uncompressed_bytes() {
+        let data = make_zip(
+            &[("a.bin", b"123"), ("b.bin", b"456")],
+            zip::CompressionMethod::Stored,
+        );
+        let mut limits = tiny_limits();
+        limits.max_total_uncompressed_bytes = 5;
+        assert!(matches!(
+            PackageContents::from_bytes_with_limits(&data, &limits),
+            Err(ParseError::ResourceLimit {
+                kind: ResourceLimitKind::TotalUncompressedBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn package_limits_reject_an_extreme_compression_ratio() {
+        let repeated = vec![b'x'; 64 * 1024];
+        let data = make_zip(
+            &[("repeated.bin", repeated.as_slice())],
+            zip::CompressionMethod::Deflated,
+        );
+        let mut limits = tiny_limits();
+        limits.max_part_uncompressed_bytes = 128 * 1024;
+        limits.max_total_uncompressed_bytes = 128 * 1024;
+        limits.compression_ratio_min_uncompressed_bytes = 1024;
+        limits.max_compression_ratio = 10;
+        assert!(matches!(
+            PackageContents::from_bytes_with_limits(&data, &limits),
+            Err(ParseError::ResourceLimit {
+                kind: ResourceLimitKind::CompressionRatio,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn normalize_strips_leading_slash_and_lowercases() {

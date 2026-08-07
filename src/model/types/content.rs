@@ -59,6 +59,12 @@ pub enum Inline {
     FieldChar(FieldChar),
     /// §17.16.23: field instruction text (appears between begin and separate).
     InstrText(String),
+    /// Field instruction text with the formatting of its source `<w:r>`.
+    /// Parsed DOCX content uses this form so a legacy MACROBUTTON display
+    /// value can inherit the formatting of its first visible character.
+    /// `InstrText(String)` remains for callers that construct the model
+    /// programmatically without run metadata.
+    InstrTextRun(Box<TextRun>),
     /// §17.11.13: footnote reference mark (auto-number rendered in the footnote body).
     FootnoteRefMark,
     /// §17.11.6: endnote reference mark (auto-number rendered in the endnote body).

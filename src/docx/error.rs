@@ -1,5 +1,27 @@
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceLimitKind {
+    ArchiveBytes,
+    PartCount,
+    PartBytes,
+    TotalUncompressedBytes,
+    CompressionRatio,
+}
+
+impl std::fmt::Display for ResourceLimitKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::ArchiveBytes => "archive bytes",
+            Self::PartCount => "part count",
+            Self::PartBytes => "part bytes",
+            Self::TotalUncompressedBytes => "total uncompressed bytes",
+            Self::CompressionRatio => "compression ratio",
+        };
+        f.write_str(name)
+    }
+}
+
 /// All errors that can occur during DOCX parsing.
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -27,6 +49,17 @@ pub enum ParseError {
 
     #[error("invalid integer: {0}")]
     ParseInt(#[from] std::num::ParseIntError),
+
+    #[error(
+        "DOCX resource limit exceeded ({kind}){part}: actual {actual}, limit {limit}",
+        part = part.as_deref().map(|name| format!(" for '{name}'")).unwrap_or_default()
+    )]
+    ResourceLimit {
+        kind: ResourceLimitKind,
+        part: Option<String>,
+        actual: u64,
+        limit: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ParseError>;

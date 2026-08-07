@@ -6,10 +6,11 @@
 //! accepts both modern (`start`/`end`) and legacy (`left`/`right`) side
 //! names per OOXML bidi handling.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::docx::model::dimension::{Dimension, EighthPoints, Points};
 use crate::docx::model::{Border, Color, ParagraphBorders, TableBorders, TableCellBorders};
+use crate::docx::parse::primitives::integer_measure::parse_integer_measure;
 use crate::docx::parse::primitives::st_enums::StBorderType;
 use crate::docx::parse::primitives::units::deserialize_optional_nonnegative_dimension;
 use crate::docx::parse::primitives::HexColor;
@@ -22,7 +23,7 @@ pub(crate) struct BorderXml {
     #[serde(
         rename = "@sz",
         default,
-        deserialize_with = "deserialize_optional_nonnegative_dimension"
+        deserialize_with = "deserialize_optional_border_width"
     )]
     sz: Option<Dimension<EighthPoints>>,
     #[serde(
@@ -33,6 +34,30 @@ pub(crate) struct BorderXml {
     space: Option<Dimension<Points>>,
     #[serde(rename = "@color", default)]
     color: Option<HexColor>,
+}
+
+fn deserialize_optional_border_width<'de, D>(
+    deserializer: D,
+) -> Result<Option<Dimension<EighthPoints>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    // A few web template generators write `w:sz="none"` while keeping
+    // `w:val="single"`. Word accepts this non-standard value as an omitted
+    // width; do the same instead of rejecting the whole document.
+    if raw.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let measure = parse_integer_measure(&raw).map_err(serde::de::Error::custom)?;
+    if measure.is_negative() {
+        return Err(serde::de::Error::custom(
+            "negative value is not valid for this OOXML measurement",
+        ));
+    }
+    Ok(Some(Dimension::new(measure.value())))
 }
 
 impl From<BorderXml> for Border {
@@ -160,6 +185,15 @@ mod tests {
         let b: BorderXml = quick_xml::de::from_str(xml).unwrap();
         let m: Border = b.into();
         assert_eq!(m.color, Color::Auto);
+    }
+
+    #[test]
+    fn nonstandard_none_border_width_is_treated_as_omitted() {
+        let b: Border =
+            quick_xml::de::from_str::<BorderXml>(r#"<top val="single" sz="none" color="BFBFBF"/>"#)
+                .unwrap()
+                .into();
+        assert_eq!(b.width.raw(), 0);
     }
 
     /// §17.18.2 ST_Border: `nil` and `none` both mean "no border", but they

@@ -42,6 +42,9 @@ pub struct ParagraphProperties {
     pub bidi: Option<bool>,
     /// §17.3.1.45: allow line breaking between any characters for East Asian text.
     pub word_wrap: Option<bool>,
+    /// §17.3.1.34: snap paragraph lines to the section document grid.
+    /// Missing means enabled when an applicable grid is present.
+    pub snap_to_grid: Option<bool>,
     pub outline_level: Option<OutlineLevel>,
     /// §17.3.1.39: vertical alignment of text on each line (ST_TextAlignment).
     pub text_alignment: Option<TextAlignment>,

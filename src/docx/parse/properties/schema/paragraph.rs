@@ -88,6 +88,8 @@ pub(crate) struct PPrXml {
     bidi: Vec<OnOff>,
     #[serde(rename = "wordWrap", default)]
     word_wrap: Vec<OnOff>,
+    #[serde(rename = "snapToGrid", default)]
+    snap_to_grid: Vec<OnOff>,
     #[serde(rename = "autoSpaceDE", default)]
     auto_space_de: Vec<OnOff>,
     #[serde(rename = "autoSpaceDN", default)]
@@ -186,7 +188,7 @@ impl From<SpacingXml> for ParagraphSpacing {
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct NumPrXml {
     #[serde(default)]
-    ilvl: Option<ValAttr<u8>>,
+    ilvl: Option<ValAttr<i16>>,
     #[serde(rename = "numId", default)]
     num_id: Option<ValAttr<i64>>,
 }
@@ -314,6 +316,7 @@ impl PPrXml {
             contextual_spacing: last_toggle(self.contextual_spacing),
             bidi: last_toggle(self.bidi),
             word_wrap: last_toggle(self.word_wrap),
+            snap_to_grid: last_toggle(self.snap_to_grid),
             outline_level: self
                 .outline_lvl
                 .and_then(|v| OutlineLevel::from_ooxml(v.val)),
@@ -337,7 +340,10 @@ fn numbering_ref(x: NumPrXml) -> Option<NumberingReference> {
     let num_id = x.num_id?;
     Some(NumberingReference {
         num_id: num_id.val,
-        level: x.ilvl.map(|v| v.val).unwrap_or(0),
+        // Some Word-generated documents use -1 together with numId=0 as a
+        // sentinel for "not numbered". Keep parsing tolerant and fall back to
+        // level zero for values outside the model's u8 range.
+        level: x.ilvl.and_then(|v| u8::try_from(v.val).ok()).unwrap_or(0),
     })
 }
 
@@ -426,6 +432,23 @@ mod tests {
     fn num_pr_without_num_id_is_none() {
         let r = parse(r#"<pPr><numPr><ilvl val="1"/></numPr></pPr>"#);
         assert!(r.properties.numbering.is_none());
+    }
+
+    #[test]
+    fn negative_numbering_level_sentinel_does_not_reject_paragraph() {
+        let r = parse(r#"<pPr><numPr><ilvl val="-1"/><numId val="0"/></numPr></pPr>"#);
+        let n = r.properties.numbering.unwrap();
+        assert_eq!(n.level, 0);
+        assert_eq!(n.num_id, 0);
+    }
+
+    #[test]
+    fn snap_to_grid_on_off_is_preserved() {
+        let enabled = parse(r#"<pPr><snapToGrid/></pPr>"#);
+        assert_eq!(enabled.properties.snap_to_grid, Some(true));
+
+        let disabled = parse(r#"<pPr><snapToGrid val="0"/></pPr>"#);
+        assert_eq!(disabled.properties.snap_to_grid, Some(false));
     }
 
     #[test]

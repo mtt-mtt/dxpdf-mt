@@ -9,14 +9,29 @@ use crate::docx::model::*;
 /// mirrors the sibling `parse_style`/`parse_formula`/`parse_length` helpers
 /// rather than raising a document-fatal error.
 pub(super) fn parse_color(s: &str) -> Option<VmlColor> {
-    let hex = s.strip_prefix('#').unwrap_or(s);
+    // Word commonly appends a palette index (`"#4472c4 [3204]"`) to the
+    // actual colour token. It is metadata, not part of ST_ColorType.
+    let token = s.split_ascii_whitespace().next().unwrap_or(s);
+    let hex = token.strip_prefix('#').unwrap_or(token);
+    if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let expand = |b: u8| {
+            let digit = (b as char).to_digit(16).unwrap_or(0) as u8;
+            digit * 17
+        };
+        let bytes = hex.as_bytes();
+        return Some(VmlColor::Rgb(
+            expand(bytes[0]),
+            expand(bytes[1]),
+            expand(bytes[2]),
+        ));
+    }
     if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
         let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
         let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
         return Some(VmlColor::Rgb(r, g, b));
     }
-    parse_named_color(s).map(VmlColor::Named)
+    parse_named_color(token).map(VmlColor::Named)
 }
 
 fn parse_named_color(s: &str) -> Option<VmlNamedColor> {
@@ -262,9 +277,20 @@ mod tests {
     }
 
     #[test]
-    fn three_digit_hex_is_not_six_digit_and_falls_through_to_none() {
-        // Not 6 hex digits → not treated as RGB; "fff" is not a named color.
-        assert_eq!(parse_color("#fff"), None);
+    fn three_digit_hex_expands_like_css_color() {
+        assert_eq!(parse_color("#cff"), Some(VmlColor::Rgb(0xCC, 0xFF, 0xFF)));
+    }
+
+    #[test]
+    fn palette_suffix_is_not_part_of_the_color_token() {
+        assert_eq!(
+            parse_color("#4472c4 [3204]"),
+            Some(VmlColor::Rgb(0x44, 0x72, 0xC4))
+        );
+        assert_eq!(
+            parse_color("black [3213]"),
+            Some(VmlColor::Named(VmlNamedColor::Black))
+        );
     }
 
     #[test]
