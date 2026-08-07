@@ -9,8 +9,11 @@
 //! pipeline end-to-end. Tier 1 adds the common ~20 shapes; Tier 2 adds the
 //! remaining ~60; Tier 3 completes the spec's ~200.
 
+mod accent_callout;
+mod ellipse;
 mod line;
 mod rect;
+mod wedge_rect_callout;
 
 use crate::model::{PresetGeometryDef, PresetShapeType};
 use crate::render::geometry::PtSize;
@@ -23,6 +26,11 @@ pub fn build_preset(def: &PresetGeometryDef, extent: PtSize) -> Option<ShapePath
     match def.preset {
         PresetShapeType::Line => Some(line::build(extent)),
         PresetShapeType::Rect => Some(rect::build(extent)),
+        PresetShapeType::Ellipse => Some(ellipse::build(extent)),
+        PresetShapeType::AccentCallout1 => Some(accent_callout::build(def, extent, 2)),
+        PresetShapeType::AccentCallout2 => Some(accent_callout::build(def, extent, 3)),
+        PresetShapeType::AccentCallout3 => Some(accent_callout::build(def, extent, 4)),
+        PresetShapeType::WedgeRectCallout => Some(wedge_rect_callout::build(def, extent)),
         _ => {
             log::warn!(
                 "shape_geometry: preset {:?} not yet implemented",
@@ -58,6 +66,15 @@ mod tests {
     fn rect_dispatches() {
         let p = build_preset(
             &def(PresetShapeType::Rect),
+            PtSize::new(Pt::new(10.0), Pt::new(20.0)),
+        );
+        assert!(p.is_some());
+    }
+
+    #[test]
+    fn ellipse_dispatches() {
+        let p = build_preset(
+            &def(PresetShapeType::Ellipse),
             PtSize::new(Pt::new(10.0), Pt::new(20.0)),
         );
         assert!(p.is_some());

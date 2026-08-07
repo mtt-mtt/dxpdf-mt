@@ -57,6 +57,23 @@ fn sanitize_image_dpi(image_dpi: f32) -> f32 {
     }
 }
 
+/// Whether a hard section break must consume a physical separator page before
+/// the next section can be laid out. Word's `oddPage`/`evenPage` section
+/// starts are based on the physical page sequence, not on the section's
+/// logical PAGE numbering. The separator itself is intentionally not owned by
+/// either section: Word emits a genuinely blank page without a header/footer.
+fn needs_parity_separator(
+    section_type: Option<crate::model::SectionType>,
+    pages_before: usize,
+) -> bool {
+    let next_page_is_odd = (pages_before + 1) % 2 == 1;
+    match section_type {
+        Some(crate::model::SectionType::OddPage) => !next_page_is_odd,
+        Some(crate::model::SectionType::EvenPage) => next_page_is_odd,
+        _ => false,
+    }
+}
+
 /// Tunable knobs for the paint phase.
 ///
 /// Constructed via [`RenderOptions::default`] and the `with_*` builder setters,
@@ -282,6 +299,16 @@ pub fn layout_document(
     for (section_idx, section) in resolved.sections.iter().enumerate() {
         let config = PageConfig::from_section(&section.properties);
         state.page_config = config.clone();
+
+        // §17.6.22/§17.6.23: an odd/even section break may require one
+        // physical blank page before the new section. Do this before taking
+        // the section page range so the blank page receives no section
+        // header/footer. It still advances the document's logical sequence,
+        // just as it does in Word when PAGE numbering is continuous.
+        if needs_parity_separator(section.properties.section_type, all_pages.len()) {
+            all_pages.push(LayoutedPage::new(config.page_size));
+            next_logical += 1;
+        }
         let logical_page_base = layout::header_footer::next_logical_page_base(
             next_logical,
             section.properties.page_number_type.as_ref(),
@@ -296,7 +323,20 @@ pub fn layout_document(
             logical_page_base,
         );
 
-        let built = build_section_blocks(section, &config, &ctx, &mut state);
+        let mut built = build_section_blocks(section, &config, &ctx, &mut state);
+        let has_next_section = section_idx + 1 < resolved.sections.len();
+        let ends_with_hard_section_break = has_next_section
+            && !matches!(
+                section.properties.section_type,
+                Some(crate::model::SectionType::Continuous | crate::model::SectionType::NextColumn)
+            );
+        // The final plain paragraph mark is structural as well. Keeping it as
+        // a font-sized empty line can push an otherwise full last page onto a
+        // contentless trailing page. As with a hard section mark, decorated
+        // or object-owning terminal paragraphs remain intact.
+        if ends_with_hard_section_break || !has_next_section {
+            layout::section::suppress_plain_terminal_section_mark(&mut built.blocks);
+        }
         let measure_fn = |text: &str,
                           font: &layout::fragment::FontProps|
          -> (dimension::Pt, layout::fragment::TextMetrics) {
@@ -592,6 +632,15 @@ mod tests {
         // 220 ppi mirrors Word's default image-compression resolution.
         assert_eq!(DEFAULT_IMAGE_DPI, 220.0);
         assert_eq!(RenderOptions::default().image_dpi(), 220.0);
+    }
+
+    #[test]
+    fn parity_section_break_inserts_only_the_required_physical_separator() {
+        assert!(needs_parity_separator(Some(SectionType::OddPage), 1,));
+        assert!(!needs_parity_separator(Some(SectionType::OddPage), 2,));
+        assert!(!needs_parity_separator(Some(SectionType::EvenPage), 1,));
+        assert!(needs_parity_separator(Some(SectionType::EvenPage), 2,));
+        assert!(!needs_parity_separator(Some(SectionType::NextPage), 1));
     }
 
     #[test]

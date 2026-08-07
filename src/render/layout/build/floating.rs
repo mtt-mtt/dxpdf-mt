@@ -204,7 +204,22 @@ pub(super) fn extract_floating_shapes(
 
     let mut shape_imgs = Vec::new();
     find_anchor_shapes(&para.content, &mut shape_imgs);
-
+    // A Word shape commonly stores a modern DrawingML shape in
+    // `mc:Choice` and a VML rendering of the same shape in `mc:Fallback`.
+    // The live-branch walker normally keeps those branches apart, but some
+    // legacy files expose the fallback `<w:pict>` as a sibling while parsing
+    // the run.  If the modern branch has a text-bearing shape, rendering the
+    // VML primitive as well produces a second rectangle at a different
+    // paragraph-relative offset (most visible with callout bubbles).  Keep
+    // independent VML-only shapes eligible; suppress only this duplicate
+    // fallback case.
+    let has_text_shape = shape_imgs.iter().any(|img| {
+        matches!(
+            img.graphic.as_ref(),
+            Some(GraphicContent::WordProcessingShape(wsp))
+                if !wsp.txbx_content.is_empty()
+        )
+    });
     let mut shapes = Vec::new();
     for img in shape_imgs {
         let ImagePlacement::Anchor(ref anchor) = img.placement else {
@@ -234,8 +249,18 @@ pub(super) fn extract_floating_shapes(
         let h = Pt::from(img.extent.height);
         let extent = PtSize::new(w, h);
 
-        let shape_path = match build_geometry(geometry, extent) {
-            Some(p) => p,
+        let (shape_path, used_geometry_fallback) = match build_geometry(geometry, extent) {
+            Some(p) => (p, false),
+            None if !wsp.txbx_content.is_empty() => {
+                // Keep the text body even when a decorative preset (for
+                // example WedgeRectCallout in thesis templates) has no
+                // geometry generator yet.  Dropping the whole shape here
+                // loses user-visible instructions and placeholders; a
+                // bounding rectangle is a safe geometry fallback because
+                // the text layout remains shape-local and the original
+                // fill/line resolution still decides whether it is visible.
+                (fallback_text_box_shape_path(extent), true)
+            }
             None => continue, // Unimplemented preset or empty geometry.
         };
 
@@ -270,6 +295,18 @@ pub(super) fn extract_floating_shapes(
         // or `Absolute`), so text always lands on the shape's fill.
         let text_commands = build_shape_text_commands(wsp, extent, ctx, state);
 
+        let stroke = if used_geometry_fallback && visuals.stroke.is_none() {
+            Some(crate::render::layout::draw_command::ResolvedStroke {
+                width: Pt::new(0.75),
+                color: crate::render::resolve::drawing_color::Rgba::BLACK,
+                dash: crate::render::layout::draw_command::ResolvedDashPattern::Solid,
+                cap: crate::render::layout::draw_command::ResolvedLineCap::Butt,
+                join: crate::render::layout::draw_command::ResolvedLineJoin::Round,
+            })
+        } else {
+            visuals.stroke
+        };
+
         shapes.push(FloatingShape {
             x,
             y,
@@ -283,7 +320,7 @@ pub(super) fn extract_floating_shapes(
             behind_doc: anchor.behind_text,
             paths: shape_path.paths,
             fill: visuals.fill,
-            stroke: visuals.stroke,
+            stroke,
             effects: visuals.effects,
             text_commands,
         });
@@ -293,9 +330,38 @@ pub(super) fn extract_floating_shapes(
     // paragraph and resolve to the same `FloatingShape` shape format.
     // We append them here so both DrawingML and VML floats live in one
     // ordered list passed downstream.
-    extract_vml_primitive_shapes(&para.content, state, frame, &mut shapes);
+    if !has_text_shape {
+        extract_vml_primitive_shapes(&para.content, state, frame, ctx, &mut shapes);
+    }
 
     shapes
+}
+
+fn fallback_text_box_shape_path(
+    extent: PtSize,
+) -> crate::render::resolve::shape_geometry::ShapePath {
+    use crate::render::geometry::PtOffset;
+    use crate::render::resolve::shape_geometry::{PathVerb, ShapePath, SubPath};
+
+    ShapePath {
+        paths: vec![SubPath {
+            verbs: vec![
+                PathVerb::MoveTo(PtOffset::new(Pt::ZERO, Pt::ZERO)),
+                PathVerb::LineTo(PtOffset::new(extent.width, Pt::ZERO)),
+                PathVerb::LineTo(PtOffset::new(extent.width, extent.height)),
+                PathVerb::LineTo(PtOffset::new(Pt::ZERO, extent.height)),
+                // A small left-facing pointer keeps unsupported callouts
+                // recognisable as dialog bubbles instead of plain boxes.
+                PathVerb::LineTo(PtOffset::new(Pt::ZERO, extent.height * 0.5 + Pt::new(6.0))),
+                PathVerb::LineTo(PtOffset::new(Pt::new(-18.0), extent.height * 0.5)),
+                PathVerb::LineTo(PtOffset::new(Pt::ZERO, extent.height * 0.5 - Pt::new(6.0))),
+                PathVerb::Close,
+            ],
+            fill_mode: crate::model::PathFillMode::Norm,
+            stroked: true,
+        }],
+        text_rect: None,
+    }
 }
 
 /// Walk the inlines for `Inline::Pict` containers and emit a
@@ -428,6 +494,7 @@ fn extract_vml_primitive_shapes(
     inlines: &[crate::model::Inline],
     state: &BuildState,
     frame: AnchorFrame,
+    ctx: &BuildContext,
     out: &mut Vec<FloatingShape>,
 ) {
     use crate::model::Inline;
@@ -435,13 +502,20 @@ fn extract_vml_primitive_shapes(
         match inline {
             Inline::Pict(pict) => {
                 for primitive in &pict.primitives {
-                    extract_vml_primitive(primitive, state, frame, out);
+                    extract_vml_primitive(
+                        primitive,
+                        pict.shape_type.as_ref(),
+                        state,
+                        frame,
+                        ctx,
+                        out,
+                    );
                 }
             }
             Inline::Hyperlink(link) => {
-                extract_vml_primitive_shapes(&link.content, state, frame, out)
+                extract_vml_primitive_shapes(&link.content, state, frame, ctx, out)
             }
-            Inline::Field(f) => extract_vml_primitive_shapes(&f.content, state, frame, out),
+            Inline::Field(f) => extract_vml_primitive_shapes(&f.content, state, frame, ctx, out),
             // §M.1.2: `<mc:AlternateContent>` carries the same shape twice —
             // modern DrawingML in `<mc:Choice>`, a VML fallback in
             // `<mc:Fallback>` — so drawing both emits one rectangle twice.
@@ -453,11 +527,11 @@ fn extract_vml_primitive_shapes(
             Inline::AlternateContent(ac) => match live_mc_branch(ac) {
                 McBranch::Choices(choices) => {
                     for choice in choices {
-                        extract_vml_primitive_shapes(&choice.content, state, frame, out);
+                        extract_vml_primitive_shapes(&choice.content, state, frame, ctx, out);
                     }
                 }
                 McBranch::Fallback(fallback) => {
-                    extract_vml_primitive_shapes(fallback, state, frame, out)
+                    extract_vml_primitive_shapes(fallback, state, frame, ctx, out)
                 }
                 McBranch::Neither => {}
             },
@@ -468,14 +542,28 @@ fn extract_vml_primitive_shapes(
 
 fn extract_vml_primitive(
     primitive: &model::VmlPrimitive,
+    shape_type: Option<&model::VmlShapeType>,
     state: &BuildState,
     frame: AnchorFrame,
+    ctx: &BuildContext,
     out: &mut Vec<FloatingShape>,
 ) {
     use crate::model::VmlPrimitive;
     match primitive {
         VmlPrimitive::Rect(r) => {
-            if let Some(shape) = build_vml_rect_shape(&r.common, state, frame) {
+            if let Some(shape) = build_vml_rect_shape(&r.common, state, frame, ctx) {
+                out.push(shape);
+            }
+        }
+        VmlPrimitive::Shape(s) => {
+            if let Some(mut shape) = build_vml_rect_shape(&s.common, state, frame, ctx) {
+                if let Some(shape_type) = shape_type
+                    .filter(|candidate| s.shape_type_ref.as_ref() == candidate.id.as_ref())
+                {
+                    if let Some(paths) = build_vml_shape_paths(shape_type, shape.size) {
+                        shape.paths = paths;
+                    }
+                }
                 out.push(shape);
             }
         }
@@ -486,7 +574,13 @@ fn extract_vml_primitive(
         // rectangle. The `arcsize` value survives in the model for a
         // future rounded-path build.
         VmlPrimitive::RoundRect(r) => {
-            if let Some(shape) = build_vml_rect_shape(&r.common, state, frame) {
+            if let Some(shape) = build_vml_rect_shape(&r.common, state, frame, ctx) {
+                out.push(shape);
+            }
+        }
+        VmlPrimitive::Oval(oval) => {
+            if let Some(mut shape) = build_vml_rect_shape(&oval.common, state, frame, ctx) {
+                shape.paths[0].verbs = crate::render::layout::vml::oval_path_verbs(shape.size);
                 out.push(shape);
             }
         }
@@ -498,7 +592,15 @@ fn extract_vml_primitive(
         // footers use absolute positioning and don't depend on it.
         VmlPrimitive::Group(g) => {
             for child in &g.children {
-                extract_vml_primitive(child, state, frame, out);
+                let child_shape_type = match child {
+                    VmlPrimitive::Shape(shape) => shape.shape_type_ref.as_ref().and_then(|id| {
+                        g.shape_types
+                            .iter()
+                            .find(|candidate| candidate.id.as_ref() == Some(id))
+                    }),
+                    _ => None,
+                };
+                extract_vml_primitive(child, child_shape_type, state, frame, ctx, out);
             }
         }
         // Image variants don't produce a `FloatingShape` — they go
@@ -510,13 +612,179 @@ fn extract_vml_primitive(
         // will dispatch them to `DrawCommand::Path` / `Line`. Their
         // text-box content (where applicable) is still picked up by
         // the inline fragment collector.
-        VmlPrimitive::Shape(_)
-        | VmlPrimitive::Oval(_)
-        | VmlPrimitive::Line(_)
+        VmlPrimitive::Line(_)
         | VmlPrimitive::PolyLine(_)
         | VmlPrimitive::Arc(_)
         | VmlPrimitive::Curve(_) => {}
     }
+}
+
+/// Evaluate a VML reusable shape path into the same local point paths used by
+/// DrawingML. Word's callout shapetypes (notably `_x0000_t61`) encode the
+/// triangular mouth in this path; treating them as a bounding rectangle loses
+/// that mouth and produces the stray thin rectangle seen in zh_013.
+fn build_vml_shape_paths(
+    shape_type: &model::VmlShapeType,
+    extent: PtSize,
+) -> Option<Vec<crate::render::resolve::shape_geometry::SubPath>> {
+    use crate::model::{VmlFormulaArg, VmlFormulaOp, VmlGuide, VmlPathCommand};
+    use crate::render::resolve::shape_geometry::{PathVerb, SubPath};
+
+    let coord_size = shape_type.coord_size?;
+    if coord_size.x <= 0 || coord_size.y <= 0 || shape_type.path.is_empty() {
+        return None;
+    }
+    let width = coord_size.x as f32;
+    let height = coord_size.y as f32;
+    let mut guides = Vec::with_capacity(shape_type.formulas.len());
+
+    let eval_arg = |arg: VmlFormulaArg, values: &[f32]| -> f32 {
+        match arg {
+            VmlFormulaArg::Literal(value) => value as f32,
+            VmlFormulaArg::AdjRef(index) => {
+                shape_type.adj.get(index as usize).copied().unwrap_or(0) as f32
+            }
+            VmlFormulaArg::FormulaRef(index) => values.get(index as usize).copied().unwrap_or(0.0),
+            VmlFormulaArg::Guide(guide) => match guide {
+                VmlGuide::Width => width,
+                VmlGuide::Height => height,
+                VmlGuide::XCenter => width / 2.0,
+                VmlGuide::YCenter => height / 2.0,
+                VmlGuide::XRange => width,
+                VmlGuide::YRange => height,
+                _ => 0.0,
+            },
+        }
+    };
+
+    for formula in &shape_type.formulas {
+        let [a, b, c] = formula.args;
+        let a = eval_arg(a, &guides);
+        let b = eval_arg(b, &guides);
+        let c = eval_arg(c, &guides);
+        let value = match formula.operation {
+            VmlFormulaOp::Val => a,
+            VmlFormulaOp::Sum => a + b - c,
+            VmlFormulaOp::Product => {
+                if c == 0.0 {
+                    0.0
+                } else {
+                    a * b / c
+                }
+            }
+            VmlFormulaOp::Mid => (a + b) / 2.0,
+            VmlFormulaOp::Abs => a.abs(),
+            VmlFormulaOp::Min => a.min(b),
+            VmlFormulaOp::Max => a.max(b),
+            VmlFormulaOp::If => {
+                if a > 0.0 {
+                    b
+                } else {
+                    c
+                }
+            }
+            VmlFormulaOp::Sqrt => a.max(0.0).sqrt(),
+            VmlFormulaOp::Mod => (a * a + b * b + c * c).sqrt(),
+            VmlFormulaOp::Sin => a * (b.to_radians()).sin(),
+            VmlFormulaOp::Cos => a * (b.to_radians()).cos(),
+            VmlFormulaOp::Tan => a * (b.to_radians()).tan(),
+            VmlFormulaOp::Atan2 => a.atan2(b),
+            VmlFormulaOp::SinAtan2 => a * b.atan2(c).sin(),
+            VmlFormulaOp::CosAtan2 => a * b.atan2(c).cos(),
+            VmlFormulaOp::SumAngle => a + b * 65_536.0 - c * 65_536.0,
+            VmlFormulaOp::Ellipse => {
+                if b == 0.0 {
+                    0.0
+                } else {
+                    c * (1.0 - (a / b).powi(2)).max(0.0).sqrt()
+                }
+            }
+        };
+        guides.push(value);
+    }
+
+    let coord = |value: model::VmlPathCoord, values: &[f32]| -> f32 {
+        match value {
+            model::VmlPathCoord::Literal(value) => value as f32,
+            model::VmlPathCoord::FormulaRef(index) => {
+                values.get(index as usize).copied().unwrap_or(0.0)
+            }
+        }
+    };
+    let point = |x: f32, y: f32| {
+        crate::render::geometry::PtOffset::new(
+            Pt::new(x * extent.width.raw() / width),
+            Pt::new(y * extent.height.raw() / height),
+        )
+    };
+
+    let mut subpaths = Vec::new();
+    let mut verbs = Vec::new();
+    let mut fill_mode = crate::model::PathFillMode::Norm;
+    let mut stroked = true;
+    let mut current = (0.0_f32, 0.0_f32);
+    let flush = |verbs: &mut Vec<PathVerb>, fill_mode, stroked, subpaths: &mut Vec<SubPath>| {
+        if !verbs.is_empty() {
+            subpaths.push(SubPath {
+                verbs: std::mem::take(verbs),
+                fill_mode,
+                stroked,
+            });
+        }
+    };
+
+    for command in &shape_type.path {
+        match *command {
+            VmlPathCommand::MoveTo { x, y } => {
+                flush(&mut verbs, fill_mode, stroked, &mut subpaths);
+                current = (coord(x, &guides), coord(y, &guides));
+                verbs.push(PathVerb::MoveTo(point(current.0, current.1)));
+            }
+            VmlPathCommand::LineTo { x, y } => {
+                current = (coord(x, &guides), coord(y, &guides));
+                verbs.push(PathVerb::LineTo(point(current.0, current.1)));
+            }
+            VmlPathCommand::RMoveTo { dx, dy } => {
+                flush(&mut verbs, fill_mode, stroked, &mut subpaths);
+                current.0 += coord(dx, &guides);
+                current.1 += coord(dy, &guides);
+                verbs.push(PathVerb::MoveTo(point(current.0, current.1)));
+            }
+            VmlPathCommand::RLineTo { dx, dy } => {
+                current.0 += coord(dx, &guides);
+                current.1 += coord(dy, &guides);
+                verbs.push(PathVerb::LineTo(point(current.0, current.1)));
+            }
+            VmlPathCommand::CurveTo {
+                x1,
+                y1,
+                x2,
+                y2,
+                x,
+                y,
+            } => {
+                current = (coord(x, &guides), coord(y, &guides));
+                verbs.push(PathVerb::CubicTo(
+                    point(coord(x1, &guides), coord(y1, &guides)),
+                    point(coord(x2, &guides), coord(y2, &guides)),
+                    point(current.0, current.1),
+                ));
+            }
+            VmlPathCommand::Close => verbs.push(PathVerb::Close),
+            VmlPathCommand::End => flush(&mut verbs, fill_mode, stroked, &mut subpaths),
+            VmlPathCommand::NoFill => fill_mode = crate::model::PathFillMode::None,
+            VmlPathCommand::NoStroke => stroked = false,
+            // The callout shapetypes use move/line/close. Other VML arc
+            // commands keep their bounding-box fallback until arc support is
+            // added to the VML path painter.
+            VmlPathCommand::QuadrantX { .. }
+            | VmlPathCommand::QuadrantY { .. }
+            | VmlPathCommand::Arc { .. } => {}
+            VmlPathCommand::RCurveTo { .. } => {}
+        }
+    }
+    flush(&mut verbs, fill_mode, stroked, &mut subpaths);
+    (!subpaths.is_empty()).then_some(subpaths)
 }
 
 /// Build a [`FloatingShape`] for a `<v:rect>`-like primitive whose
@@ -533,6 +801,7 @@ fn build_vml_rect_shape(
     common: &model::VmlCommonAttrs,
     state: &BuildState,
     frame: AnchorFrame,
+    ctx: &BuildContext,
 ) -> Option<FloatingShape> {
     use crate::render::geometry::PtOffset;
     use crate::render::resolve::shape_geometry::{PathVerb, SubPath};
@@ -567,7 +836,8 @@ fn build_vml_rect_shape(
     // `@fillcolor`. We honor solid fills natively and degrade
     // gradient/tile/pattern/frame to `ResolvedFill::None` with a
     // one-time log so the rest of the shape still renders.
-    let fill = resolve_vml_solid_fill(common);
+    let fill = crate::render::layout::vml::resolve_vml_solid_fill(common);
+    let stroke = crate::render::layout::vml::resolve_vml_stroke(common);
 
     // Build a closed-rectangle path in shape-local Pt. The painter
     // applies the `(x, y)` and `size` to position the path.
@@ -580,7 +850,7 @@ fn build_vml_rect_shape(
             PathVerb::Close,
         ],
         fill_mode: crate::model::PathFillMode::Norm,
-        stroked: matches!(common.stroked, Some(true)),
+        stroked: stroke.is_some(),
     }];
 
     // Vertical position resolution depends on the
@@ -613,12 +883,17 @@ fn build_vml_rect_shape(
         behind_doc: false,
         paths,
         fill,
-        stroke: None,
+        stroke,
         effects: vec![],
-        // VML rect text-box content is still picked up at the host paragraph
-        // y by the inline-fragment collector. Sub-layout into shape-local
-        // commands isn't wired for VML primitives yet.
-        text_commands: Vec::new(),
+        // VML text-box content uses the same shape-local sub-layout as
+        // DrawingML text boxes. This is important for page-anchored thesis
+        // templates: emitting the content at the host paragraph would lose
+        // the shape's absolute position and can also change pagination.
+        text_commands: common
+            .text_box
+            .as_ref()
+            .map(|text_box| build_vml_text_commands(text_box, extent, ctx, state))
+            .unwrap_or_default(),
     })
 }
 
@@ -1072,60 +1347,6 @@ fn vml_absolute_position(style: &model::VmlStyle) -> Option<(Pt, Pt)> {
     Some((x, y))
 }
 
-/// Compute the effective solid `ResolvedFill` for a VML primitive
-/// per §14.1.2.5. The `<v:fill>` child wins over `@fillcolor`. Only
-/// the `Solid` fill type is honored here; the others log once and
-/// degrade to `ResolvedFill::None` so the shape's outline / text
-/// content still renders.
-fn resolve_vml_solid_fill(
-    common: &model::VmlCommonAttrs,
-) -> crate::render::layout::draw_command::ResolvedFill {
-    use crate::model::{VmlColor, VmlFillType};
-    use crate::render::layout::draw_command::ResolvedFill;
-    use crate::render::resolve::drawing_color::Rgba;
-
-    let to_solid = |c: &VmlColor| -> Option<ResolvedFill> {
-        match c {
-            VmlColor::Rgb(r, g, b) => Some(ResolvedFill::Solid(Rgba {
-                r: *r as f32 / 255.0,
-                g: *g as f32 / 255.0,
-                b: *b as f32 / 255.0,
-                a: 1.0,
-            })),
-            // Named/system colors aren't yet resolved — fall through.
-            VmlColor::Named(_) => None,
-        }
-    };
-
-    if let Some(ref fill) = common.fill {
-        match fill.fill_type {
-            VmlFillType::Solid => {
-                if let Some(c) = fill.color.as_ref().and_then(to_solid) {
-                    return c;
-                }
-                // Solid type with no `@color` — fall back to attribute.
-            }
-            VmlFillType::Gradient
-            | VmlFillType::GradientRadial
-            | VmlFillType::Tile
-            | VmlFillType::Frame
-            | VmlFillType::Pattern => {
-                log::warn!(
-                    "vml: unsupported fill type {:?} — rendering as no-fill",
-                    fill.fill_type
-                );
-                return ResolvedFill::None;
-            }
-        }
-    }
-
-    common
-        .fill_color
-        .as_ref()
-        .and_then(to_solid)
-        .unwrap_or(ResolvedFill::None)
-}
-
 /// True when the anchor's vertical position resolves relative to the host
 /// paragraph or line — the only case where the shape's eventual page-y is a
 /// function of `paragraph_top` rather than an absolute frame. The shape-text
@@ -1211,7 +1432,7 @@ impl BodyAnchor {
 /// shape's interior doesn't pollute the outer document; `field_ctx` is copied
 /// so PAGE/NUMPAGES inside a shape's text body still resolve against the host
 /// page.
-pub(super) fn build_shape_text_commands(
+pub(crate) fn build_shape_text_commands(
     wsp: &crate::model::WordProcessingShape,
     extent: PtSize,
     ctx: &BuildContext,
@@ -1283,6 +1504,7 @@ pub(super) fn build_shape_text_commands(
         outline: crate::render::layout::build::OutlineCollector::Excluded,
         shape_auto_fit: auto_fit,
         page_config: state.page_config.clone(),
+        doc_grid_line_pitch: None,
         footnotes: Default::default(),
         endnote_counter: 0,
         list_counters: std::collections::HashMap::new(),
@@ -1342,6 +1564,56 @@ pub(super) fn build_shape_text_commands(
         commands.push(cmd);
     }
     commands
+}
+
+/// Lay out a legacy VML text box through the same WordprocessingML sub-layout
+/// used by DrawingML shapes. VML and DrawingML differ in their container
+/// syntax, but the text body is the same `w:txbxContent`; adapting the insets
+/// here avoids a second paragraph/table layout implementation.
+pub(crate) fn build_vml_text_commands(
+    text_box: &crate::model::VmlTextBox,
+    extent: PtSize,
+    ctx: &BuildContext,
+    state: &BuildState,
+) -> Vec<crate::render::layout::draw_command::DrawCommand> {
+    use crate::model::dimension::{Dimension, Emu};
+
+    fn inset_to_emu(value: Option<crate::model::VmlLength>) -> Option<Dimension<Emu>> {
+        let value = value?;
+        let points = value.to_absolute_points().unwrap_or(value.value as f32);
+        Some(Dimension::new((points * 12_700.0).round() as i64))
+    }
+
+    let body_pr = text_box
+        .inset
+        .as_ref()
+        .map(|inset| crate::model::BodyProperties {
+            rotation: None,
+            vert: None,
+            wrap: None,
+            left_inset: inset_to_emu(inset.left),
+            top_inset: inset_to_emu(inset.top),
+            right_inset: inset_to_emu(inset.right),
+            bottom_inset: inset_to_emu(inset.bottom),
+            anchor: text_box.style.text_anchor.map(|anchor| match anchor {
+                crate::model::VmlTextAnchor::Top => crate::model::TextAnchoringType::Top,
+                crate::model::VmlTextAnchor::Middle => crate::model::TextAnchoringType::Center,
+                crate::model::VmlTextAnchor::Bottom => crate::model::TextAnchoringType::Bottom,
+            }),
+            vert_overflow: None,
+            auto_fit: None,
+        });
+    let adapter = crate::model::WordProcessingShape {
+        cnv_pr: None,
+        shape_properties: None,
+        style_line_ref: None,
+        style_effect_ref: None,
+        style_fill_ref: None,
+        style_font_ref: None,
+        body_pr,
+        txbx_content: text_box.content.clone(),
+    };
+    build_shape_text_commands(&adapter, extent, ctx, state)
 }
 
 /// Whether `@vertOverflow` keeps `cmd`, given the bottom of the body's box.
@@ -1630,6 +1902,7 @@ mod tests {
     fn default_state() -> BuildState {
         BuildState {
             page_config: Default::default(),
+            doc_grid_line_pitch: None,
             outline: Default::default(),
             shape_auto_fit: crate::render::layout::ShapeAutoFit::NONE,
             footnotes: Default::default(),
@@ -1726,6 +1999,7 @@ mod tests {
     // ── §20.1.10.60 shape text-body anchoring ────────────────────────────
 
     use super::build_shape_text_commands;
+    use super::FloatingShape;
     use crate::model::{
         BodyProperties, Paragraph as ModelParagraph, ParagraphProperties, RunElement,
         RunProperties, TextAnchoringType, TextRun,
@@ -1754,6 +2028,7 @@ mod tests {
             endnotes: HashMap::new(),
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
+            adjust_line_height_in_table: false,
         }
     }
 
@@ -2431,9 +2706,10 @@ mod tests {
 
     // ── §14.1.2.5 VML fill resolution ────────────────────────────────────
 
-    use super::{build_vml_rect_shape, model, resolve_vml_solid_fill};
+    use super::{build_vml_rect_shape, model};
     use crate::model::{VmlColor, VmlFill, VmlFillType, VmlLength, VmlLengthUnit, VmlNamedColor};
     use crate::render::layout::draw_command::ResolvedFill;
+    use crate::render::layout::vml::resolve_vml_solid_fill;
 
     fn solid_rgb(fill: &ResolvedFill) -> (f32, f32, f32) {
         let ResolvedFill::Solid(c) = fill else {
@@ -2512,18 +2788,14 @@ mod tests {
         }
     }
 
-    /// Named colours are parsed but not yet resolved to RGB, so they leave the
-    /// shape unfilled rather than guessing.
+    /// Common VML/CSS named colours resolve deterministically.
     #[test]
-    fn vml_named_colors_are_not_resolved_yet() {
+    fn vml_named_colors_resolve_to_rgb() {
         let common = model::VmlCommonAttrs {
             fill_color: Some(VmlColor::Named(VmlNamedColor::Black)),
             ..Default::default()
         };
-        assert!(matches!(
-            resolve_vml_solid_fill(&common),
-            ResolvedFill::None
-        ));
+        assert_eq!(solid_rgb(&resolve_vml_solid_fill(&common)), (0.0, 0.0, 0.0));
     }
 
     // ── §14.1.2.19 VML rect construction ─────────────────────────────────
@@ -2550,13 +2822,28 @@ mod tests {
         }
     }
 
+    fn build_test_vml_rect(
+        common: &model::VmlCommonAttrs,
+        state: &BuildState,
+        frame: AnchorFrame,
+    ) -> Option<FloatingShape> {
+        let resolved = empty_resolved();
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+        build_vml_rect_shape(common, state, frame, &ctx)
+    }
+
     /// The path is a closed rectangle in *shape-local* points — the painter
     /// applies `(x, y)`, so baking the position into the path would double it.
     #[test]
     fn vml_rect_is_a_closed_rectangle_in_shape_local_points() {
         use crate::render::resolve::shape_geometry::PathVerb;
 
-        let shape = build_vml_rect_shape(
+        let shape = build_test_vml_rect(
             &vml_rect(30.0, 40.0, 200.0, 10.0),
             &default_state(),
             AnchorFrame::Page,
@@ -2587,7 +2874,7 @@ mod tests {
     /// body's left margin, so the page-relative x is pre-compensated.
     #[test]
     fn stack_frame_vml_rect_backs_out_the_left_margin() {
-        let shape = build_vml_rect_shape(
+        let shape = build_test_vml_rect(
             &vml_rect(80.0, 0.0, 10.0, 10.0),
             &default_state(),
             AnchorFrame::Stack,
@@ -2608,13 +2895,13 @@ mod tests {
         let mut unpositioned = vml_rect(30.0, 40.0, 200.0, 10.0);
         unpositioned.style.position = None;
         assert!(
-            build_vml_rect_shape(&unpositioned, &default_state(), AnchorFrame::Page).is_none(),
+            build_test_vml_rect(&unpositioned, &default_state(), AnchorFrame::Page).is_none(),
             "no position:absolute"
         );
 
         for (w, h) in [(0.0, 10.0), (200.0, 0.0), (-5.0, 10.0)] {
             assert!(
-                build_vml_rect_shape(
+                build_test_vml_rect(
                     &vml_rect(30.0, 40.0, w, h),
                     &default_state(),
                     AnchorFrame::Page
@@ -2625,19 +2912,20 @@ mod tests {
         }
     }
 
-    /// `@stroked` reaches the sub-path so the painter knows whether to outline.
+    /// `@stroked` reaches the sub-path; omission keeps VML's default stroke.
     #[test]
     fn vml_rect_carries_the_stroked_flag_onto_its_path() {
         for stroked in [None, Some(false), Some(true)] {
             let mut common = vml_rect(0.0, 0.0, 10.0, 10.0);
             common.stroked = stroked;
             let shape =
-                build_vml_rect_shape(&common, &default_state(), AnchorFrame::Page).expect("builds");
+                build_test_vml_rect(&common, &default_state(), AnchorFrame::Page).expect("builds");
             assert_eq!(
                 shape.paths[0].stroked,
-                stroked == Some(true),
+                stroked != Some(false),
                 "stroked={stroked:?}"
             );
+            assert_eq!(shape.stroke.is_some(), stroked != Some(false));
         }
     }
 }
