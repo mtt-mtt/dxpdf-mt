@@ -22,6 +22,11 @@ struct Cli {
     /// Higher values yield crisper images and larger PDFs.
     #[arg(long, default_value_t = DEFAULT_IMAGE_DPI, value_parser = parse_image_dpi)]
     image_dpi: f32,
+
+    /// Recursively load a controlled .ttf/.otf/.ttc font directory.
+    /// Fonts remain process-local and are not installed into the OS.
+    #[arg(long)]
+    font_dir: Option<PathBuf>,
 }
 
 /// Lowest / highest `--image-dpi` the CLI accepts. Bounds only catch typos; the
@@ -78,7 +83,16 @@ fn run() -> Result<(), dxpdf::Error> {
     let options = RenderOptions::default().with_image_dpi(cli.image_dpi);
 
     let docx_bytes = dxpdf::path_io::read(&cli.input)?;
-    let pdf_bytes = dxpdf::convert_with_options(&docx_bytes, &options)?;
+    let pdf_bytes = if let Some(font_dir) = cli.font_dir {
+        dxpdf::convert_with_options_and_font_dir(
+            &docx_bytes,
+            &options,
+            &dxpdf::PackageLimits::default(),
+            font_dir,
+        )?
+    } else {
+        dxpdf::convert_with_options(&docx_bytes, &options)?
+    };
     dxpdf::path_io::write(&output, &pdf_bytes)?;
     eprintln!("Converted {} -> {}", cli.input.display(), output.display());
 

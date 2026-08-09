@@ -72,6 +72,10 @@ pub struct ParagraphStyle {
     /// §17.3.1.44: when the paragraph *does* split, forbid a single line stranded
     /// at the bottom (orphan) or top (widow) of a page. Word's default is on.
     pub widow_control: bool,
+    /// §17.3.1.45 `w:wordWrap`: allow a word in a space-delimited language
+    /// to break between characters when it exceeds the line extent. The OOXML
+    /// default is false; East Asian line-break opportunities are independent.
+    pub word_wrap: bool,
     /// §17.3.1.9: suppress spacing between paragraphs of the same style.
     pub contextual_spacing: bool,
     /// Style ID for contextual spacing comparison.
@@ -154,6 +158,7 @@ impl ParagraphStyle {
             keep_next: self.keep_next,
             keep_lines: self.keep_lines,
             widow_control: self.widow_control,
+            word_wrap: self.word_wrap,
             contextual_spacing: self.contextual_spacing,
             style_id: self.style_id.clone(),
             // Caller will replace these — skip cloning the vec.
@@ -188,6 +193,7 @@ impl Default for ParagraphStyle {
             keep_lines: false,
             // §17.3.1.44: Word enables widow/orphan control by default.
             widow_control: true,
+            word_wrap: false,
             contextual_spacing: false,
             style_id: None,
             page_floats: Vec::new(),

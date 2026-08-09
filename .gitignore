@@ -1,4 +1,5 @@
 /target
+/target-no-subset/
 
 # Local-only document corpus. May contain private/customer documents, so it is
 # never committed. Tests that use it are gated on file existence and skip when

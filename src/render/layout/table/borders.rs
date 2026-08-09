@@ -497,6 +497,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 
@@ -1005,6 +1006,7 @@ mod edge_mapping_tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 

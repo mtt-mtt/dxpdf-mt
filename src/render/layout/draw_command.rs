@@ -68,6 +68,9 @@ pub enum DrawCommand {
         /// §17.3.2.45: horizontal scale factor (1.0 = normal, 0.8 = 80%,
         /// 1.5 = 150%). Painter applies via `Font::set_scale_x`.
         text_scale: f32,
+        /// Clockwise rotation in degrees around `position`. Normal body text
+        /// is `0`; table-cell `w:textDirection` uses ±90 degrees.
+        rotation_degrees: f32,
     },
     Underline {
         line: PtLineSegment,
@@ -315,12 +318,11 @@ impl DrawCommand {
     ///
     /// **Text is approximate.** A `Text` command carries a baseline and a font
     /// size, not the ascent/descent it was measured with, so the band is taken
-    /// as `baseline ± font_size`. That is the same approximation
-    /// `render::estimate_cursor_y` already makes for the descender, kept
-    /// deliberately identical so the two cannot disagree about where a line
-    /// ends. It is generous on both sides, which is the safe direction for the
-    /// one caller that exists (`vertOverflow="clip"`): a line is dropped when
-    /// it *might* paint outside its box rather than when it certainly does.
+    /// as `baseline ± font_size`. It is generous on both sides, which is the
+    /// safe direction for the one caller that exists (`vertOverflow="clip"`):
+    /// a line is dropped when it *might* paint outside its box rather than when
+    /// it certainly does. Continuous-section layout uses the stacker's exact
+    /// terminal flow state and does not depend on this paint-band estimate.
     pub fn vertical_span(&self) -> Option<(Pt, Pt)> {
         match self {
             DrawCommand::Text {
@@ -389,6 +391,7 @@ mod tests {
             italic: false,
             color: RgbColor::BLACK,
             text_scale: 1.0,
+            rotation_degrees: 0.0,
         };
         cmd.shift_y(Pt::new(5.0));
         if let DrawCommand::Text { position, .. } = cmd {
@@ -531,6 +534,7 @@ mod tests {
                     italic: false,
                     color: RgbColor::BLACK,
                     text_scale: 1.0,
+                    rotation_degrees: 0.0,
                 },
             ),
             (
@@ -658,6 +662,7 @@ mod tests {
             italic: false,
             color: RgbColor::BLACK,
             text_scale: 1.0,
+            rotation_degrees: 0.0,
         };
         let (top, bottom) = cmd.vertical_span().unwrap();
         assert_eq!((top.raw(), bottom.raw()), (8.0, 32.0));

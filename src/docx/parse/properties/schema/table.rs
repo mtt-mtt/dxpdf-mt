@@ -527,7 +527,10 @@ mod tests {
         let b = tp.borders.unwrap();
         assert_eq!(b.top.unwrap().style, BorderStyle::Single);
         assert_eq!(b.left.unwrap().style, BorderStyle::Double);
-        assert_eq!(tp.cell_margins.unwrap().top.raw(), 100);
+        assert_eq!(
+            tp.cell_margins.unwrap().top.map(|value| value.raw()),
+            Some(100)
+        );
     }
 
     #[test]

@@ -1047,7 +1047,12 @@ where
                             // the instruction's display argument, so recover
                             // it before closing the field instead of dropping
                             // the whole placeholder.
-                            if !frame.had_separate && frame.substitution_pending.is_none() {
+                            let inside_internal_hyperlink =
+                                matches!(hyperlink_url, Some(LinkTarget::Internal(_)));
+                            if !frame.had_separate
+                                && frame.substitution_pending.is_none()
+                                && !inside_internal_hyperlink
+                            {
                                 if let Ok(parsed) = crate::field::parse(&frame.instruction) {
                                     if let Some(text) = fallback_field_instruction_text(&parsed) {
                                         frame.format_source = instruction_display_format_source(
@@ -1839,6 +1844,75 @@ mod tests {
             })
             .collect();
         assert_eq!(rendered, "[placeholder]");
+    }
+
+    #[test]
+    fn toc_hyperlink_hides_macrobutton_editor_text_but_keeps_pageref_cache() {
+        let inlines = vec![Inline::Hyperlink(Hyperlink {
+            target: HyperlinkTarget::Internal {
+                anchor: "_Toc42".into(),
+            },
+            content: vec![
+                text_run("第2章"),
+                fld_char(FieldCharType::Begin),
+                Inline::InstrText(" MACROBUTTON AcceptAllChangesShown [请输入章节名称] ".into()),
+                fld_char(FieldCharType::End),
+                fld_char(FieldCharType::Begin),
+                Inline::InstrText(" PAGEREF _Toc42 \\h ".into()),
+                fld_char(FieldCharType::Separate),
+                text_run("3"),
+                fld_char(FieldCharType::End),
+            ],
+        })];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rendered, "第2章3");
+    }
+
+    #[test]
+    fn malformed_complex_field_keeps_its_cached_result() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("BROKEN \"unterminated".into()),
+            fld_char(FieldCharType::Separate),
+            text_run("cached result"),
+            fld_char(FieldCharType::End),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rendered, "cached result");
     }
 
     #[test]

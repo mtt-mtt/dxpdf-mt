@@ -8,6 +8,7 @@ use super::helpers::table_x_offset;
 use super::types::{FloatingImageY, LayoutBlock, PageParity};
 use crate::render::dimension::Pt;
 use crate::render::geometry::PtRect;
+use crate::render::layout::cell::CellFootnote;
 
 /// One fitted line of stacked cell content, recorded so a §17.4.1 row split can
 /// choose legal cut points from the paragraph structure rather than from raw
@@ -53,6 +54,9 @@ pub struct StackResult {
     /// Empty when the content cannot be safely bisected (nested table or
     /// floating object present) — such cells move whole rather than split.
     pub lines: Vec<CellLine>,
+    /// Footnotes encountered while stacking cell paragraphs, positioned at the
+    /// line carrying each reference.
+    pub footnotes: Vec<CellFootnote>,
 }
 
 /// Stack blocks vertically within a fixed-width area.
@@ -88,6 +92,7 @@ pub fn stack_blocks(
     // block was encountered which makes the whole cell unsafe to bisect
     // (nested table or floating object).
     let mut cell_lines: Vec<CellLine> = Vec::new();
+    let mut cell_footnotes: Vec<CellFootnote> = Vec::new();
     let mut splittable = true;
 
     for (block_index, block) in blocks.iter().enumerate() {
@@ -97,6 +102,7 @@ pub fn stack_blocks(
                 style,
                 floating_images,
                 floating_shapes,
+                footnotes,
                 ..
             } => {
                 let mut effective_style = style.clone_for_layout();
@@ -114,12 +120,10 @@ pub fn stack_blocks(
 
                 // Register floating images.
                 let content_top = cursor_y + effective_style.space_before;
-                // Where the paragraph would start with no `TopAndBottom` band,
-                // so the band's effect on the cursor can be told apart from it.
-                let pre_band_cursor = cursor_y;
                 // §20.4.2.18: `wrapTopAndBottom` floats occupy a band of their
-                // own above the paragraph and **stack** — each sits below the
-                // one before it, and the paragraph starts below the whole band.
+                // own and **stack** — each relative object sits below the
+                // exclusion band of the one before it. Paragraph lines may
+                // still occupy space above an absolutely positioned band.
                 // Tracks the band's running bottom so successive floats don't
                 // all resolve to `content_top` and draw on top of each other.
                 // Shared with the shape loop below, so a `TopAndBottom` image
@@ -129,24 +133,21 @@ pub fn stack_blocks(
                 // before.
                 let mut band_bottom: Option<Pt> = None;
                 for fi in floating_images.iter() {
-                    let (y_start, y_end) = match fi.y {
-                        FloatingImageY::RelativeToParagraph(offset) => {
-                            (content_top + offset, content_top + offset + fi.size.height)
-                        }
-                        FloatingImageY::Absolute(img_y) => (img_y, img_y + fi.size.height),
+                    let natural_y = match fi.y {
+                        FloatingImageY::RelativeToParagraph(offset) => content_top + offset,
+                        FloatingImageY::Absolute(img_y) => img_y,
                     };
+                    let y_start = natural_y - fi.dist_top;
+                    let y_end = natural_y + fi.size.height + fi.dist_bottom;
                     if fi.is_wrap_top_and_bottom() {
                         let img_y = match fi.y {
                             // Page-absolute floats are positioned by the anchor,
                             // not by the band.
                             FloatingImageY::Absolute(y) => y,
-                            FloatingImageY::RelativeToParagraph(offset) => {
-                                let natural = content_top + offset;
-                                match band_bottom {
-                                    Some(bottom) => natural.max(bottom),
-                                    None => natural,
-                                }
-                            }
+                            FloatingImageY::RelativeToParagraph(_) => match band_bottom {
+                                Some(bottom) => natural_y.max(bottom + fi.dist_top),
+                                None => natural_y,
+                            },
                         };
                         commands.push(DrawCommand::Image {
                             rect: PtRect::from_xywh(
@@ -158,14 +159,20 @@ pub fn stack_blocks(
                             image_data: fi.image_data.clone(),
                             src_rect: fi.src_rect,
                         });
-                        let bottom = img_y + fi.size.height;
+                        let bottom = img_y + fi.size.height + fi.dist_bottom;
+                        page_floats.push(float::ActiveFloat {
+                            page_x: Pt::ZERO,
+                            page_y_start: img_y - fi.dist_top,
+                            page_y_end: bottom,
+                            width: content_width,
+                            source: float::FloatSource::Image,
+                            vertical_exclusion: true,
+                            wrap_text: float::WrapTextSide::BothSides,
+                        });
                         band_bottom = Some(match band_bottom {
                             Some(prev) => prev.max(bottom),
                             None => bottom,
                         });
-                        if bottom > cursor_y {
-                            cursor_y = bottom;
-                        }
                     } else if fi.wrap_mode.registers_as_wrap_float() {
                         page_floats.push(float::ActiveFloat {
                             page_x: fi.x.resolve(parity) - fi.dist_left,
@@ -173,14 +180,15 @@ pub fn stack_blocks(
                             page_y_end: y_end,
                             width: fi.size.width + fi.dist_left + fi.dist_right,
                             source: float::FloatSource::Image,
+                            vertical_exclusion: false,
                             wrap_text: fi.wrap_mode.wrap_text().into(),
                         });
                     }
                 }
 
                 // §20.4.2: register floating shapes (DrawingML). Mirrors the
-                // image branch above: `TopAndBottom` emits now and advances
-                // the cursor; wrap-enabled modes (Square/Tight/Through) are
+                // image branch above: `TopAndBottom` emits now and registers
+                // a full-width exclusion band; Square/Tight/Through are
                 // registered as active floats so subsequent lines narrow
                 // around them. `None` shapes emit after the paragraph.
                 for fs in floating_shapes.iter() {
@@ -188,23 +196,20 @@ pub fn stack_blocks(
                     if matches!(fs.wrap_mode, WrapMode::None) {
                         continue;
                     }
-                    let (y_start, y_end) = match fs.y {
-                        FloatingImageY::RelativeToParagraph(offset) => {
-                            (content_top + offset, content_top + offset + fs.size.height)
-                        }
-                        FloatingImageY::Absolute(y) => (y, y + fs.size.height),
+                    let natural_y = match fs.y {
+                        FloatingImageY::RelativeToParagraph(offset) => content_top + offset,
+                        FloatingImageY::Absolute(y) => y,
                     };
+                    let y_start = natural_y - fs.dist_top;
+                    let y_end = natural_y + fs.size.height + fs.dist_bottom;
                     if fs.is_wrap_top_and_bottom() {
                         // Same band as the images above — see `band_bottom`.
                         let shape_y = match fs.y {
                             FloatingImageY::Absolute(y) => y,
-                            FloatingImageY::RelativeToParagraph(offset) => {
-                                let natural = content_top + offset;
-                                match band_bottom {
-                                    Some(bottom) => natural.max(bottom),
-                                    None => natural,
-                                }
-                            }
+                            FloatingImageY::RelativeToParagraph(_) => match band_bottom {
+                                Some(bottom) => natural_y.max(bottom + fs.dist_top),
+                                None => natural_y,
+                            },
                         };
                         commands.push(DrawCommand::Path {
                             origin: crate::render::geometry::PtOffset::new(
@@ -220,14 +225,20 @@ pub fn stack_blocks(
                             stroke: fs.stroke.clone(),
                             effects: fs.effects.clone(),
                         });
-                        let bottom = shape_y + fs.size.height;
+                        let bottom = shape_y + fs.size.height + fs.dist_bottom;
+                        page_floats.push(float::ActiveFloat {
+                            page_x: Pt::ZERO,
+                            page_y_start: shape_y - fs.dist_top,
+                            page_y_end: bottom,
+                            width: content_width,
+                            source: float::FloatSource::Shape,
+                            vertical_exclusion: true,
+                            wrap_text: float::WrapTextSide::BothSides,
+                        });
                         band_bottom = Some(match band_bottom {
                             Some(prev) => prev.max(bottom),
                             None => bottom,
                         });
-                        if bottom > cursor_y {
-                            cursor_y = bottom;
-                        }
                     } else {
                         page_floats.push(float::ActiveFloat {
                             page_x: fs.x.resolve(parity) - fs.dist_left,
@@ -235,24 +246,10 @@ pub fn stack_blocks(
                             page_y_end: y_end,
                             width: fs.size.width + fs.dist_left + fs.dist_right,
                             source: float::FloatSource::Shape,
+                            vertical_exclusion: false,
                             wrap_text: fs.wrap_mode.wrap_text().into(),
                         });
                     }
-                }
-
-                // §20.4.2.18: the band was placed from `content_top`, which
-                // already includes `space_before`, and the cursor now sits at
-                // the band's bottom. `place_paragraph` applies `space_before`
-                // again inside the paragraph box, so without this the text is
-                // pushed a second `space_before` below the band it is supposed
-                // to sit directly beneath — contradicting the band comment
-                // above ("the paragraph starts below the whole band").
-                //
-                // Only when the band actually moved the cursor: a float with a
-                // negative `wp:posOffset` that resolves above the paragraph
-                // leaves the cursor alone and needs no correction.
-                if cursor_y > pre_band_cursor {
-                    cursor_y -= effective_style.space_before;
                 }
 
                 float::prune_floats(&mut page_floats, cursor_y);
@@ -275,15 +272,32 @@ pub fn stack_blocks(
                 // unsafe to bisect (per-line float offsets depend on absolute
                 // y); a paragraph whose box would tear (keepLines, borders,
                 // shading, drop cap) is kept internally atomic.
+                let record_cut_lines =
+                    splittable && floating_images.is_empty() && floating_shapes.is_empty();
                 if !floating_images.is_empty() || !floating_shapes.is_empty() {
                     splittable = false;
-                } else if splittable {
-                    let interior_atomic = effective_style.keep_lines
-                        || effective_style.borders.is_some()
-                        || effective_style.shading.is_some()
-                        || effective_style.drop_cap.is_some();
-                    let mut line_top = cursor_y + effective_style.space_before;
-                    for i in 0..placed.line_count() {
+                }
+                let interior_atomic = effective_style.keep_lines
+                    || effective_style.borders.is_some()
+                    || effective_style.shading.is_some()
+                    || effective_style.drop_cap.is_some();
+                let mut line_top = cursor_y + effective_style.space_before;
+                let mut last_line_top = line_top;
+                let mut footnote_cursor = 0;
+                for i in 0..placed.line_count() {
+                    last_line_top = line_top;
+                    let refs_on_line = placed.footnote_refs_in(i, i + 1);
+                    for _ in 0..refs_on_line {
+                        if let Some(footnote) = footnotes.get(footnote_cursor) {
+                            cell_footnotes.push(CellFootnote {
+                                top_y: line_top,
+                                footnote: footnote.clone(),
+                                page_height: Pt::ZERO,
+                            });
+                        }
+                        footnote_cursor += 1;
+                    }
+                    if record_cut_lines {
                         cell_lines.push(CellLine {
                             top_y: line_top,
                             para: block_index,
@@ -291,8 +305,18 @@ pub fn stack_blocks(
                             widow_control: effective_style.widow_control,
                             keep_next: effective_style.keep_next,
                         });
-                        line_top += placed.line_height(i);
                     }
+                    line_top += placed.line_height(i);
+                }
+                // Defensive preservation for malformed documents where a note
+                // body exists but no reference fragment survived. Associate it
+                // with the paragraph's last line instead of silently dropping it.
+                for footnote in footnotes.iter().skip(footnote_cursor) {
+                    cell_footnotes.push(CellFootnote {
+                        top_y: last_line_top,
+                        footnote: footnote.clone(),
+                        page_height: Pt::ZERO,
+                    });
                 }
 
                 let para = placed.emit_full();
@@ -422,6 +446,7 @@ pub fn stack_blocks(
         commands,
         height: cursor_y,
         lines: if splittable { cell_lines } else { Vec::new() },
+        footnotes: cell_footnotes,
     }
 }
 
@@ -449,6 +474,8 @@ mod tests {
             x: FloatingImageX::Absolute(Pt::ZERO),
             y,
             wrap_mode: wrap,
+            dist_top: Pt::ZERO,
+            dist_bottom: Pt::ZERO,
             dist_left: Pt::ZERO,
             dist_right: Pt::ZERO,
             behind_doc: false,
@@ -853,8 +880,8 @@ mod tests {
         assert_eq!(text_ys(&result), vec![SPACE + ASCENT]);
     }
 
-    /// A non-`TopAndBottom` float leaves the cursor alone, so it must not
-    /// trigger the correction either.
+    /// A square float narrows the line without inserting a full-width
+    /// clearance, so ordinary paragraph spacing remains unchanged.
     #[test]
     fn a_square_wrap_float_does_not_change_paragraph_spacing() {
         const SPACE: f32 = 10.0;

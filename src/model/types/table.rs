@@ -1,7 +1,7 @@
 //! Table types — table, row, cell properties, borders, positioning.
 
 use crate::model::dimension::{Dimension, ThousandthPercent, Twips};
-use crate::model::geometry::{EdgeInsets, PartialEdgeInsets};
+use crate::model::geometry::PartialEdgeInsets;
 
 use super::content::Block;
 use super::formatting::{
@@ -25,7 +25,11 @@ pub struct TableProperties {
     pub layout: Option<TableLayout>,
     pub indent: Option<TableMeasure>,
     pub borders: Option<TableBorders>,
-    pub cell_margins: Option<EdgeInsets<Twips>>,
+    /// §17.4.43 `<w:tblCellMar>` — table-level cell-margin defaults.
+    /// Each side is independently optional because direct table properties,
+    /// table styles, and the format defaults cascade per side. In particular,
+    /// an explicit zero must remain distinguishable from an omitted side.
+    pub cell_margins: Option<PartialEdgeInsets<Twips>>,
     pub cell_spacing: Option<TableMeasure>,
     pub look: Option<TableLook>,
     /// §17.4.68: number of rows in each row band for conditional formatting.

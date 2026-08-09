@@ -72,6 +72,8 @@ pub struct ResolvedDocument {
     /// §17.15.3.1: whether document-grid line pitch also applies inside table
     /// cells. Omitted compatibility settings resolve to `false`.
     pub adjust_line_height_in_table: bool,
+    /// §17.15.1.18: document-wide full-width character compression policy.
+    pub character_spacing_control: crate::model::CharacterSpacingControl,
 }
 
 /// Transform a raw parsed Document into a layout-ready ResolvedDocument.
@@ -142,6 +144,7 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
         even_and_odd_headers: settings.even_and_odd_headers,
         default_tab_stop: settings.default_tab_stop,
         adjust_line_height_in_table: settings.adjust_line_height_in_table,
+        character_spacing_control: settings.character_spacing_control,
     }
 }
 

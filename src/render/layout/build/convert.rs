@@ -244,6 +244,80 @@ pub(super) fn doc_font_size(ctx: &BuildContext) -> Pt {
         .unwrap_or(SPEC_DEFAULT_FONT_SIZE)
 }
 
+/// Resolve §17.3.1.12 paragraph indents after the paragraph font size is known.
+///
+/// Character-unit values form a parallel style cascade in Word.  A non-zero
+/// value wins over the related absolute value even when the latter came from a
+/// later hierarchy level; zero clears the character cascade and falls back to
+/// the absolute value.  One character is one em of the resolved paragraph font.
+pub(super) fn resolve_indentation(
+    indentation: Option<model::Indentation>,
+    character_width: Pt,
+) -> (Pt, Pt, Pt) {
+    let Some(indentation) = indentation else {
+        return (Pt::ZERO, Pt::ZERO, Pt::ZERO);
+    };
+
+    let resolve_side = |chars: Option<
+        crate::model::dimension::Dimension<crate::model::dimension::HundredthChars>,
+    >,
+                        absolute: Option<
+        crate::model::dimension::Dimension<crate::model::dimension::Twips>,
+    >| {
+        chars
+            .filter(|value| value.raw() != 0)
+            .map(|value| character_width * value.to_characters_f32())
+            .or_else(|| absolute.map(Pt::from))
+            .unwrap_or(Pt::ZERO)
+    };
+
+    let hanging_chars = indentation.first_line_chars.and_then(|value| match value {
+        model::FirstLineIndentChars::Hanging(value) if value.raw() != 0 => Some(value),
+        _ => None,
+    });
+    let first_line_chars = indentation.first_line_chars.and_then(|value| {
+        use model::FirstLineIndentChars;
+        match value {
+            FirstLineIndentChars::FirstLine(value) if value.raw() != 0 => {
+                Some(character_width * value.to_characters_f32())
+            }
+            FirstLineIndentChars::Hanging(value) if value.raw() != 0 => {
+                Some(-(character_width * value.to_characters_f32()))
+            }
+            FirstLineIndentChars::None
+            | FirstLineIndentChars::FirstLine(_)
+            | FirstLineIndentChars::Hanging(_) => None,
+        }
+    });
+    let first_line = first_line_chars.unwrap_or_else(|| {
+        indentation
+            .first_line
+            .map(|value| match value {
+                FirstLineIndent::FirstLine(value) => Pt::from(value),
+                FirstLineIndent::Hanging(value) => -Pt::from(value),
+                FirstLineIndent::None => Pt::ZERO,
+            })
+            .unwrap_or(Pt::ZERO)
+    });
+
+    // Word compatibility: when a non-zero hangingChars value is present but
+    // startChars/leftChars is absent, Word ignores the absolute start/left
+    // value.  The continuation-line start becomes the hanging width and the
+    // first-line offset is its negative.  Keeping an explicit zero distinct
+    // from absence is important: zero clears the character-unit cascade and
+    // exposes the absolute value instead.
+    let start = match (indentation.start_chars, hanging_chars) {
+        (None, Some(value)) => character_width * value.to_characters_f32(),
+        _ => resolve_side(indentation.start_chars, indentation.start),
+    };
+
+    (
+        start,
+        resolve_side(indentation.end_chars, indentation.end),
+        first_line,
+    )
+}
+
 /// Convert a model paragraph properties into a layout ParagraphStyle.
 ///
 /// `auto_fit` is the §20.1.2.1.18 `a:normAutofit` shrink of the enclosing shape
@@ -254,30 +328,14 @@ pub(super) fn doc_font_size(ctx: &BuildContext) -> Pt {
 /// shape text box.
 pub(super) fn paragraph_style_from_props(
     props: &model::ParagraphProperties,
+    character_width: Pt,
     default_tab_stop: Pt,
     auto_fit: crate::render::layout::ShapeAutoFit,
     locale: crate::render::resolve::locale::Locale,
     outline: Option<crate::render::layout::draw_command::OutlineHeading>,
 ) -> ParagraphStyle {
-    let indent_left = props
-        .indentation
-        .and_then(|i| i.start)
-        .map(Pt::from)
-        .unwrap_or(Pt::ZERO);
-    let indent_right = props
-        .indentation
-        .and_then(|i| i.end)
-        .map(Pt::from)
-        .unwrap_or(Pt::ZERO);
-    let indent_first_line = props
-        .indentation
-        .and_then(|i| i.first_line)
-        .map(|fl| match fl {
-            FirstLineIndent::FirstLine(v) => Pt::from(v),
-            FirstLineIndent::Hanging(v) => -Pt::from(v),
-            FirstLineIndent::None => Pt::ZERO,
-        })
-        .unwrap_or(Pt::ZERO);
+    let (indent_left, indent_right, indent_first_line) =
+        resolve_indentation(props.indentation, character_width);
 
     // §17.3.1.33: when autoSpacing is true, use 14pt instead of explicit value.
     let space_before = if props.spacing.and_then(|s| s.before_auto_spacing) == Some(true) {
@@ -346,6 +404,8 @@ pub(super) fn paragraph_style_from_props(
         keep_lines: props.keep_lines.unwrap_or(false),
         // §17.3.1.44: Word enables widow/orphan control by default.
         widow_control: props.widow_control.unwrap_or(true),
+        // §17.3.1.45: absent means space-delimited words move intact.
+        word_wrap: props.word_wrap.unwrap_or(false),
         contextual_spacing: props.contextual_spacing.unwrap_or(false),
         style_id: None, // set by caller when available
         page_floats: Vec::new(),
@@ -852,8 +912,11 @@ pub(super) fn vml_style_length_to_pt(len: model::VmlLength) -> Option<Pt> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::dimension::Dimension;
-    use crate::model::{Border, BorderStyle, Color, ParagraphBorders, ParagraphProperties};
+    use crate::model::dimension::{Dimension, HundredthChars, Twips};
+    use crate::model::{
+        Border, BorderStyle, Color, FirstLineIndent, FirstLineIndentChars, Indentation,
+        ParagraphBorders, ParagraphProperties,
+    };
     use crate::render::resolve::color::rgb_from_u32;
 
     /// An all-empty ResolvedDocument for exercising `resolve_paragraph_defaults`.
@@ -876,6 +939,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
 
@@ -887,6 +951,67 @@ mod tests {
             content: Vec::new(),
             rsids: model::ParagraphRevisionIds::default(),
         }
+    }
+
+    #[test]
+    fn nonzero_character_indents_override_absolute_values() {
+        let ind = Indentation {
+            start: Some(Dimension::<Twips>::new(31_680)),
+            start_chars: Some(Dimension::<HundredthChars>::new(250)),
+            end: Some(Dimension::<Twips>::new(720)),
+            end_chars: Some(Dimension::<HundredthChars>::new(-50)),
+            first_line: Some(FirstLineIndent::FirstLine(Dimension::new(31_680))),
+            first_line_chars: Some(FirstLineIndentChars::Hanging(Dimension::new(147))),
+            mirror: None,
+        };
+
+        let (start, end, first) = resolve_indentation(Some(ind), Pt::new(12.0));
+        assert!((start.raw() - 30.0).abs() < 0.001);
+        assert!((end.raw() + 6.0).abs() < 0.001);
+        assert!((first.raw() + 17.64).abs() < 0.001);
+    }
+
+    #[test]
+    fn zero_character_indents_fall_back_to_absolute_values() {
+        let ind = Indentation {
+            start: Some(Dimension::<Twips>::new(720)),
+            start_chars: Some(Dimension::<HundredthChars>::new(0)),
+            first_line: Some(FirstLineIndent::FirstLine(Dimension::new(360))),
+            first_line_chars: Some(FirstLineIndentChars::Hanging(Dimension::new(0))),
+            ..Default::default()
+        };
+
+        let (start, _, first) = resolve_indentation(Some(ind), Pt::new(12.0));
+        assert_eq!(start, Pt::new(36.0));
+        assert_eq!(first, Pt::new(18.0));
+    }
+
+    #[test]
+    fn hanging_chars_without_start_chars_replaces_absolute_start() {
+        let ind = Indentation {
+            start: Some(Dimension::<Twips>::new(31_680)),
+            first_line: Some(FirstLineIndent::FirstLine(Dimension::new(31_680))),
+            first_line_chars: Some(FirstLineIndentChars::Hanging(Dimension::new(147))),
+            ..Default::default()
+        };
+
+        let (start, _, first) = resolve_indentation(Some(ind), Pt::new(10.0));
+        assert!((start.raw() - 14.7).abs() < 0.001);
+        assert!((first.raw() + 14.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn explicit_zero_start_chars_exposes_absolute_start_with_hanging_chars() {
+        let ind = Indentation {
+            start: Some(Dimension::<Twips>::new(720)),
+            start_chars: Some(Dimension::<HundredthChars>::new(0)),
+            first_line_chars: Some(FirstLineIndentChars::Hanging(Dimension::new(100))),
+            ..Default::default()
+        };
+
+        let (start, _, first) = resolve_indentation(Some(ind), Pt::new(10.0));
+        assert_eq!(start, Pt::new(36.0));
+        assert_eq!(first, Pt::new(-10.0));
     }
 
     #[test]

@@ -303,6 +303,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: vmerge,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 

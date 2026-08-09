@@ -99,6 +99,32 @@ fn find_anchor_images<'a>(
     }
 }
 
+/// Resolve the four text-clearance edges for an anchor.
+///
+/// The parser has already applied wrap-element attributes over the matching
+/// `wp:anchor` attributes per edge. Tight/Through can override only L/R;
+/// TopAndBottom can override only T/B. Keeping this selection in one helper
+/// prevents image and shape extraction from drifting apart.
+fn effective_wrap_distance(
+    anchor: &model::AnchorProperties,
+) -> crate::model::geometry::EdgeInsets<crate::model::dimension::Emu> {
+    match &anchor.wrap {
+        model::TextWrap::Square { distance, .. }
+        | model::TextWrap::Tight { distance, .. }
+        | model::TextWrap::Through { distance, .. } => *distance,
+        model::TextWrap::TopAndBottom {
+            distance_top,
+            distance_bottom,
+        } => crate::model::geometry::EdgeInsets::new(
+            *distance_top,
+            anchor.distance.right,
+            *distance_bottom,
+            anchor.distance.left,
+        ),
+        model::TextWrap::None => anchor.distance,
+    }
+}
+
 pub(super) fn extract_floating_images(
     para: &Paragraph,
     ctx: &BuildContext,
@@ -130,6 +156,7 @@ pub(super) fn extract_floating_images(
         let w = Pt::from(img.extent.width);
         let h = Pt::from(img.extent.height);
         let (x, y) = resolve_anchor_position(anchor, w, h, state, frame);
+        let wrap_distance = effective_wrap_distance(anchor);
 
         images.push(FloatingImage {
             image_data,
@@ -138,8 +165,10 @@ pub(super) fn extract_floating_images(
             x,
             y,
             wrap_mode: crate::render::layout::section::WrapMode::from_model(&anchor.wrap),
-            dist_left: Pt::from(anchor.distance.left),
-            dist_right: Pt::from(anchor.distance.right),
+            dist_top: Pt::from(wrap_distance.top),
+            dist_bottom: Pt::from(wrap_distance.bottom),
+            dist_left: Pt::from(wrap_distance.left),
+            dist_right: Pt::from(wrap_distance.right),
             behind_doc: anchor.behind_text,
         });
     }
@@ -287,6 +316,7 @@ pub(super) fn extract_floating_shapes(
             .unwrap_or((crate::model::dimension::Dimension::new(0), false, false));
 
         let (x, y) = resolve_anchor_position(anchor, w, h, state, frame);
+        let wrap_distance = effective_wrap_distance(anchor);
 
         // §17.17.1: lay out the shape's text-box content (`wps:txbx`) into
         // shape-local Pt commands. Both paragraph- and page-anchored shapes
@@ -315,8 +345,10 @@ pub(super) fn extract_floating_shapes(
             flip_h,
             flip_v,
             wrap_mode: crate::render::layout::section::WrapMode::from_model(&anchor.wrap),
-            dist_left: Pt::from(anchor.distance.left),
-            dist_right: Pt::from(anchor.distance.right),
+            dist_top: Pt::from(wrap_distance.top),
+            dist_bottom: Pt::from(wrap_distance.bottom),
+            dist_left: Pt::from(wrap_distance.left),
+            dist_right: Pt::from(wrap_distance.right),
             behind_doc: anchor.behind_text,
             paths: shape_path.paths,
             fill: visuals.fill,
@@ -484,6 +516,8 @@ fn build_vml_floating_image(
         x,
         y: FloatingImageY::RelativeToParagraph(y),
         wrap_mode: WrapMode::None,
+        dist_top: Pt::ZERO,
+        dist_bottom: Pt::ZERO,
         dist_left: Pt::ZERO,
         dist_right: Pt::ZERO,
         behind_doc: false,
@@ -876,6 +910,8 @@ fn build_vml_rect_shape(
         // §14.1.2.16: VML rects don't usually wrap surrounding text
         // — they sit at an absolute z-index. Treat them as wrapNone.
         wrap_mode: crate::render::layout::section::WrapMode::None,
+        dist_top: Pt::ZERO,
+        dist_bottom: Pt::ZERO,
         dist_left: Pt::ZERO,
         dist_right: Pt::ZERO,
         // §14.1.2 z-index drives layering. For Tier 0 we treat all
@@ -2029,6 +2065,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
 

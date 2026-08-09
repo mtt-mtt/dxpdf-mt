@@ -32,10 +32,34 @@ producing missing glyphs that depend on conversion order.
 Per-render ownership makes that leakage impossible by construction. Do not
 reintroduce a global typeface cache.
 
+## Controlled font packs
+
+`FontPack::load_dir` recursively loads `.ttf`, `.otf`, and `.ttc` files into a
+process-local collection. It does not install or modify operating-system
+fonts. Servers should retain one `FontMgr` and one `FontPack`, then call
+`convert_with_options_and_font_pack`; CLI `--font-dir` and Python `font_dir=`
+are single-conversion convenience interfaces and reload the directory.
+
+The effective priority is: DOCX-embedded face, controlled-pack exact face,
+then the ordered metric-compatible substitution candidates. For each
+substitution candidate the controlled pack is checked before the host, so a
+lower-ranked packaged substitute cannot overtake a higher-ranked host face.
+General host resolution and the final fallback follow. Pack traversal and
+missing-glyph fallback order are sorted so they do not depend on `HashMap`
+iteration.
+
+Original packaged bytes are retained for subsetting instead of using Skia's
+serialized copy. CFF-flavoured OTF faces are validated and counted but are
+currently excluded from PDF output: the Windows Skia PDF backend serializes
+them as an invalid TrueType `FontFile2` stream. This guard prevents PDFs that
+only render because the viewer silently substitutes another font.
+
 ## The resolution chain
 
-`FontRegistry::resolve(family, style)` is cached after first call. On a miss,
-`resolve_uncached` tries six steps in order:
+`FontRegistry::resolve(family, style)` is cached after first call. The six
+labels below retain the original host-facing chain; controlled-pack exact,
+localized-alias, and substitution lookup now occurs after step 1 and before
+step 2:
 
 1. **Embedded fonts** — anything in `word/fonts/*.odttf` wins outright. This is
    the highest-fidelity option: it is the exact font the author used.
@@ -58,7 +82,7 @@ reintroduce a global typeface cache.
    localized system names and the frequently referenced, non-embedded
    `方正小标宋简体`, which falls back to the Song-family `SimSun` instead of a
    CJK-incapable generic UI font.
-5. **Metric-compatible substitution** — `FONT_SUBSTITUTIONS`, tried in order.
+5. **Word-compatible substitution** — `FONT_SUBSTITUTIONS`, tried in order.
    The table is keyed by *family*, so a face-qualified name falls back to its
    base family first: `"Segoe UI Light"` → strip the trailing weight word →
    `"Segoe UI"` → that family's substitutes. Without it a document naming a face
@@ -116,12 +140,15 @@ manager, which is why it is recorded here rather than done.
 
 ### `FONT_SUBSTITUTIONS`
 
-Metric-compatible means *same advance widths*, so line breaks and page counts
-match Word even though glyph shapes differ. This is why Carlito/Caladea are
-used rather than a generic sans/serif.
+Most entries prefer metric-compatible faces with similar advance widths, so
+line breaks and page counts remain close to Word even though glyph shapes
+differ. The Montserrat and Century Schoolbook chains are narrower compatibility
+rules: their first choice reproduces the fallback observed in the controlled
+Windows Word reference; later choices remain cross-platform substitutes.
 
 | Requested | Substitutes, in order |
 |---|---|
+| Montserrat | Segoe Print, Carlito, Liberation Sans, Noto Sans |
 | Century Schoolbook | Segoe Print, Century, Liberation Serif, Noto Serif |
 | Calibri | Carlito, Liberation Sans, Noto Sans |
 | Cambria | Caladea, Liberation Serif, Noto Serif |

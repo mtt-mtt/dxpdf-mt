@@ -237,6 +237,7 @@ mod tests {
         TableSlice {
             commands: Vec::new(),
             size: PtSize::new(Pt::new(100.0), Pt::new(height)),
+            footnotes: Vec::new(),
         }
     }
 
@@ -247,6 +248,7 @@ mod tests {
             page_y_end: Pt::new(y_end),
             width: Pt::new(100.0),
             source,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         }
     }

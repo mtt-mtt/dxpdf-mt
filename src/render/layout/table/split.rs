@@ -276,11 +276,14 @@ pub(super) fn split_row_at(mr: &MeasuredRow, cut: &SplitCut) -> SplitRow {
         // lines that actually remain.
         let (first_lines, second_lines) =
             partition_lines(&entry.layout.lines, cc.line_cut_y, cc.shift);
+        let (first_footnotes, second_footnotes) =
+            partition_footnotes(&entry.layout.footnotes, cc.content_cut_y, cc.shift);
         first_entries.push(CellLayoutEntry {
             layout: crate::render::layout::cell::CellLayout {
                 commands: first_cmds,
                 content_height: entry.layout.content_height.min(first_h),
                 lines: first_lines,
+                footnotes: first_footnotes,
             },
             cell_x: entry.cell_x,
             cell_w: entry.cell_w,
@@ -291,6 +294,7 @@ pub(super) fn split_row_at(mr: &MeasuredRow, cut: &SplitCut) -> SplitRow {
                 commands: second_cmds,
                 content_height: (entry.layout.content_height - cc.shift).max(Pt::ZERO),
                 lines: second_lines,
+                footnotes: second_footnotes,
             },
             cell_x: entry.cell_x,
             cell_w: entry.cell_w,
@@ -339,6 +343,28 @@ pub(super) fn split_row_at(mr: &MeasuredRow, cut: &SplitCut) -> SplitRow {
             border_gap_below: mr.border_gap_below,
         },
     }
+}
+
+fn partition_footnotes(
+    footnotes: &[crate::render::layout::cell::CellFootnote],
+    cut_y: Pt,
+    shift: Pt,
+) -> (
+    Vec<crate::render::layout::cell::CellFootnote>,
+    Vec<crate::render::layout::cell::CellFootnote>,
+) {
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for footnote in footnotes {
+        if footnote.top_y < cut_y {
+            first.push(footnote.clone());
+        } else {
+            let mut continuation = footnote.clone();
+            continuation.top_y -= shift;
+            second.push(continuation);
+        }
+    }
+    (first, second)
 }
 
 /// Split a command list at `cut_y`. Commands whose primary Y < `cut_y`
@@ -471,6 +497,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: None,
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -587,6 +614,7 @@ mod tests {
                 commands: Vec::new(),
                 content_height: Pt::new(28.0),
                 lines,
+                footnotes: Vec::new(),
             },
             cell_x: Pt::ZERO,
             cell_w: Pt::new(40.0),

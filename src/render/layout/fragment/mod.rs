@@ -22,7 +22,7 @@ mod text;
 pub use collect::{
     collect_fragments, FieldContext, FootnoteTracker, FragmentCtx, RecordedFootnote,
 };
-pub use split::split_oversized_fragments;
+pub use split::{split_oversized_fragments, split_oversized_fragments_for_word_wrap};
 
 // ── Superscript / subscript rendering constants ───────────────────────────────
 // §17.3.2.42: these ratios are "application-defined" per the spec; the values
@@ -263,7 +263,9 @@ pub enum Fragment {
 pub(crate) fn east_asian_break_char(ch: char) -> bool {
     matches!(
         ch,
-        '\u{2E80}'..='\u{A4CF}'
+        '\u{00D7}'
+            | '\u{FF3F}'
+            | '\u{2E80}'..='\u{A4CF}'
             | '\u{AC00}'..='\u{D7AF}'
             | '\u{F900}'..='\u{FAFF}'
             | '\u{20000}'..='\u{323AF}'
@@ -297,6 +299,35 @@ pub(crate) fn east_asian_closing_punctuation(ch: char) -> bool {
             | '；'
             | '：'
     )
+}
+
+/// The side of a full-width punctuation glyph whose built-in half-em
+/// whitespace is removed by `w:characterSpacingControl`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PunctuationCompressionSide {
+    Leading,
+    Trailing,
+}
+
+/// Fraction of a full-width punctuation advance removed by Word-compatible
+/// `compressPunctuation` layout. The value is calibrated from reference line
+/// endings across the affected corpus. Keep measurement and paint in sync.
+pub(crate) const PUNCTUATION_COMPRESSION_RATIO: f32 = 0.20;
+
+/// §17.15.1.18: punctuation eligible for full-width whitespace compression.
+///
+/// Curly quotation marks are included because an East Asian typeface normally
+/// exposes them as full-em glyphs. Measurement and paint both gate the actual
+/// adjustment on the resolved glyph advance, so half-width Latin quotes are
+/// left unchanged.
+pub(crate) fn punctuation_compression_side(ch: char) -> Option<PunctuationCompressionSide> {
+    if east_asian_opening_punctuation(ch) {
+        Some(PunctuationCompressionSide::Leading)
+    } else if east_asian_closing_punctuation(ch) {
+        Some(PunctuationCompressionSide::Trailing)
+    } else {
+        None
+    }
 }
 
 /// Whitespace that Word permits to hang past the right edge of a line.
@@ -454,6 +485,19 @@ pub fn to_roman_lower(mut n: u32) -> String {
 mod tests {
     use super::*;
     use crate::model::UnderlineStyle;
+
+    #[test]
+    fn classifies_east_asian_punctuation_compression_sides() {
+        assert_eq!(
+            punctuation_compression_side('（'),
+            Some(PunctuationCompressionSide::Leading)
+        );
+        assert_eq!(
+            punctuation_compression_side('。'),
+            Some(PunctuationCompressionSide::Trailing)
+        );
+        assert_eq!(punctuation_compression_side('A'), None);
+    }
 
     #[test]
     fn font_props_default_fallback() {

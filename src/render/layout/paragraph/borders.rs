@@ -195,7 +195,9 @@ pub(super) fn emit_segment_borders_and_shading(
             &style.line_spacing,
             style.auto_fit,
         );
-        cursor_y = style.space_before + line_h + style.space_after;
+        // `content_bottom` may already include a vertical clearance jump over
+        // a full-width float. Preserve that jump, then add the empty line.
+        cursor_y = content_bottom + line_h + style.space_after;
     }
 
     cursor_y

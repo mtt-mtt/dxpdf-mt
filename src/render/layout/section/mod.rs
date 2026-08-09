@@ -12,8 +12,9 @@ mod types;
 use super::fragment::Fragment;
 
 pub use layout::layout_section;
+#[cfg(test)]
 pub(crate) use layout::layout_section_with_clearance;
-pub(crate) use layout::SectionStart;
+pub(crate) use layout::{layout_section_with_clearance_result, SectionStart};
 pub use stacker::{stack_blocks, CellLine, StackResult};
 pub use types::*;
 
@@ -25,10 +26,10 @@ pub use types::*;
 /// break is the boundary. Laying out that invisible mark as an ordinary empty
 /// paragraph can create a spurious blank page before the next section.
 ///
-/// The caller invokes this either when another hard-break section follows or
-/// for the final section, whose terminal mark has no following visible
-/// content to separate. Decorated or object-owning terminal paragraphs are
-/// kept.
+/// The caller invokes this only when another hard-break section follows.
+/// A document-final `w:sectPr` is stored directly under `w:body`, so trailing
+/// paragraphs in the final section are real content and do not pass through
+/// this suppression. Decorated or object-owning terminal paragraphs are kept.
 pub(crate) fn suppress_plain_terminal_section_mark(blocks: &mut Vec<LayoutBlock>) {
     loop {
         let Some(LayoutBlock::Paragraph {
@@ -228,6 +229,8 @@ mod tests {
             x: FloatingImageX::Absolute(Pt::new(10.0)),
             y: FloatingImageY::RelativeToParagraph(Pt::ZERO),
             wrap_mode,
+            dist_top: Pt::ZERO,
+            dist_bottom: Pt::ZERO,
             dist_left: Pt::ZERO,
             dist_right: Pt::ZERO,
             behind_doc: false,
@@ -268,6 +271,7 @@ mod tests {
                         cell_borders: None,
                         vertical_merge: None,
                         vertical_align: crate::render::layout::table::CellVAlign::Top,
+                        text_direction: None,
                     }],
                     height_rule: None,
                     is_header: Some(*header),
@@ -675,6 +679,43 @@ mod tests {
     }
 
     #[test]
+    fn table_tail_spacer_can_push_a_break_paragraph_onto_a_blank_page() {
+        let blocks = vec![
+            one_column_table(&[("row", false)]),
+            empty_spacer_block(90.0),
+            LayoutBlock::Paragraph {
+                fragments: vec![Fragment::PageBreak {
+                    line_height: Pt::new(14.0),
+                }],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            },
+            para_block("after", 30.0),
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 3);
+        assert!(
+            pages[1].commands.is_empty(),
+            "page 2 is intentionally blank"
+        );
+        assert!(pages[2].commands.iter().any(
+            |command| matches!(command, DrawCommand::Text { text, .. } if text.as_ref() == "after")
+        ));
+    }
+
+    #[test]
     fn empty_page_tail_before_leading_inline_break_does_not_create_blank_page() {
         let blocks = vec![
             para_block("before", 30.0),
@@ -840,6 +881,117 @@ mod tests {
             .collect();
         assert!(xs.contains(&10), "column 0 text at x=10, got {xs:?}");
         assert!(xs.contains(&105), "column 1 text at x=105, got {xs:?}");
+    }
+
+    #[test]
+    fn continuous_section_inherits_the_real_terminal_column() {
+        let config = two_column_config();
+        let clearance = HeaderFooterClearance::uniform(&config);
+        let first = layout_section_with_clearance_result(
+            &[multiline_para(8, false, false)],
+            &config,
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            SectionStart {
+                continuation: None,
+                clearance: &clearance,
+                logical_page_base: 1,
+            },
+            true,
+        );
+
+        assert!(first.pages.is_empty(), "the shared page stays pending");
+        let continuation = first.continuation.expect("terminal state is preserved");
+        assert_eq!(continuation.current_col, 1, "eight lines end in column 2");
+        assert_eq!(continuation.column_top, config.margins.top);
+        assert!(continuation.cursor_y > continuation.column_top);
+
+        let second = layout_section_with_clearance_result(
+            &[multiline_para(5, false, false)],
+            &config,
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            SectionStart {
+                continuation: Some(continuation),
+                clearance: &clearance,
+                logical_page_base: 1,
+            },
+            false,
+        );
+
+        assert_eq!(second.pages.len(), 2, "the tail continues then paginates");
+        assert_eq!(
+            second
+                .pages
+                .iter()
+                .map(|page| text_count(&page.commands))
+                .sum::<usize>(),
+            13,
+            "no line from either section is lost"
+        );
+        let body_bottom = config.page_size.height - config.margins.bottom;
+        for command in &second.pages[0].commands {
+            if let DrawCommand::Text {
+                position,
+                font_size,
+                ..
+            } = command
+            {
+                assert!(
+                    position.y + *font_size <= body_bottom,
+                    "shared-page text must not be painted below the body"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_geometry_continuation_is_not_a_full_height_column() {
+        let source_config = two_column_config();
+        let source_clearance = HeaderFooterClearance::uniform(&source_config);
+        let first = layout_section_with_clearance_result(
+            &[multiline_para(9, false, false)],
+            &source_config,
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            SectionStart {
+                continuation: None,
+                clearance: &source_clearance,
+                logical_page_base: 1,
+            },
+            true,
+        );
+        let continuation = first.continuation.expect("terminal state is preserved");
+
+        let target_config = small_config();
+        let target_clearance = HeaderFooterClearance::uniform(&target_config);
+        let second = layout_section_with_clearance_result(
+            &[multiline_para(3, false, true)],
+            &target_config,
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            SectionStart {
+                continuation: Some(continuation),
+                clearance: &target_clearance,
+                logical_page_base: 1,
+            },
+            false,
+        );
+
+        assert_eq!(
+            second.pages.len(),
+            2,
+            "a widow-controlled paragraph that cannot fit the short shared-page region moves"
+        );
+        assert_eq!(
+            text_count(&second.pages[1].commands),
+            3,
+            "the paragraph lands intact on the fresh page"
+        );
     }
 
     fn border_line() -> crate::render::layout::paragraph::BorderLine {
@@ -1092,14 +1244,18 @@ mod tests {
         }
         fragments.push(footnote_ref_frag()); // reference on the last line
         let footnotes = vec![
-            (
-                vec![text_frag("FNA", 30.0, 12.0)],
-                ParagraphStyle::default(),
-            ),
-            (
-                vec![text_frag("FNB", 30.0, 12.0)],
-                ParagraphStyle::default(),
-            ),
+            LayoutFootnote {
+                paragraphs: vec![(
+                    vec![text_frag("FNA", 30.0, 12.0)],
+                    ParagraphStyle::default(),
+                )],
+            },
+            LayoutFootnote {
+                paragraphs: vec![(
+                    vec![text_frag("FNB", 30.0, 12.0)],
+                    ParagraphStyle::default(),
+                )],
+            },
         ];
         let block = LayoutBlock::Paragraph {
             fragments,
@@ -1520,6 +1676,54 @@ mod tests {
         assert!(
             first_moved_x >= Pt::new(90.0),
             "moved text at {first_moved_x:?} overlaps its 10-90pt float",
+        );
+    }
+
+    #[test]
+    fn vertical_wrap_clearance_extends_the_active_float_band() {
+        let mut image = floating_image(WrapMode::Square(crate::model::WrapText::BothSides), 14.0);
+        image.dist_bottom = Pt::new(28.0);
+        let block = LayoutBlock::Paragraph {
+            fragments: (0..4)
+                .map(|i| text_frag(&format!("clearance-{i}"), 80.0, 14.0))
+                .collect(),
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![image],
+            floating_shapes: vec![],
+        };
+
+        let pages = layout_section(
+            &[block],
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+        let positions: Vec<(String, Pt)> = pages[0]
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text { text, position, .. } if text.starts_with("clearance-") => {
+                    Some((text.to_string(), position.x))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(positions.len(), 4);
+        for (text, x) in &positions[..3] {
+            assert!(
+                *x >= Pt::new(90.0),
+                "{text} at {x:?} must avoid the 10-90pt float through its bottom clearance",
+            );
+        }
+        assert_eq!(
+            positions[3].1,
+            Pt::new(10.0),
+            "the first line below the clearance band returns to the margin",
         );
     }
 
@@ -2285,10 +2489,12 @@ mod tests {
             fragments: vec![text_frag("body", 30.0, 14.0)],
             style: ParagraphStyle::default(),
             page_break_before: false,
-            footnotes: vec![(
-                vec![text_frag("footnote", 30.0, 14.0)],
-                ParagraphStyle::default(),
-            )],
+            footnotes: vec![LayoutFootnote {
+                paragraphs: vec![(
+                    vec![text_frag("footnote", 30.0, 14.0)],
+                    ParagraphStyle::default(),
+                )],
+            }],
             floating_images: vec![],
             floating_shapes: vec![],
         };
@@ -2362,6 +2568,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: None,
                     vertical_align: crate::render::layout::table::CellVAlign::Top,
+                    text_direction: None,
                 }],
                 height_rule: None,
                 is_header: None,
@@ -2529,6 +2736,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: crate::render::layout::table::CellVAlign::Top,
+            text_direction: None,
         }
     }
 
@@ -2621,10 +2829,12 @@ mod tests {
                     ..Default::default()
                 },
                 page_break_before: false,
-                footnotes: vec![(
-                    vec![text_frag("footnote", 30.0, 14.0)],
-                    ParagraphStyle::default(),
-                )],
+                footnotes: vec![LayoutFootnote {
+                    paragraphs: vec![(
+                        vec![text_frag("footnote", 30.0, 14.0)],
+                        ParagraphStyle::default(),
+                    )],
+                }],
                 floating_images: vec![],
                 floating_shapes: vec![],
             },
@@ -2908,6 +3118,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: None,
                     vertical_align: crate::render::layout::table::CellVAlign::Top,
+                    text_direction: None,
                 }],
                 height_rule: None,
                 is_header: None,
@@ -2972,6 +3183,7 @@ mod tests {
                                 crate::render::layout::table::VerticalMergeState::Restart,
                             ),
                             vertical_align: crate::render::layout::table::CellVAlign::Top,
+                            text_direction: None,
                         },
                         TableCellInput {
                             blocks: vec![para_block("row0-peer", 30.0)],
@@ -2981,6 +3193,7 @@ mod tests {
                             cell_borders: None,
                             vertical_merge: None,
                             vertical_align: crate::render::layout::table::CellVAlign::Top,
+                            text_direction: None,
                         },
                     ],
                     height_rule: None,
@@ -3001,6 +3214,7 @@ mod tests {
                                 crate::render::layout::table::VerticalMergeState::Continue,
                             ),
                             vertical_align: crate::render::layout::table::CellVAlign::Top,
+                            text_direction: None,
                         },
                         TableCellInput {
                             blocks: (0..2)
@@ -3012,6 +3226,7 @@ mod tests {
                             cell_borders: None,
                             vertical_merge: None,
                             vertical_align: crate::render::layout::table::CellVAlign::Top,
+                            text_direction: None,
                         },
                     ],
                     height_rule: None,
@@ -3030,6 +3245,7 @@ mod tests {
                             cell_borders: None,
                             vertical_merge: None,
                             vertical_align: crate::render::layout::table::CellVAlign::Top,
+                            text_direction: None,
                         },
                         TableCellInput {
                             blocks: vec![para_block("after-peer", 30.0)],
@@ -3039,6 +3255,7 @@ mod tests {
                             cell_borders: None,
                             vertical_merge: None,
                             vertical_align: crate::render::layout::table::CellVAlign::Top,
+                            text_direction: None,
                         },
                     ],
                     height_rule: None,
@@ -3362,6 +3579,37 @@ mod tests {
             .position(|p| p.iter().any(|t| t == "body"))
             .unwrap();
         assert_eq!(kn_last, body);
+    }
+
+    #[test]
+    fn keep_next_heading_stays_with_a_split_terminal_paragraph() {
+        // Two fill lines leave room for a one-line heading and two of the
+        // terminal paragraph's four lines. Word keeps that legal 2+2 split on
+        // the current page instead of moving the whole heading/body group.
+        let mut blocks = vec![para_block("fill0", 100.0), para_block("fill1", 100.0)];
+        blocks.push(styled_para_block("heading", true, false));
+        let mut terminal = multiline_keep_next("body", 4);
+        let LayoutBlock::Paragraph { style, .. } = &mut terminal else {
+            unreachable!("multiline_keep_next builds a paragraph")
+        };
+        style.keep_next = false;
+        blocks.push(terminal);
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+        let per_page = texts_per_page(&pages);
+        assert_eq!(
+            per_page[0],
+            ["fill0", "fill1", "heading", "body0", "body1"],
+            "the keepNext heading and a widow-legal terminal head stay here"
+        );
+        assert_eq!(per_page[1], ["body2", "body3"]);
     }
 
     /// A floating table whose laid-out height exceeds the available
@@ -3758,6 +4006,8 @@ mod tests {
                 x: FloatingImageX::Absolute(Pt::new(fx)),
                 y: FloatingImageY::Absolute(Pt::new(fy)),
                 wrap_mode: WrapMode::Square(crate::model::WrapText::BothSides),
+                dist_top: Pt::ZERO,
+                dist_bottom: Pt::ZERO,
                 dist_left: Pt::ZERO,
                 dist_right: Pt::ZERO,
                 behind_doc: false,

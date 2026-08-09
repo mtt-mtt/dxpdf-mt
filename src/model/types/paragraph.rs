@@ -1,6 +1,6 @@
 //! Paragraph types — paragraph properties, spacing, indentation, frames.
 
-use crate::model::dimension::{Dimension, Twips};
+use crate::model::dimension::{Dimension, HundredthChars, Twips};
 
 use super::formatting::{
     Alignment, CnfStyle, HeightRule, ParagraphBorders, Shading, TabStop, TableAnchor, TableXAlign,
@@ -162,8 +162,14 @@ impl OutlineLevel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Indentation {
     pub start: Option<Dimension<Twips>>,
+    /// Start indent in hundredths of the paragraph character width.
+    pub start_chars: Option<Dimension<HundredthChars>>,
     pub end: Option<Dimension<Twips>>,
+    /// End indent in hundredths of the paragraph character width.
+    pub end_chars: Option<Dimension<HundredthChars>>,
     pub first_line: Option<FirstLineIndent>,
+    /// First-line or hanging indent in hundredths of the paragraph character width.
+    pub first_line_chars: Option<FirstLineIndentChars>,
     pub mirror: Option<bool>,
 }
 
@@ -174,6 +180,18 @@ pub enum FirstLineIndent {
     None,
     FirstLine(Dimension<Twips>),
     Hanging(Dimension<Twips>),
+}
+
+/// Character-unit counterpart of [`FirstLineIndent`].
+///
+/// A zero value is deliberately retained: Microsoft Word uses it to clear an
+/// earlier character-unit value in the style hierarchy, then falls back to the
+/// related absolute indent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstLineIndentChars {
+    None,
+    FirstLine(Dimension<HundredthChars>),
+    Hanging(Dimension<HundredthChars>),
 }
 
 /// Paragraph spacing — only fields explicitly present in the XML are `Some`.

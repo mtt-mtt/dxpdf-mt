@@ -74,6 +74,57 @@ fn needs_parity_separator(
     }
 }
 
+/// Whether Word must preserve recto/verso parity when an ordinary hard
+/// section restarts logical page numbering.
+///
+/// With document-level `evenAndOddHeaders` enabled, Word uses
+/// `w:pgNumType/@start` to decide whether the section's first page is odd or
+/// even.  For a `nextPage` section after the document has already started, a
+/// conflicting physical sheet gets a blank separator so (for example) a
+/// restarted logical page 1 remains a right-hand/odd page. Explicit
+/// `oddPage`/`evenPage` starts remain the responsibility of
+/// `needs_parity_separator`; continuous and next-column sections cannot insert
+/// a physical separator here.
+fn needs_numbering_restart_parity_separator(
+    even_and_odd: bool,
+    section_type: Option<crate::model::SectionType>,
+    pages_before: usize,
+    page_number_type: Option<&crate::model::PageNumberType>,
+) -> bool {
+    if !even_and_odd
+        || !matches!(
+            section_type,
+            None | Some(crate::model::SectionType::NextPage)
+        )
+    {
+        return false;
+    }
+    let Some(start) = page_number_type.and_then(|numbering| numbering.start) else {
+        return false;
+    };
+    let next_physical_is_odd = (pages_before + 1) % 2 == 1;
+    let restarted_logical_is_odd = start % 2 == 1;
+    next_physical_is_odd != restarted_logical_is_odd
+}
+
+/// Whether the outgoing section owns a structural paragraph mark that should
+/// not be laid out as ordinary empty content.
+///
+/// Only a hard break *before another section* has such an outgoing mark.  The
+/// final `w:sectPr` is a direct child of `w:body`; any trailing `w:p` elements
+/// before it are real document paragraphs and may legitimately flow onto a
+/// blank final page.
+fn has_structural_terminal_section_mark(
+    section_type: Option<crate::model::SectionType>,
+    has_next_section: bool,
+) -> bool {
+    has_next_section
+        && !matches!(
+            section_type,
+            Some(crate::model::SectionType::Continuous | crate::model::SectionType::NextColumn)
+        )
+}
+
 /// Tunable knobs for the paint phase.
 ///
 /// Constructed via [`RenderOptions::default`] and the `with_*` builder setters,
@@ -123,58 +174,9 @@ use crate::render::layout::header_footer::{
     render_headers_footers, HeaderFooterBlocks, HeaderFooterClearance, PageRange,
 };
 use crate::render::layout::page::PageConfig;
-use crate::render::layout::section::layout_section_with_clearance;
+use crate::render::layout::section::layout_section_with_clearance_result;
 use crate::render::resolve::header_footer::HeaderFooterSet;
 use crate::render::resolve::ResolvedDocument;
-
-/// Estimate where the content on `page` ends, so a `Continuous` section
-/// (§17.6.22) knows where to resume on the same page.
-///
-/// The match is **exhaustive on purpose**: a `_ => continue` arm silently gives
-/// any unlisted variant zero height, and the following section then paints over
-/// it. That is how `EmojiCluster` and `Path` came to be ignored — a paragraph
-/// containing only an emoji resumed at `margins.top`, drawing the next
-/// section's text inside the emoji's box. Adding a variant should break this
-/// build, not the output.
-fn estimate_cursor_y(
-    page: &layout::draw_command::LayoutedPage,
-    config: &layout::page::PageConfig,
-) -> dimension::Pt {
-    use layout::draw_command::DrawCommand;
-    let mut max_y = config.margins.top;
-    for cmd in &page.commands {
-        let bottom = match cmd {
-            // Baseline plus a full font size approximates the descender.
-            DrawCommand::Text {
-                position,
-                font_size,
-                ..
-            } => position.y + *font_size,
-            // A segment may run in either direction; take the lower end.
-            DrawCommand::Underline { line, .. } | DrawCommand::Line { line, .. } => {
-                line.start.y.max(line.end.y)
-            }
-            DrawCommand::Image { rect, .. }
-            | DrawCommand::EmojiCluster { rect, .. }
-            | DrawCommand::Rect { rect, .. } => rect.origin.y + rect.size.height,
-            // `extent` is the shape's unrotated bounding box; a rotation can
-            // reach slightly past it, which is within this function's remit.
-            DrawCommand::Path { origin, extent, .. } => origin.y + extent.height,
-            // §17.3.1.19: draws nothing, so it consumes no vertical space.
-            DrawCommand::Outline(_) => continue,
-            // Annotations mark content that is already accounted for by the
-            // command underneath them, and a named destination is a point.
-            // Neither adds extent of its own.
-            DrawCommand::LinkAnnotation { .. }
-            | DrawCommand::InternalLink { .. }
-            | DrawCommand::NamedDestination { .. } => continue,
-        };
-        if bottom > max_y {
-            max_y = bottom;
-        }
-    }
-    max_y
-}
 
 /// Full pipeline: resolve → preload fonts → layout → paint.
 ///
@@ -197,6 +199,16 @@ pub fn render_with_font_mgr(
     font_mgr: &skia_safe::FontMgr,
     options: &RenderOptions,
 ) -> Result<Vec<u8>, error::RenderError> {
+    render_with_font_mgr_and_font_pack(doc, font_mgr, None, options)
+}
+
+/// Render with a reusable controlled font pack installed ahead of host fonts.
+pub fn render_with_font_mgr_and_font_pack(
+    doc: Document,
+    font_mgr: &skia_safe::FontMgr,
+    font_pack: Option<&fonts::FontPack>,
+    options: &RenderOptions,
+) -> Result<Vec<u8>, error::RenderError> {
     use std::time::Instant;
 
     let t = Instant::now();
@@ -205,10 +217,11 @@ pub fn render_with_font_mgr(
 
     let t = Instant::now();
     #[allow(unused_mut)] // mut required only when subset-fonts is enabled
-    let mut registry = fonts::FontRegistry::build(
+    let mut registry = fonts::FontRegistry::build_with_font_pack(
         font_mgr.clone(),
         &resolved.embedded_fonts,
         &resolved.font_families,
+        font_pack,
     )?;
     log::debug!("  registry: {:?}", t.elapsed());
 
@@ -226,7 +239,12 @@ pub fn render_with_font_mgr(
     }
 
     let t = Instant::now();
-    let pdf = painter::render_to_pdf(&pages, &registry, options);
+    let pdf = painter::render_to_pdf_with_character_spacing_control(
+        &pages,
+        &registry,
+        options,
+        resolved.character_spacing_control,
+    );
     log::debug!("  paint:    {:?}", t.elapsed());
     pdf
 }
@@ -251,7 +269,10 @@ pub fn layout_document(
     resolved: &ResolvedDocument,
     registry: &fonts::FontRegistry,
 ) -> Vec<LayoutedPage> {
-    let measurer = layout::measurer::TextMeasurer::new(registry);
+    let measurer = layout::measurer::TextMeasurer::with_character_spacing_control(
+        registry,
+        resolved.character_spacing_control,
+    );
     let ctx = BuildContext {
         measurer: &measurer,
         resolved,
@@ -305,7 +326,42 @@ pub fn layout_document(
         // the section page range so the blank page receives no section
         // header/footer. It still advances the document's logical sequence,
         // just as it does in Word when PAGE numbering is continuous.
-        if needs_parity_separator(section.properties.section_type, all_pages.len()) {
+        if section_idx > 0
+            && section.properties.section_type != Some(crate::model::SectionType::Continuous)
+        {
+            log::debug!(
+                target: "dxpdf::pagination",
+                "section-boundary section={} type={:?} pages_before={} logical_next={}",
+                section_idx,
+                section.properties.section_type,
+                all_pages.len(),
+                next_logical,
+            );
+        }
+        let explicit_parity_separator =
+            needs_parity_separator(section.properties.section_type, all_pages.len());
+        let numbering_restart_separator = section_idx > 0
+            && needs_numbering_restart_parity_separator(
+                even_and_odd,
+                section.properties.section_type,
+                all_pages.len(),
+                section.properties.page_number_type.as_ref(),
+            );
+        if explicit_parity_separator || numbering_restart_separator {
+            let cause = if explicit_parity_separator {
+                "ParitySectionSeparator"
+            } else {
+                "NumberingRestartParitySeparator"
+            };
+            log::debug!(
+                target: "dxpdf::pagination",
+                "page-break cause={} section={} type={:?} physical_page={} logical_page={} body_commands=0 total_commands=0 footnotes=0 floats=0",
+                cause,
+                section_idx,
+                section.properties.section_type,
+                all_pages.len() + 1,
+                next_logical,
+            );
             all_pages.push(LayoutedPage::new(config.page_size));
             next_logical += 1;
         }
@@ -325,16 +381,9 @@ pub fn layout_document(
 
         let mut built = build_section_blocks(section, &config, &ctx, &mut state);
         let has_next_section = section_idx + 1 < resolved.sections.len();
-        let ends_with_hard_section_break = has_next_section
-            && !matches!(
-                section.properties.section_type,
-                Some(crate::model::SectionType::Continuous | crate::model::SectionType::NextColumn)
-            );
-        // The final plain paragraph mark is structural as well. Keeping it as
-        // a font-sized empty line can push an otherwise full last page onto a
-        // contentless trailing page. As with a hard section mark, decorated
-        // or object-owning terminal paragraphs remain intact.
-        if ends_with_hard_section_break || !has_next_section {
+        let ends_with_hard_section_break =
+            has_structural_terminal_section_mark(section.properties.section_type, has_next_section);
+        if ends_with_hard_section_break {
             layout::section::suppress_plain_terminal_section_mark(&mut built.blocks);
         }
         let measure_fn = |text: &str,
@@ -348,11 +397,17 @@ pub fn layout_document(
             if section.properties.section_type == Some(crate::model::SectionType::Continuous) {
                 pending_continuation.take()
             } else {
-                pending_continuation = None;
+                // Consume any stale state defensively; a non-continuous
+                // section cannot share the outgoing physical page.
+                let _ = pending_continuation.take();
                 None
             };
 
-        let mut pages = layout_section_with_clearance(
+        let next_is_continuous = resolved.sections.get(section_idx + 1).is_some_and(|next| {
+            next.properties.section_type == Some(crate::model::SectionType::Continuous)
+        });
+
+        let layout_result = layout_section_with_clearance_result(
             &built.blocks,
             &config,
             Some(&measure_fn),
@@ -363,25 +418,11 @@ pub fn layout_document(
                 clearance: &clearance,
                 logical_page_base,
             },
+            next_is_continuous,
         );
-
+        let mut pages = layout_result.pages;
+        pending_continuation = layout_result.continuation;
         last_config = config.clone();
-
-        // Check if the NEXT section is continuous — if so, save the last page
-        // as continuation state instead of appending it.
-        // (Peek ahead by checking the section index.)
-        let next_is_continuous = resolved.sections.get(section_idx + 1).is_some_and(|next| {
-            next.properties.section_type == Some(crate::model::SectionType::Continuous)
-        });
-
-        if next_is_continuous && !pages.is_empty() {
-            let last_page = pages.pop().unwrap();
-            let cursor_y = estimate_cursor_y(&last_page, &last_config);
-            pending_continuation = Some(layout::section::ContinuationState {
-                page: last_page,
-                cursor_y,
-            });
-        }
 
         let page_start = all_pages.len();
         all_pages.append(&mut pages);
@@ -644,6 +685,74 @@ mod tests {
     }
 
     #[test]
+    fn numbering_restart_preserves_odd_even_physical_parity() {
+        let restart = PageNumberType {
+            format: None,
+            start: Some(1),
+            chap_style: None,
+            chap_sep: None,
+        };
+        assert!(needs_numbering_restart_parity_separator(
+            true,
+            Some(SectionType::NextPage),
+            1,
+            Some(&restart),
+        ));
+        assert!(!needs_numbering_restart_parity_separator(
+            true,
+            Some(SectionType::NextPage),
+            2,
+            Some(&restart),
+        ));
+        assert!(!needs_numbering_restart_parity_separator(
+            false,
+            Some(SectionType::NextPage),
+            1,
+            Some(&restart),
+        ));
+        assert!(!needs_numbering_restart_parity_separator(
+            true,
+            Some(SectionType::Continuous),
+            1,
+            Some(&restart),
+        ));
+        assert!(!needs_numbering_restart_parity_separator(
+            true,
+            Some(SectionType::OddPage),
+            1,
+            Some(&restart),
+        ));
+        assert!(!needs_numbering_restart_parity_separator(
+            true,
+            Some(SectionType::NextPage),
+            1,
+            None,
+        ));
+    }
+
+    #[test]
+    fn only_an_outgoing_hard_section_has_a_structural_terminal_mark() {
+        assert!(has_structural_terminal_section_mark(
+            Some(SectionType::NextPage),
+            true
+        ));
+        assert!(has_structural_terminal_section_mark(None, true));
+        assert!(!has_structural_terminal_section_mark(
+            Some(SectionType::Continuous),
+            true
+        ));
+        assert!(!has_structural_terminal_section_mark(
+            Some(SectionType::NextColumn),
+            true
+        ));
+        assert!(!has_structural_terminal_section_mark(
+            Some(SectionType::NextPage),
+            false
+        ));
+        assert!(!has_structural_terminal_section_mark(None, false));
+    }
+
+    #[test]
     fn render_options_with_image_dpi_overrides() {
         assert_eq!(
             RenderOptions::default().with_image_dpi(300.0).image_dpi(),
@@ -841,156 +950,6 @@ mod tests {
         let (_, pages) = resolve_and_layout(doc);
         assert_eq!(pages[0].page_size.width.raw(), 612.0);
         assert_eq!(pages[0].page_size.height.raw(), 792.0);
-    }
-
-    // ─── estimate_cursor_y (H3#1) ─────────────────────────────────────────
-
-    mod cursor_y {
-        use super::*;
-        use crate::render::dimension::Pt;
-        use crate::render::geometry::{PtLineSegment, PtOffset, PtRect, PtSize};
-        use crate::render::layout::draw_command::{DrawCommand, LayoutedPage};
-        use crate::render::layout::page::PageConfig;
-
-        fn page_with(cmd: DrawCommand) -> (LayoutedPage, PageConfig) {
-            let config = PageConfig::default();
-            let mut page = LayoutedPage::new(config.page_size);
-            page.commands.push(cmd);
-            (page, config)
-        }
-
-        fn rect_at(y: f32, h: f32) -> PtRect {
-            PtRect::from_xywh(Pt::ZERO, Pt::new(y), Pt::new(10.0), Pt::new(h))
-        }
-
-        /// An empty page resumes at the top margin — the floor every case
-        /// below has to beat.
-        #[test]
-        fn empty_page_resumes_at_the_top_margin() {
-            let config = PageConfig::default();
-            let page = LayoutedPage::new(config.page_size);
-            assert_eq!(estimate_cursor_y(&page, &config), config.margins.top);
-        }
-
-        /// Every variant that occupies vertical space must move the cursor.
-        /// `EmojiCluster` and `Path` are H3#1: both were swallowed by a
-        /// `_ => continue`, so a section following them resumed at the top
-        /// margin and painted over them.
-        #[test]
-        fn every_extent_bearing_variant_advances_the_cursor() {
-            let below = Pt::new(400.0);
-            let cases: Vec<(&str, DrawCommand)> = vec![
-                (
-                    "Image",
-                    DrawCommand::Image {
-                        rect: rect_at(400.0, 50.0),
-                        image_data: crate::render::resolve::images::MediaEntry {
-                            data: std::sync::Arc::from(Vec::new().into_boxed_slice()),
-                            format: crate::model::ImageFormat::Png,
-                        },
-                        src_rect: None,
-                    },
-                ),
-                (
-                    "Rect",
-                    DrawCommand::Rect {
-                        rect: rect_at(400.0, 50.0),
-                        color: crate::render::resolve::color::RgbColor::BLACK,
-                    },
-                ),
-                (
-                    "Line",
-                    DrawCommand::Line {
-                        line: PtLineSegment::new(
-                            PtOffset::new(Pt::ZERO, Pt::new(450.0)),
-                            PtOffset::new(Pt::new(10.0), Pt::new(400.0)),
-                        ),
-                        color: crate::render::resolve::color::RgbColor::BLACK,
-                        width: Pt::new(1.0),
-                    },
-                ),
-                (
-                    "Path",
-                    DrawCommand::Path {
-                        origin: PtOffset::new(Pt::ZERO, Pt::new(400.0)),
-                        rotation: crate::model::dimension::Dimension::new(0),
-                        flip_h: false,
-                        flip_v: false,
-                        extent: PtSize::new(Pt::new(10.0), Pt::new(50.0)),
-                        paths: Vec::new(),
-                        fill: crate::render::layout::draw_command::ResolvedFill::None,
-                        stroke: None,
-                        effects: Vec::new(),
-                    },
-                ),
-            ];
-
-            for (label, cmd) in cases {
-                let (page, config) = page_with(cmd);
-                let y = estimate_cursor_y(&page, &config);
-                assert!(
-                    y > below,
-                    "{label} occupies y=400..450 but the cursor resumed at {y:?} — \
-                     the next section would paint over it"
-                );
-            }
-        }
-
-        /// The emoji case, kept separate because it is the one reproduced
-        /// end-to-end: a paragraph containing only an emoji, followed by a
-        /// continuous section break, resumed at exactly `margins.top`.
-        #[test]
-        fn emoji_cluster_advances_the_cursor() {
-            let (page, config) = page_with(DrawCommand::EmojiCluster {
-                rect: rect_at(36.0, 47.25),
-                text: "\u{1F4DE}".into(),
-                typeface: emoji_test_typeface(),
-                size: Pt::new(36.0),
-                presentation: crate::render::emoji::cluster::EmojiPresentation::Emoji,
-                structure: crate::render::emoji::cluster::EmojiStructure::Single,
-            });
-            assert_eq!(
-                estimate_cursor_y(&page, &config),
-                Pt::new(83.25),
-                "the cursor must clear the emoji's box, not sit inside it"
-            );
-        }
-
-        fn emoji_test_typeface() -> crate::render::fonts::TypefaceEntry {
-            use skia_safe::{FontMgr, FontStyle};
-            let tf = FontMgr::new()
-                .legacy_make_typeface(None::<&str>, FontStyle::normal())
-                .expect("system default typeface");
-            let id = crate::render::fonts::TypefaceId::from(&tf);
-            crate::render::fonts::TypefaceEntry {
-                typeface: tf,
-                origin: crate::render::fonts::TypefaceOrigin::System { typeface_id: id },
-            }
-        }
-
-        /// Annotations sit on top of content that already contributed its own
-        /// extent, and a destination is a point. Counting them would push the
-        /// cursor past content that is not there.
-        #[test]
-        fn annotations_and_destinations_contribute_nothing() {
-            for cmd in [
-                DrawCommand::LinkAnnotation {
-                    rect: rect_at(400.0, 50.0),
-                    url: "https://example.invalid".into(),
-                },
-                DrawCommand::InternalLink {
-                    rect: rect_at(400.0, 50.0),
-                    destination: "anchor".into(),
-                },
-                DrawCommand::NamedDestination {
-                    position: PtOffset::new(Pt::ZERO, Pt::new(400.0)),
-                    name: "anchor".into(),
-                },
-            ] {
-                let (page, config) = page_with(cmd);
-                assert_eq!(estimate_cursor_y(&page, &config), config.margins.top);
-            }
-        }
     }
 
     // ─── Error surface (H3#4) ─────────────────────────────────────────────

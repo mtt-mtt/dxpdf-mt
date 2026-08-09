@@ -225,13 +225,15 @@ fn build_non_story_content(
     for (block_i, block) in blocks.iter().enumerate() {
         match block {
             Block::Paragraph(p) => {
-                let (mut frags, props) = build_fragments(p, ctx, state, None, None);
+                let (mut frags, props, paragraph_font_size) =
+                    build_fragments(p, ctx, state, None, None);
                 // §17.11.12: headers/footers don't render footnote bodies, but
                 // they must still drain — otherwise a reference inside one
                 // would be attributed to the next body paragraph.
                 let _ = state.footnotes.take_pending();
                 let style = paragraph_style_from_props(
                     &props,
+                    state.shape_auto_fit.scale_font(paragraph_font_size),
                     Pt::from(ctx.resolved.default_tab_stop),
                     state.shape_auto_fit,
                     convert::paragraph_locale(p, ctx.resolved),
@@ -382,6 +384,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
 
