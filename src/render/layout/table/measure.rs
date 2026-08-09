@@ -2,7 +2,9 @@
 
 use crate::render::dimension::Pt;
 
-use crate::render::layout::cell::{layout_cell, CellLayout};
+use crate::render::layout::cell::{
+    intrinsic_rotated_cell_extent, layout_cell, layout_rotated_cell, CellLayout,
+};
 
 use super::borders::{
     border_width, resolve_border_conflict, resolve_cell_effective_borders, CellBorders, CellEdge,
@@ -273,6 +275,48 @@ pub(super) fn measure_table_rows(
                     commands: Vec::new(),
                     content_height: Pt::ZERO,
                     lines: Vec::new(),
+                    footnotes: Vec::new(),
+                }
+            } else if matches!(
+                cell.text_direction,
+                Some(
+                    crate::model::TextDirection::BottomToTopLeftToRight
+                        | crate::model::TextDirection::TopToBottomRightToLeft
+                )
+            ) {
+                let physical_extent = match row.height_rule {
+                    Some(RowHeightRule::AtLeast(height) | RowHeightRule::Exact(height))
+                        if height > Pt::ZERO =>
+                    {
+                        Some(height)
+                    }
+                    _ => intrinsic_rotated_cell_extent(
+                        &cell.blocks,
+                        &cell.margins,
+                        cell.text_direction.expect("matched rotated direction"),
+                        default_line_height,
+                    ),
+                };
+                if let Some(physical_extent) = physical_extent {
+                    layout_rotated_cell(
+                        &cell.blocks,
+                        physical_extent,
+                        &cell.margins,
+                        cell.text_direction.expect("matched rotated direction"),
+                        default_line_height,
+                        measure_text,
+                    )
+                } else {
+                    log::warn!(
+                        "§17.4.70: rotated table cell has non-measurable auto-height content; using horizontal fallback"
+                    );
+                    layout_cell(
+                        &cell.blocks,
+                        layout_w,
+                        &cell.margins,
+                        default_line_height,
+                        measure_text,
+                    )
                 }
             } else {
                 layout_cell(
@@ -283,6 +327,19 @@ pub(super) fn measure_table_rows(
                     measure_text,
                 )
             };
+
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!(
+                    "[table] row={row_idx} cell={cell_ci} width={:.2}pt content_height={:.2}pt margins={:.2}/{:.2}/{:.2}/{:.2}pt lines={}",
+                    cell_w.raw(),
+                    layout.content_height.raw(),
+                    cell.margins.top.raw(),
+                    cell.margins.right.raw(),
+                    cell.margins.bottom.raw(),
+                    cell.margins.left.raw(),
+                    layout.lines.len(),
+                );
+            }
 
             // §17.4.85: a merged cell's height is normally decided by
             // `expand_rows_for_vmerge` over the whole span, not here — folding a
@@ -427,6 +484,7 @@ mod tests {
             cell_borders: borders,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 

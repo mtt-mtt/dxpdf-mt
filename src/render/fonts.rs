@@ -16,6 +16,10 @@
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use skia_safe::font_style::{Slant, Weight, Width};
 use skia_safe::{Data, Font, FontMgr, FontStyle, Typeface};
@@ -44,6 +48,10 @@ impl EmbeddedFontId {
         self.0
     }
 }
+
+/// Stable id for a face loaded from a process-local controlled font pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PackagedFontId(u32);
 
 /// Identity for a Skia [`Typeface`], wrapping `Typeface::unique_id`.
 /// Used as the join key with [`crate::render::subset::CodepointUsage`].
@@ -91,12 +99,126 @@ pub enum TypefaceOrigin {
     /// Loaded from a font asset distributed with dxpdf rather than from the
     /// DOCX or host font collection.
     Bundled { font: BundledFont },
+    /// Loaded from a process-local controlled font pack. The registry retains
+    /// the original file bytes so OTF/CFF fonts are subset from their real
+    /// source instead of Skia's serialized representation.
+    Packaged { id: PackagedFontId },
 }
 
 #[derive(Clone, Debug)]
 pub struct TypefaceEntry {
     pub typeface: Typeface,
     pub origin: TypefaceOrigin,
+}
+
+#[derive(Clone, Debug)]
+struct PackagedFontFace {
+    family: String,
+    style: FontStyle,
+    typeface: Typeface,
+    bytes: Arc<[u8]>,
+    face_index: usize,
+}
+
+/// A reusable, process-local collection of fonts loaded from a directory.
+///
+/// Loading is intentionally separate from [`FontRegistry`]: a server can read
+/// a large controlled font pack once, then cheaply install cloned Skia
+/// typeface handles into each render-local registry. The fonts are never
+/// installed into the host operating system.
+#[derive(Clone, Debug)]
+pub struct FontPack {
+    root: PathBuf,
+    files_scanned: usize,
+    files_loaded: usize,
+    invalid_files: usize,
+    faces: Vec<PackagedFontFace>,
+}
+
+impl FontPack {
+    /// Recursively load `.ttf`, `.otf`, and `.ttc` files below `root`.
+    ///
+    /// Directory traversal and face ordering are sorted so duplicate family
+    /// names resolve deterministically on every host. Unreadable directories
+    /// and files are errors; files Skia cannot decode are counted and skipped.
+    pub fn load_dir(font_mgr: &FontMgr, root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let mut paths = Vec::new();
+        collect_font_paths(&root, &mut paths)?;
+        paths.sort_by(|a, b| {
+            a.to_string_lossy()
+                .to_lowercase()
+                .cmp(&b.to_string_lossy().to_lowercase())
+        });
+
+        let mut files_loaded = 0usize;
+        let mut invalid_files = 0usize;
+        let mut faces = Vec::new();
+
+        for path in &paths {
+            let bytes: Arc<[u8]> = fs::read(path)?.into();
+            let face_count = collection_face_count(&bytes);
+            let mut loaded_from_file = 0usize;
+            for face_index in 0..face_count {
+                let Some(typeface) = font_mgr.new_from_data(bytes.as_ref(), face_index) else {
+                    continue;
+                };
+                faces.push(PackagedFontFace {
+                    family: typeface.family_name(),
+                    style: typeface.font_style(),
+                    typeface,
+                    bytes: Arc::clone(&bytes),
+                    face_index,
+                });
+                loaded_from_file += 1;
+            }
+            if loaded_from_file == 0 {
+                invalid_files += 1;
+                log::warn!("could not load packaged font '{}'", path.display());
+            } else {
+                files_loaded += 1;
+            }
+        }
+
+        Ok(Self {
+            root,
+            files_scanned: paths.len(),
+            files_loaded,
+            invalid_files,
+            faces,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn files_scanned(&self) -> usize {
+        self.files_scanned
+    }
+
+    pub fn files_loaded(&self) -> usize {
+        self.files_loaded
+    }
+
+    pub fn invalid_files(&self) -> usize {
+        self.invalid_files
+    }
+
+    pub fn face_count(&self) -> usize {
+        self.faces.len()
+    }
+
+    pub fn family_count(&self) -> usize {
+        let mut families: Vec<_> = self
+            .faces
+            .iter()
+            .map(|face| face.family.to_lowercase())
+            .collect();
+        families.sort();
+        families.dedup();
+        families.len()
+    }
 }
 
 /// Cache key for resolved typefaces — case-insensitive family + weight + slant.
@@ -126,9 +248,19 @@ pub enum RegisterError {
     },
 }
 
-/// Open-source metric-compatible substitutes for proprietary fonts. Tried
-/// in order when `match_family_style` for the requested family fails.
+/// Word-compatible fallback chains for commonly missing fonts. Entries prefer
+/// either an observed Word fallback or open-source metric-compatible faces and
+/// are tried in order when `match_family_style` for the requested family fails.
 const FONT_SUBSTITUTIONS: &[(&str, &[&str])] = &[
+    // A controlled Word reference render on Windows resolves an unavailable
+    // Montserrat request to Segoe Print. The difference is layout-significant:
+    // replacing it with the system-default Segoe UI compresses the line box
+    // and changes both wrapping and pagination. An installed or embedded
+    // Montserrat still wins in steps 1-2; this chain is reached only on a miss.
+    (
+        "Montserrat",
+        &["Segoe Print", "Carlito", "Liberation Sans", "Noto Sans"],
+    ),
     // Word on Windows maps the legacy Century Schoolbook family to Segoe
     // Print when the requested face is absent.  This is not a cosmetic
     // choice: Segoe Print's wider advances and taller line box materially
@@ -196,6 +328,12 @@ struct EmbeddedRecord {
     family: String,
     variant: EmbeddedFontVariant,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PackagedRecord {
+    bytes: Arc<[u8]>,
+    face_index: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -408,6 +546,10 @@ pub struct FontRegistry {
     font_mgr: FontMgr,
     embedded: Vec<EmbeddedRecord>,
     embedded_index: HashMap<(String, EmbeddedFontVariant), EmbeddedFontId>,
+    packaged: Vec<PackagedRecord>,
+    packaged_typefaces: HashMap<String, Vec<(FontStyle, TypefaceEntry)>>,
+    packaged_fallback_faces: Vec<(FontStyle, TypefaceEntry)>,
+    packaged_fallback: Option<TypefaceEntry>,
     bundled_symbols: OnceCell<Option<TypefaceEntry>>,
     bundled_color_emoji: OnceCell<Option<TypefaceEntry>>,
     system_face_aliases: OnceCell<FaceAliasIndex>,
@@ -421,6 +563,10 @@ impl FontRegistry {
             font_mgr,
             embedded: Vec::new(),
             embedded_index: HashMap::new(),
+            packaged: Vec::new(),
+            packaged_typefaces: HashMap::new(),
+            packaged_fallback_faces: Vec::new(),
+            packaged_fallback: None,
             bundled_symbols: OnceCell::new(),
             bundled_color_emoji: OnceCell::new(),
             system_face_aliases: OnceCell::new(),
@@ -441,13 +587,32 @@ impl FontRegistry {
         embedded: &[EmbeddedFont],
         families: &[String],
     ) -> Result<Self, crate::render::error::RenderError> {
-        if font_mgr
+        Self::build_with_font_pack(font_mgr, embedded, families, None)
+    }
+
+    /// Build a registry with an optional controlled font pack.
+    ///
+    /// DOCX-embedded faces are registered after the pack, so they retain the
+    /// highest priority. A pack also supplies the last-resort face on a host
+    /// whose system font manager is empty.
+    pub fn build_with_font_pack(
+        font_mgr: FontMgr,
+        embedded: &[EmbeddedFont],
+        families: &[String],
+        font_pack: Option<&FontPack>,
+    ) -> Result<Self, crate::render::error::RenderError> {
+        let mut reg = Self::new(font_mgr);
+        if let Some(font_pack) = font_pack {
+            reg.install_font_pack(font_pack);
+        }
+        if reg
+            .font_mgr
             .legacy_make_typeface(None::<&str>, FontStyle::normal())
             .is_none()
+            && reg.packaged_fallback.is_none()
         {
             return Err(crate::render::error::RenderError::NoFontsAvailable);
         }
-        let mut reg = Self::new(font_mgr);
         for ef in embedded {
             if let Err(err) = reg.register_embedded(&ef.family, ef.variant, ef.data.clone()) {
                 log::warn!("{err}");
@@ -455,6 +620,70 @@ impl FontRegistry {
         }
         reg.preload(families);
         Ok(reg)
+    }
+
+    fn install_font_pack(&mut self, font_pack: &FontPack) {
+        let mut output_unsafe_faces = 0usize;
+        for face in &font_pack.faces {
+            // Skia's PDF backend currently serializes CFF-flavoured OTF faces
+            // as a malformed TrueType FontFile2 stream on Windows. Loading
+            // remains part of pack validation, but do not select those faces
+            // until the backend can preserve CFF outlines correctly.
+            if face.bytes.starts_with(b"OTTO") {
+                output_unsafe_faces += 1;
+                continue;
+            }
+            let id = PackagedFontId(self.packaged.len() as u32);
+            self.packaged.push(PackagedRecord {
+                bytes: Arc::clone(&face.bytes),
+                face_index: face.face_index,
+            });
+            let entry = TypefaceEntry {
+                typeface: face.typeface.clone(),
+                origin: TypefaceOrigin::Packaged { id },
+            };
+            self.packaged_typefaces
+                .entry(face.family.to_lowercase())
+                .or_default()
+                .push((face.style, entry.clone()));
+            self.packaged_fallback_faces
+                .push((face.style, entry.clone()));
+            self.typefaces
+                .get_mut()
+                .insert(TypefaceKey::new(&face.family, face.style), entry.clone());
+            if self.packaged_fallback.is_none()
+                || (face.family.eq_ignore_ascii_case("Carlito")
+                    && face.style == FontStyle::normal())
+            {
+                self.packaged_fallback = Some(entry);
+            }
+        }
+        for faces in self.packaged_typefaces.values_mut() {
+            faces.sort_by_key(|(style, _)| {
+                (
+                    *style.weight(),
+                    slant_sort_key(style.slant()),
+                    *style.width(),
+                )
+            });
+        }
+        log::info!(
+            "loaded controlled font pack '{}' ({} files, {} faces, {} families, {} invalid, {} CFF faces excluded from PDF output)",
+            font_pack.root().display(),
+            font_pack.files_loaded(),
+            font_pack.face_count(),
+            font_pack.family_count(),
+            font_pack.invalid_files(),
+            output_unsafe_faces
+        );
+    }
+
+    fn packaged_match(&self, family: &str, requested: FontStyle) -> Option<TypefaceEntry> {
+        self.packaged_typefaces
+            .get(&family.to_lowercase())?
+            .iter()
+            .min_by_key(|(candidate, _)| font_style_distance(*candidate, requested))
+            .map(|(_, entry)| entry.clone())
     }
 
     pub fn font_mgr(&self) -> &FontMgr {
@@ -511,6 +740,12 @@ impl FontRegistry {
         &self.embedded[id.0 as usize].bytes
     }
 
+    /// Original file bytes and face index for a controlled-pack typeface.
+    pub fn packaged_font_source(&self, id: PackagedFontId) -> (&[u8], usize) {
+        let record = &self.packaged[id.0 as usize];
+        (&record.bytes, record.face_index)
+    }
+
     /// Family + variant for a registered embedded font.
     pub fn embedded_meta(&self, id: EmbeddedFontId) -> (&str, EmbeddedFontVariant) {
         let r = &self.embedded[id.0 as usize];
@@ -546,6 +781,54 @@ impl FontRegistry {
                     typeface: tf,
                     origin: TypefaceOrigin::Embedded { id },
                 };
+            }
+        }
+
+        if let Some(entry) = self.packaged_match(family, style) {
+            log::debug!("[font] '{}' {:?} → controlled font pack", family, style);
+            return entry;
+        }
+
+        if let Some(canonical) = localized_family_alias(family) {
+            if let Some(entry) = self.packaged_match(canonical, style) {
+                log::debug!(
+                    "[font] '{}' {:?} -> controlled localized alias '{}'",
+                    family,
+                    style,
+                    canonical
+                );
+                return entry;
+            }
+        }
+
+        if let Some((matched, subs)) = substitutes_for(family) {
+            for sub in subs {
+                if let Some(entry) = self.packaged_match(sub, style) {
+                    log::debug!(
+                        "[font] '{}' {:?} → controlled substitute '{}' (via '{}')",
+                        family,
+                        style,
+                        sub,
+                        matched
+                    );
+                    return entry;
+                }
+                // Preserve the substitution table's candidate order across
+                // sources. If the controlled pack lacks the first-choice
+                // compatibility face but the host has it, use that face
+                // before trying a lower-ranked packaged substitute.
+                if !self.packaged_typefaces.is_empty() {
+                    if let Some(tf) = match_exact(&self.font_mgr, sub, style) {
+                        log::debug!(
+                            "[font] '{}' {:?} -> controlled-chain host substitute '{}' (via '{}')",
+                            family,
+                            style,
+                            sub,
+                            matched
+                        );
+                        return system_entry(tf);
+                    }
+                }
             }
         }
 
@@ -604,17 +887,19 @@ impl FontRegistry {
         // return. A registry made with `FontRegistry::new` carries no such
         // guarantee — that constructor is for tests, which supply a real
         // `FontMgr`.
-        let tf = self
+        let entry = self
             .font_mgr
             .legacy_make_typeface(None::<&str>, style)
+            .map(system_entry)
+            .or_else(|| self.packaged_fallback.clone())
             .expect("FontRegistry::build guarantees a last-resort typeface");
         log::debug!(
             "[font] '{}' {:?} → system default '{}'",
             family,
             style,
-            tf.family_name()
+            entry.typeface.family_name()
         );
-        system_entry(tf)
+        entry
     }
 
     /// Resolve a typeface by exact family + style match, or `None` if the
@@ -639,6 +924,9 @@ impl FontRegistry {
                     origin: TypefaceOrigin::Embedded { id },
                 });
             }
+        }
+        if let Some(entry) = self.packaged_match(family, style) {
+            return Some(entry);
         }
         match_exact(&self.font_mgr, family, style).map(system_entry)
     }
@@ -722,6 +1010,19 @@ impl FontRegistry {
             .iter()
             .copied()
             .find(|&ch| requested.typeface.unichar_to_glyph(ch) == 0)?;
+        if let Some(packaged) = self
+            .packaged_fallback_faces
+            .iter()
+            .filter(|(_, entry)| {
+                codepoints
+                    .iter()
+                    .all(|&ch| entry.typeface.unichar_to_glyph(ch) != 0)
+            })
+            .min_by_key(|(candidate, _)| font_style_distance(*candidate, style))
+            .map(|(_, entry)| entry.clone())
+        {
+            return Some(packaged);
+        }
         let fallback = self
             .font_mgr
             .match_family_style_character(family, style, &["zh-CN", "en-US"], missing)
@@ -826,6 +1127,70 @@ impl FontRegistry {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn collect_font_paths(root: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+    let metadata = fs::metadata(root)?;
+    if metadata.is_file() {
+        if is_supported_font_path(root) {
+            paths.push(root.to_path_buf());
+        }
+        return Ok(());
+    }
+
+    let mut entries: Vec<_> = fs::read_dir(root)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_font_paths(&path, paths)?;
+        } else if file_type.is_file() && is_supported_font_path(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_font_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "ttf" | "otf" | "ttc"
+            )
+        })
+}
+
+fn collection_face_count(bytes: &[u8]) -> usize {
+    const MAX_COLLECTION_FACES: usize = 256;
+    if bytes.len() < 12 || &bytes[..4] != b"ttcf" {
+        return 1;
+    }
+    let count = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    count.clamp(1, MAX_COLLECTION_FACES)
+}
+
+fn slant_sort_key(slant: Slant) -> i32 {
+    match slant {
+        Slant::Upright => 0,
+        Slant::Italic => 1,
+        Slant::Oblique => 2,
+    }
+}
+
+fn font_style_distance(candidate: FontStyle, requested: FontStyle) -> (i32, i32, i32) {
+    let slant_penalty = if candidate.slant() == requested.slant() {
+        0
+    } else {
+        1
+    };
+    (
+        slant_penalty,
+        (*candidate.weight() - *requested.weight()).abs(),
+        (*candidate.width() - *requested.width()).abs(),
+    )
+}
 
 fn font_style_for_variant(v: EmbeddedFontVariant) -> FontStyle {
     match v {
@@ -1058,6 +1423,7 @@ impl FontCache {
 mod tests {
     use super::*;
     use skia_safe::font_style::{Slant, Weight, Width};
+    use std::fs;
 
     #[test]
     fn synthetic_bold_is_used_only_when_a_bold_face_is_missing() {
@@ -1070,6 +1436,44 @@ mod tests {
 
     fn fmgr() -> FontMgr {
         FontMgr::new()
+    }
+
+    #[test]
+    fn controlled_font_pack_loads_recursively_without_system_installation() {
+        let font_mgr = fmgr();
+        let typeface = font_mgr
+            .legacy_make_typeface(None::<&str>, FontStyle::normal())
+            .expect("system has no default typeface");
+        let (bytes, _) = typeface
+            .to_font_data()
+            .expect("system default typeface has no font bytes");
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("probe.ttf"), bytes).unwrap();
+        fs::write(nested.join("ignored.txt"), b"not a font").unwrap();
+
+        let pack = FontPack::load_dir(&font_mgr, temp.path()).unwrap();
+        assert_eq!(pack.files_scanned(), 1);
+        assert_eq!(pack.files_loaded(), 1);
+        assert_eq!(pack.invalid_files(), 0);
+        assert_eq!(pack.face_count(), 1);
+        assert_eq!(pack.family_count(), 1);
+
+        let family = pack.faces[0].family.clone();
+        let style = pack.faces[0].style;
+        let registry = FontRegistry::build_with_font_pack(
+            font_mgr,
+            &[],
+            std::slice::from_ref(&family),
+            Some(&pack),
+        )
+        .unwrap();
+        let resolved = registry.resolve(&family, style);
+        assert_eq!(
+            TypefaceId::from(&resolved.typeface),
+            TypefaceId::from(&pack.faces[0].typeface)
+        );
     }
 
     #[test]
@@ -1452,7 +1856,8 @@ mod tests {
                 TypefaceOrigin::Embedded { .. }
                 | TypefaceOrigin::System { .. }
                 | TypefaceOrigin::SystemFallback { .. }
-                | TypefaceOrigin::Bundled { .. } => {}
+                | TypefaceOrigin::Bundled { .. }
+                | TypefaceOrigin::Packaged { .. } => {}
             }
         }
     }
@@ -1648,6 +2053,13 @@ mod tests {
         let (matched, substitutes) =
             substitutes_for("Century Schoolbook").expect("known legacy family");
         assert_eq!(matched, "Century Schoolbook");
+        assert_eq!(substitutes.first(), Some(&"Segoe Print"));
+    }
+
+    #[test]
+    fn montserrat_uses_the_word_compatible_windows_fallback_first() {
+        let (matched, substitutes) = substitutes_for("Montserrat").expect("known web family");
+        assert_eq!(matched, "Montserrat");
         assert_eq!(substitutes.first(), Some(&"Segoe Print"));
     }
 

@@ -68,3 +68,10 @@ When `FieldContext` has no value for a field (e.g., body text without per-page c
 The `\* MERGEFORMAT` switch preserves the formatting of the first result run when the field is updated. Our substitution honors this: the first `TextRun` between Separate and End provides font family, size, bold, italic, color — the substituted text replaces only the content while preserving the style.
 
 Fallback (no result TextRun present): paragraph default font properties are used via `make_field_text_fragment`.
+
+Legacy `MACROBUTTON` fields without a `separate` marker use their display
+argument as printable fallback text. One exception is an internal hyperlink
+(the structure Word uses for cached TOC entries): there the macrobutton is an
+editing aid and is suppressed, while the following `PAGEREF` cached result is
+kept. Malformed or unsupported fields with a result zone always preserve that
+cached result.

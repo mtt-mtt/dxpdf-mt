@@ -54,6 +54,7 @@ pip install dxpdf
 ```bash
 dxpdf input.docx                  # produces input.pdf
 dxpdf input.docx -o output.pdf    # specify output path
+dxpdf input.docx --font-dir ./core-fonts  # process-local controlled fonts
 dxpdf input.docx --image-dpi 300  # embed images at 300 DPI (default 220; range 1–2400)
 ```
 
@@ -78,6 +79,24 @@ use dxpdf::RenderOptions;
 
 let options = RenderOptions::default().with_image_dpi(300.0);
 let pdf_bytes = dxpdf::convert_with_options(&docx_bytes, &options)?;
+```
+
+For repeatable server-side font resolution, load a controlled font pack once
+and reuse it across conversions:
+
+```rust
+use dxpdf::{FontPack, PackageLimits, RenderOptions};
+use skia_safe::FontMgr;
+
+let font_mgr = FontMgr::new();
+let font_pack = FontPack::load_dir(&font_mgr, "core-fonts")?;
+let pdf_bytes = dxpdf::convert_with_options_and_font_pack(
+    &docx_bytes,
+    &RenderOptions::default(),
+    &PackageLimits::default(),
+    &font_mgr,
+    &font_pack,
+)?;
 ```
 
 You can also inspect or transform the parsed document model before conversion:
@@ -112,6 +131,9 @@ dxpdf.convert_file("input.docx", "output.pdf")
 # Customize embedded-image resolution (default 220 DPI)
 pdf_bytes = dxpdf.convert(open("input.docx", "rb").read(), image_dpi=300)
 dxpdf.convert_file("input.docx", "output.pdf", image_dpi=300)
+
+# Use controlled fonts without installing them into the operating system
+dxpdf.convert_file("input.docx", "output.pdf", font_dir="core-fonts")
 ```
 
 ## Supported DOCX Features

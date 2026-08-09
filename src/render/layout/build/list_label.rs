@@ -10,7 +10,9 @@ use crate::model::{self, ParagraphProperties};
 use crate::render::dimension::Pt;
 use crate::render::layout::fragment::Fragment;
 
-use super::convert::{pic_bullet_size, remap_legacy_font_chars, resolve_paragraph_defaults};
+use super::convert::{
+    pic_bullet_size, remap_legacy_font_chars, resolve_indentation, resolve_paragraph_defaults,
+};
 use super::{BuildContext, BuildState};
 
 /// Inject list label fragments into a paragraph if it has a numbering reference.
@@ -94,7 +96,10 @@ pub(super) fn inject_list_label(
         });
 
     if let Some((label_frag, label_height)) = pic_bullet_injected {
-        let hanging = extract_hanging(level_def);
+        let (fam, paragraph_size, color, _, _) =
+            resolve_paragraph_defaults(para, ctx.resolved, false, None, None);
+        let indent_character_width = state.shape_auto_fit.scale_font(paragraph_size);
+        let hanging = extract_hanging(level_def, indent_character_width);
         // §17.9.29: `Nothing` drops the separator entirely. `Tab` and `Space`
         // both advance via a tab here — a picture bullet has no text font to emit
         // a literal space with, and image-bullet + space is vanishingly rare.
@@ -104,12 +109,10 @@ pub(super) fn inject_list_label(
             // §17.3.1.38: a leader on this separator is drawn in the
             // formatting in effect at the tab. A picture bullet has no text
             // run of its own, so the paragraph defaults *are* that formatting.
-            let (fam, size, color, _, _) =
-                resolve_paragraph_defaults(para, ctx.resolved, false, None, None);
             let sep_font = crate::render::layout::fragment::font_props_from_run(
                 &model::RunProperties::default(),
                 &fam,
-                size,
+                paragraph_size,
                 state.shape_auto_fit,
             );
             let tab_frag = Fragment::Tab {
@@ -123,7 +126,9 @@ pub(super) fn inject_list_label(
         fragments.insert(0, label_frag);
 
         if !drop_separator {
-            if let Some(lvl_left) = effective_numbering_start(para, level_def) {
+            if let Some(lvl_left) =
+                effective_numbering_start(para, level_def, indent_character_width)
+            {
                 merged_props.tabs.insert(
                     0,
                     crate::model::TabStop {
@@ -159,11 +164,20 @@ pub(super) fn inject_list_label(
             if let Some(start) = direct.start {
                 ind.start = Some(start);
             }
+            if let Some(start_chars) = direct.start_chars {
+                ind.start_chars = Some(start_chars);
+            }
             if let Some(end) = direct.end {
                 ind.end = Some(end);
             }
+            if let Some(end_chars) = direct.end_chars {
+                ind.end_chars = Some(end_chars);
+            }
             if let Some(first_line) = direct.first_line {
                 ind.first_line = Some(first_line);
+            }
+            if let Some(first_line_chars) = direct.first_line_chars {
+                ind.first_line_chars = Some(first_line_chars);
             }
         }
         merged_props.indentation = Some(ind);
@@ -257,7 +271,8 @@ fn inject_text_label(
     let (w, m) = ctx.measurer.measure(&label_text, &label_font);
     let h = m.height();
 
-    let hanging = extract_hanging(level_def);
+    let indent_character_width = auto_fit.scale_font(default_size);
+    let hanging = extract_hanging(level_def, indent_character_width);
     // §17.9.7: lvlJc controls label justification within the hanging indent area.
     let jc = level_def.and_then(|l| l.justification);
     let text_offset = match jc {
@@ -302,7 +317,9 @@ fn inject_text_label(
             fragments.insert(0, label_frag);
 
             // Implicit tab stop at numLvl.left so the tab lands at body text.
-            if let Some(lvl_left) = effective_numbering_start(para, level_def) {
+            if let Some(lvl_left) =
+                effective_numbering_start(para, level_def, indent_character_width)
+            {
                 merged_props.tabs.insert(
                     0,
                     crate::model::TabStop {
@@ -351,29 +368,40 @@ fn inject_text_label(
 fn effective_numbering_start(
     para: &model::Paragraph,
     level_def: Option<&crate::render::resolve::numbering::ResolvedNumberingLevel>,
+    character_width: Pt,
 ) -> Option<crate::model::dimension::Dimension<crate::model::dimension::Twips>> {
-    para.properties
-        .indentation
+    let direct = para.properties.indentation;
+    let level = level_def.and_then(|level| level.indentation);
+    let start = direct
         .and_then(|indent| indent.start)
-        .or_else(|| {
-            level_def
-                .and_then(|level| level.indentation.as_ref())
-                .and_then(|indent| indent.start)
-        })
+        .or_else(|| level.and_then(|indent| indent.start));
+    let start_chars = direct
+        .and_then(|indent| indent.start_chars)
+        .or_else(|| level.and_then(|indent| indent.start_chars));
+    if start.is_none() && start_chars.is_none() {
+        return None;
+    }
+    let effective = model::Indentation {
+        start,
+        start_chars,
+        ..Default::default()
+    };
+    let points = resolve_indentation(Some(effective), character_width).0;
+    Some(crate::model::dimension::Dimension::new(
+        (points.raw() * 20.0).round() as i64,
+    ))
 }
 
 /// Extract the hanging indent from a numbering level definition.
 fn extract_hanging(
     level_def: Option<&crate::render::resolve::numbering::ResolvedNumberingLevel>,
+    character_width: Pt,
 ) -> Pt {
-    level_def
+    let first_line = level_def
         .and_then(|l| l.indentation.as_ref())
-        .and_then(|ind| ind.first_line)
-        .map(|fl| match fl {
-            model::FirstLineIndent::Hanging(v) => Pt::from(v),
-            _ => Pt::ZERO,
-        })
-        .unwrap_or(Pt::ZERO)
+        .map(|ind| resolve_indentation(Some(*ind), character_width).2)
+        .unwrap_or(Pt::ZERO);
+    (-first_line).max(Pt::ZERO)
 }
 
 /// §17.9.23 — derive a label's [`FontProps`] from the resolved
@@ -488,7 +516,7 @@ impl<'a> ListLabelRunPropertyCascade<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::dimension::{Dimension, HalfPoints, Twips};
+    use crate::model::dimension::{Dimension, HalfPoints, HundredthChars, Twips};
     use crate::model::{FontSet, FontSlot, RunProperties, TextScale, UnderlineStyle};
 
     // ── §17.9.22 label emission ──────────────────────────────────────────
@@ -498,8 +526,8 @@ mod tests {
     // separator switch, §17.9.7 justification, and the hanging indent.
 
     use crate::model::{
-        Alignment, FirstLineIndent, Indentation, LevelSuffix, NumId, NumberFormat,
-        NumberingReference,
+        Alignment, FirstLineIndent, FirstLineIndentChars, Indentation, LevelSuffix, NumId,
+        NumberFormat, NumberingReference,
     };
     use crate::render::fonts::FontRegistry;
     use crate::render::layout::measurer::TextMeasurer;
@@ -546,6 +574,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
 
@@ -744,6 +773,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_zero_character_start_clears_the_numbering_character_start() {
+        let resolved = resolved_with(vec![ResolvedNumberingLevel {
+            indentation: Some(Indentation {
+                start: Some(Dimension::<Twips>::new(720)),
+                start_chars: Some(Dimension::<HundredthChars>::new(200)),
+                ..Default::default()
+            }),
+            ..decimal_level()
+        }]);
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+        let mut para = numbered_para();
+        para.properties.indentation = Some(Indentation {
+            start_chars: Some(Dimension::<HundredthChars>::new(0)),
+            ..Default::default()
+        });
+        let mut fragments = Vec::new();
+        let mut props = props_at(0);
+
+        inject_list_label(
+            &para,
+            &mut fragments,
+            &mut props,
+            &ctx,
+            &mut BuildState::default(),
+        );
+
+        assert!(
+            props
+                .tabs
+                .iter()
+                .any(|tab| tab.position == Dimension::<Twips>::new(720)),
+            "the explicit zero clears 2.00ch, exposing the 720-twip fallback"
+        );
+    }
+
     /// §17.9.7 `lvlJc`: the label is placed by shifting it within the hanging
     /// indent area — `start` not at all, `end` by its whole width, `center` by
     /// half. Expressed as a ratio so the host font's metrics cancel.
@@ -804,6 +874,41 @@ mod tests {
                 assert!(
                     (got - (18.0 - label_width)).abs() < 1e-3,
                     "18pt hanging indent less a {label_width}pt label, got {got}"
+                );
+            }
+            other => panic!("expected the separator tab, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn character_unit_numbering_indents_drive_body_stop_and_hanging_width() {
+        let resolved = resolved_with(vec![ResolvedNumberingLevel {
+            indentation: Some(Indentation {
+                start: Some(Dimension::<Twips>::new(31_680)),
+                start_chars: Some(Dimension::<HundredthChars>::new(200)),
+                first_line: Some(FirstLineIndent::FirstLine(Dimension::new(31_680))),
+                first_line_chars: Some(FirstLineIndentChars::Hanging(Dimension::new(147))),
+                ..Default::default()
+            }),
+            ..decimal_level()
+        }]);
+        let (fragments, props) = inject(&resolved, &mut BuildState::default(), 0);
+
+        assert!(
+            props
+                .tabs
+                .iter()
+                .any(|tab| tab.position == Dimension::<Twips>::new(400)),
+            "2.00 characters at the 10pt specification default must become 20pt (400 twips)"
+        );
+        let label_width = fragments[0].width().raw();
+        match &fragments[1] {
+            Fragment::Tab { fitting_width, .. } => {
+                let got = fitting_width.unwrap().raw();
+                let expected = 10.0 * 1.47 - label_width;
+                assert!(
+                    (got - expected).abs() < 0.001,
+                    "expected {expected}, got {got}"
                 );
             }
             other => panic!("expected the separator tab, got {other:?}"),

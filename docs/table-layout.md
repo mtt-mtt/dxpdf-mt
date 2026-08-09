@@ -265,6 +265,18 @@ honoured inside table cells exactly as they are in the body. See
 gets a visible top edge, even though the measured top borders were suppressed
 or resolved away.
 
+### Footnotes in cells
+
+Cell layout records every footnote together with the line that contains its
+reference. Row splitting partitions those records with the same cut used for
+text commands, so a note follows the split half that owns its reference.
+
+The paginated table path measures note bodies at page content width and charges
+their height, plus one separator gap per page, while packing rows. Each
+`TableSlice` returns the complete notes referenced by that slice to the section
+stacker. Repeated header rows do not repeat their original footnotes on later
+pages.
+
 ## Related
 
 - [Floating Tables](floating-tables.md) — §17.4.58 `tblpPr` positioning.

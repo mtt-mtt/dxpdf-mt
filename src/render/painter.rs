@@ -139,6 +139,24 @@ pub fn render_to_pdf(
     registry: &FontRegistry,
     options: &RenderOptions,
 ) -> Result<Vec<u8>, RenderError> {
+    render_to_pdf_with_character_spacing_control(
+        pages,
+        registry,
+        options,
+        crate::model::CharacterSpacingControl::DoNotCompress,
+    )
+}
+
+/// Production paint entry point carrying the document-wide
+/// `w:characterSpacingControl` policy. The public helper above retains the
+/// spec-default behaviour for painter unit tests and external callers that
+/// already supply laid-out pages rather than a resolved DOCX document.
+pub(crate) fn render_to_pdf_with_character_spacing_control(
+    pages: &[LayoutedPage],
+    registry: &FontRegistry,
+    options: &RenderOptions,
+    character_spacing_control: crate::model::CharacterSpacingControl,
+) -> Result<Vec<u8>, RenderError> {
     let mut pdf_bytes: Vec<u8> = Vec::new();
     // §17.3.1.19: the outline is document-level, so its structure tree has to
     // exist before the first page — `pdf::new_document` takes it by reference
@@ -164,7 +182,14 @@ pub fn render_to_pdf(
         let mut on_page = doc.begin_page(to_size(page.page_size), None);
         {
             let canvas = on_page.canvas();
-            render_page(canvas, page, registry, &mut state, options);
+            render_page(
+                canvas,
+                page,
+                registry,
+                &mut state,
+                options,
+                character_spacing_control,
+            );
         }
         doc = on_page.end_page();
     }
@@ -214,6 +239,7 @@ fn render_page(
     registry: &FontRegistry,
     state: &mut PaintState,
     options: &RenderOptions,
+    character_spacing_control: crate::model::CharacterSpacingControl,
 ) {
     // Destructure into disjoint `&mut` field bindings — same borrow semantics as
     // the individual caches, so the paint body below is unchanged.
@@ -263,7 +289,13 @@ fn render_page(
                 italic,
                 color,
                 text_scale,
+                rotation_degrees,
             } => {
+                let rotated = rotation_degrees.abs() > f32::EPSILON;
+                if rotated {
+                    canvas.save();
+                    canvas.rotate(*rotation_degrees, Some(to_point(*position)));
+                }
                 let (slot, base_font) =
                     font_cache.get_indexed(registry, font_family, *font_size, *bold, *italic);
                 // §17.3.2.45: a non-1.0 scale is applied via Skia's scale_x —
@@ -293,7 +325,14 @@ fn render_page(
                 );
                 text_paint.set_color4f(to_color4f(*color), None);
 
-                if char_spacing.abs() > Pt::ZERO {
+                let compress_punctuation = matches!(
+                    character_spacing_control,
+                    crate::model::CharacterSpacingControl::CompressPunctuation
+                        | crate::model::CharacterSpacingControl::CompressPunctuationAndJapaneseKana
+                ) && text.chars().any(|ch| {
+                    crate::render::layout::fragment::punctuation_compression_side(ch).is_some()
+                });
+                if char_spacing.abs() > Pt::ZERO || compress_punctuation {
                     // §17.3.2.35 w:spacing — draw each character with
                     // explicit spacing to match the measured fragment width.
                     let char_count = text.chars().count();
@@ -324,8 +363,35 @@ fn render_page(
                         } else {
                             font.measure_str(&*s, None).0
                         };
-                        canvas.draw_str(&*s, to_point(cursor), font, &text_paint);
-                        cursor.x += Pt::new(w) + *char_spacing;
+                        let compression_side = if compress_punctuation {
+                            crate::render::layout::fragment::punctuation_compression_side(ch)
+                        } else {
+                            None
+                        };
+                        // Only full-width punctuation carries a removable
+                        // built-in blank. Proportional Latin quotes share the
+                        // same Unicode codepoints, so require a near-em glyph
+                        // advance before trimming them.
+                        let compression = if compression_side.is_some()
+                            && w >= font_size.raw() * *text_scale * 0.8
+                        {
+                            Pt::new(
+                                w * crate::render::layout::fragment::PUNCTUATION_COMPRESSION_RATIO,
+                            )
+                        } else {
+                            Pt::ZERO
+                        };
+                        let mut draw_cursor = cursor;
+                        if matches!(
+                            compression_side,
+                            Some(
+                                crate::render::layout::fragment::PunctuationCompressionSide::Leading
+                            )
+                        ) {
+                            draw_cursor.x -= compression;
+                        }
+                        canvas.draw_str(&*s, to_point(draw_cursor), font, &text_paint);
+                        cursor.x += Pt::new(w) + *char_spacing - compression;
                     }
                 } else if let Some(slot) = blob_slot {
                     // Common path: reuse a cached, position-independent glyph
@@ -341,6 +407,9 @@ fn render_page(
                     }
                 } else {
                     canvas.draw_str(text, to_point(*position), font, &text_paint);
+                }
+                if rotated {
+                    canvas.restore();
                 }
             }
             DrawCommand::Underline { line, color, width }
@@ -984,6 +1053,7 @@ mod tests {
                 italic: false,
                 color: RgbColor::BLACK,
                 text_scale: 1.0,
+                rotation_degrees: 0.0,
             }],
             page_size: PtSize::new(Pt::new(612.0), Pt::new(792.0)),
         };
@@ -1008,6 +1078,7 @@ mod tests {
                 italic: false,
                 color: RgbColor::BLACK,
                 text_scale: 1.0,
+                rotation_degrees: 0.0,
             }],
             page_size: PtSize::new(Pt::new(612.0), Pt::new(792.0)),
         };
@@ -1032,6 +1103,7 @@ mod tests {
                 italic: false,
                 color: RgbColor::BLACK,
                 text_scale: 1.0,
+                rotation_degrees: 0.0,
             }],
             page_size: PtSize::new(Pt::new(612.0), Pt::new(792.0)),
         };
@@ -1155,6 +1227,7 @@ mod tests {
                 italic: false,
                 color: RgbColor::BLACK,
                 text_scale: 1.0,
+                rotation_degrees: 0.0,
             }],
             page_size: PtSize::new(Pt::new(612.0), Pt::new(792.0)),
         };

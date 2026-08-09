@@ -4,6 +4,7 @@ use crate::render::dimension::Pt;
 use crate::render::geometry::{PtEdgeInsets, PtSize};
 use crate::render::resolve::color::RgbColor;
 
+use crate::model::TextDirection;
 use crate::render::layout::cell::CellLayout;
 use crate::render::layout::draw_command::DrawCommand;
 
@@ -71,6 +72,8 @@ pub struct TableCellInput {
     pub vertical_merge: Option<VerticalMergeState>,
     /// §17.4.84: vertical alignment of content within the cell.
     pub vertical_align: CellVAlign,
+    /// §17.4.70: resolved text flow direction for this cell.
+    pub text_direction: Option<TextDirection>,
 }
 
 /// §17.4.85: vertical merge state for a cell.

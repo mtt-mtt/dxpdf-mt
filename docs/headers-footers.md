@@ -66,6 +66,14 @@ Handled separately from `stack_blocks` because they use page-absolute coordinate
 
 Headers/footers are built **per-page** to evaluate PAGE and NUMPAGES fields correctly.
 
+When document-level `evenAndOddHeaders` is enabled, `w:pgNumType/@start`
+drives the first page's logical odd/even identity. For a later ordinary hard
+section, if an explicit restart has the opposite parity from the next physical
+sheet, document layout inserts a blank physical separator before the section.
+The separator belongs to neither adjacent section and therefore receives no
+header or footer. The document's first section is not preceded by such a page;
+explicit `oddPage`/`evenPage` starts use their own physical-parity rule.
+
 ### Two-Phase Layout (lib.rs)
 
 1. **Phase 1**: layout all sections → determine total page count

@@ -567,6 +567,7 @@ mod tests {
             italic: false,
             color: RgbColor::BLACK,
             text_scale: 1.0,
+            rotation_degrees: 0.0,
         });
 
         let config = test_config();
@@ -613,6 +614,7 @@ mod tests {
             italic: false,
             color: RgbColor::BLACK,
             text_scale: 1.0,
+            rotation_degrees: 0.0,
         });
 
         let config = test_config();

@@ -13,6 +13,9 @@ pub struct DocumentSettings {
     /// §17.15.3.1: apply the active section's document-grid line pitch to
     /// paragraphs inside table cells as well as body paragraphs.
     pub adjust_line_height_in_table: bool,
+    /// §17.15.1.18: document-wide compression of whitespace carried by
+    /// full-width punctuation (and, for the third mode, Japanese kana).
+    pub character_spacing_control: CharacterSpacingControl,
     /// The rsid of the original editing session that created this document.
     pub rsid_root: Option<RevisionSaveId>,
     /// All revision save IDs recorded in this document's history.
@@ -29,10 +32,21 @@ impl Default for DocumentSettings {
             default_tab_stop: Dimension::new(720),
             even_and_odd_headers: false,
             adjust_line_height_in_table: false,
+            character_spacing_control: CharacterSpacingControl::DoNotCompress,
             rsid_root: None,
             rsids: Vec::new(),
         }
     }
+}
+
+/// §17.18.10: character-level whitespace compression policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CharacterSpacingControl {
+    /// Spec default when `w:characterSpacingControl` is omitted.
+    #[default]
+    DoNotCompress,
+    CompressPunctuation,
+    CompressPunctuationAndJapaneseKana,
 }
 
 #[cfg(test)]
@@ -52,6 +66,10 @@ mod tests {
         let s = DocumentSettings::default();
         assert!(!s.even_and_odd_headers);
         assert!(!s.adjust_line_height_in_table);
+        assert_eq!(
+            s.character_spacing_control,
+            CharacterSpacingControl::DoNotCompress
+        );
         assert!(s.rsid_root.is_none());
         assert!(s.rsids.is_empty());
     }

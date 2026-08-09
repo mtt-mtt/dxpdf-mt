@@ -1,7 +1,9 @@
 //! Pure data types for section layout.
 
 use super::super::draw_command::{LayoutedPage, ResolvedEffect, ResolvedFill, ResolvedStroke};
+use super::super::float::ActiveFloat;
 use super::super::fragment::Fragment;
+use super::super::page::ColumnGeometry;
 use super::super::paragraph::ParagraphStyle;
 use super::super::table::TableRowInput;
 use crate::model::dimension::{Dimension, SixtieThousandthDeg};
@@ -53,9 +55,9 @@ impl WrapMode {
     }
 
     /// Whether the drawing participates in wrap-around text flow (i.e.,
-    /// should be registered as an active float). `None` and
+    /// should be registered as a side-wrapping active float). `None` and
     /// `TopAndBottom` don't — None is purely overlay; TopAndBottom is
-    /// handled by advancing `cursor_y` past the drawing on emit.
+    /// registered separately as a full-width vertical exclusion band.
     pub fn registers_as_wrap_float(self) -> bool {
         matches!(self, Self::Square(_) | Self::Tight(_) | Self::Through(_))
     }
@@ -104,7 +106,11 @@ pub struct FloatingImage {
     pub y: FloatingImageY,
     /// §20.4.2.14-18: text wrap mode (drives float registration + cursor advance).
     pub wrap_mode: WrapMode,
-    /// §20.4.2.3 distL/distR: horizontal distance from surrounding text.
+    /// §20.4.2.3 distT/distB/distL/distR: distance from surrounding text.
+    /// These are the effective values after wrap-element attributes override
+    /// the anchor attributes per edge.
+    pub dist_top: Pt,
+    pub dist_bottom: Pt,
     pub dist_left: Pt,
     pub dist_right: Pt,
     /// §20.4.2.3 @behindDoc: image is painted behind document text.
@@ -221,7 +227,10 @@ pub struct FloatingShape {
     pub flip_v: bool,
     /// §20.4.2.14-18: text wrap mode.
     pub wrap_mode: WrapMode,
-    /// §20.4.2.3 distL/distR — horizontal distance from surrounding text.
+    /// §20.4.2.3 distT/distB/distL/distR — effective distance from
+    /// surrounding text after wrap-element overrides.
+    pub dist_top: Pt,
+    pub dist_bottom: Pt,
     pub dist_left: Pt,
     pub dist_right: Pt,
     /// §20.4.2.3 @behindDoc — painted behind document text.
@@ -252,6 +261,16 @@ impl FloatingShape {
     }
 }
 
+/// One footnote reference and all paragraphs in its body.
+///
+/// Keeping the body grouped by reference is required when a paragraph or table
+/// row splits across pages: the reference count identifies whole notes, not
+/// individual footnote paragraphs.
+#[derive(Clone, Debug)]
+pub struct LayoutFootnote {
+    pub paragraphs: Vec<(Vec<Fragment>, ParagraphStyle)>,
+}
+
 /// A block ready for layout — either a paragraph or a table.
 ///
 /// The `Paragraph` variant is intentionally larger than `Table` (it carries
@@ -266,7 +285,7 @@ pub enum LayoutBlock {
         /// §17.3.1.23: force a page break before this paragraph.
         page_break_before: bool,
         /// Footnotes referenced in this paragraph — rendered at page bottom.
-        footnotes: Vec<(Vec<Fragment>, ParagraphStyle)>,
+        footnotes: Vec<LayoutFootnote>,
         /// §20.4.2.3: floating images anchored to this paragraph.
         floating_images: Vec<FloatingImage>,
         /// §14.5 / §20.1.2.2.35: floating DrawingML shapes anchored to this paragraph.
@@ -297,6 +316,25 @@ pub enum LayoutBlock {
 pub struct ContinuationState {
     pub page: LayoutedPage,
     pub cursor_y: Pt,
+    /// Physical page size of the outgoing section. A continuous section can
+    /// inherit the exact column cursor only when this geometry still applies.
+    pub page_size: PtSize,
+    /// Body top before footnote reservation.
+    pub page_top: Pt,
+    /// Body bottom before footnote reservation.
+    pub body_bottom: Pt,
+    /// Column geometry used to produce `current_col` and `column_top`.
+    pub columns: Vec<ColumnGeometry>,
+    /// 0-based column containing the outgoing section's terminal cursor.
+    pub current_col: usize,
+    /// Top of the active column flow region.
+    pub column_top: Pt,
+    /// Effective body bottom after footnote reservation.
+    pub bottom: Pt,
+    /// Floats from the shared physical page that still affect following text.
+    pub page_floats: Vec<ActiveFloat>,
+    /// Paragraph anchor used by paragraph-relative floating objects.
+    pub last_para_start_y: Pt,
 }
 
 #[cfg(test)]

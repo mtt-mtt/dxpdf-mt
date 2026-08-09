@@ -519,6 +519,7 @@ impl AnchorXml {
             self.wrap_tight,
             self.wrap_through,
             self.wrap_top_and_bottom,
+            distance,
         );
         Image {
             extent: Size::new(self.extent.cx, self.extent.cy),
@@ -583,6 +584,7 @@ fn pick_wrap(
     tight: Option<WrapTightThroughXml>,
     through: Option<WrapTightThroughXml>,
     top_and_bottom: Option<WrapTopAndBottomXml>,
+    anchor_distance: EdgeInsets<Emu>,
 ) -> TextWrap {
     if none.is_some() {
         return TextWrap::None;
@@ -590,10 +592,10 @@ fn pick_wrap(
     if let Some(s) = square {
         return TextWrap::Square {
             distance: EdgeInsets::new(
-                s.dist_t.unwrap_or_default(),
-                s.dist_r.unwrap_or_default(),
-                s.dist_b.unwrap_or_default(),
-                s.dist_l.unwrap_or_default(),
+                s.dist_t.unwrap_or(anchor_distance.top),
+                s.dist_r.unwrap_or(anchor_distance.right),
+                s.dist_b.unwrap_or(anchor_distance.bottom),
+                s.dist_l.unwrap_or(anchor_distance.left),
             ),
             wrap_text: s.wrap_text.into(),
         };
@@ -601,10 +603,10 @@ fn pick_wrap(
     if let Some(t) = tight {
         return TextWrap::Tight {
             distance: EdgeInsets::new(
-                Dimension::new(0),
-                t.dist_r.unwrap_or_default(),
-                Dimension::new(0),
-                t.dist_l.unwrap_or_default(),
+                anchor_distance.top,
+                t.dist_r.unwrap_or(anchor_distance.right),
+                anchor_distance.bottom,
+                t.dist_l.unwrap_or(anchor_distance.left),
             ),
             wrap_text: t.wrap_text.into(),
             polygon: t.polygon.and_then(polygon),
@@ -613,10 +615,10 @@ fn pick_wrap(
     if let Some(th) = through {
         return TextWrap::Through {
             distance: EdgeInsets::new(
-                Dimension::new(0),
-                th.dist_r.unwrap_or_default(),
-                Dimension::new(0),
-                th.dist_l.unwrap_or_default(),
+                anchor_distance.top,
+                th.dist_r.unwrap_or(anchor_distance.right),
+                anchor_distance.bottom,
+                th.dist_l.unwrap_or(anchor_distance.left),
             ),
             wrap_text: th.wrap_text.into(),
             polygon: th.polygon.and_then(polygon),
@@ -624,8 +626,8 @@ fn pick_wrap(
     }
     if let Some(tb) = top_and_bottom {
         return TextWrap::TopAndBottom {
-            distance_top: tb.dist_t.unwrap_or_default(),
-            distance_bottom: tb.dist_b.unwrap_or_default(),
+            distance_top: tb.dist_t.unwrap_or(anchor_distance.top),
+            distance_bottom: tb.dist_b.unwrap_or(anchor_distance.bottom),
         };
     }
     TextWrap::None
@@ -778,6 +780,72 @@ mod tests {
             TextWrap::Square { wrap_text, .. } => assert_eq!(*wrap_text, WrapText::BothSides),
             other => panic!("expected Square, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wrap_distances_fall_back_per_edge_and_explicit_zero_overrides_anchor() {
+        let img = parse_anchor(
+            r#"<anchor distT="45720" distB="45720" distL="114300" distR="114300"
+                      simplePos="0" relativeHeight="1"
+                      behindDoc="0" locked="0" allowOverlap="1">
+                <simplePos x="0" y="0"/>
+                <positionH relativeFrom="page"><posOffset>0</posOffset></positionH>
+                <positionV relativeFrom="page"><posOffset>0</posOffset></positionV>
+                <wrapSquare wrapText="bothSides" distT="0" distR="228600"/>
+                <extent cx="100" cy="100"/>
+                <effectExtent l="0" t="0" r="0" b="0"/>
+                <docPr id="30" name="distance precedence"/>
+                <graphic><graphicData/></graphic>
+            </anchor>"#,
+        );
+        let ImagePlacement::Anchor(anchor) = &img.placement else {
+            panic!("expected Anchor");
+        };
+        let TextWrap::Square { distance, .. } = &anchor.wrap else {
+            panic!("expected Square");
+        };
+        assert_eq!(distance.top.raw(), 0, "explicit child zero wins");
+        assert_eq!(distance.right.raw(), 228_600, "child value wins");
+        assert_eq!(
+            distance.bottom.raw(),
+            45_720,
+            "missing child edge falls back"
+        );
+        assert_eq!(
+            distance.left.raw(),
+            114_300,
+            "missing child edge falls back"
+        );
+    }
+
+    #[test]
+    fn top_and_bottom_missing_distances_fall_back_to_the_anchor() {
+        let img = parse_anchor(
+            r#"<anchor distT="127000" distB="254000" distL="0" distR="0"
+                      simplePos="0" relativeHeight="1"
+                      behindDoc="0" locked="0" allowOverlap="1">
+                <simplePos x="0" y="0"/>
+                <positionH relativeFrom="page"><posOffset>0</posOffset></positionH>
+                <positionV relativeFrom="page"><posOffset>0</posOffset></positionV>
+                <wrapTopAndBottom/>
+                <extent cx="100" cy="100"/>
+                <effectExtent l="0" t="0" r="0" b="0"/>
+                <docPr id="31" name="top-bottom fallback"/>
+                <graphic><graphicData/></graphic>
+            </anchor>"#,
+        );
+        let ImagePlacement::Anchor(anchor) = &img.placement else {
+            panic!("expected Anchor");
+        };
+        let TextWrap::TopAndBottom {
+            distance_top,
+            distance_bottom,
+        } = &anchor.wrap
+        else {
+            panic!("expected TopAndBottom");
+        };
+        assert_eq!(distance_top.raw(), 127_000);
+        assert_eq!(distance_bottom.raw(), 254_000);
     }
 
     #[test]

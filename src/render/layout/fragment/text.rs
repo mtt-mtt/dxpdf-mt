@@ -407,6 +407,7 @@ mod tests {
     fn cjk_text_exposes_breaks_without_whitespace() {
         assert_eq!(split_into_words("收费管理"), vec!["收", "费", "管", "理"]);
         assert_eq!(split_into_words("ABC收费"), vec!["ABC", "收", "费"]);
+        assert_eq!(split_into_words("×××。"), vec!["×", "×", "×。"]);
     }
 
     #[test]

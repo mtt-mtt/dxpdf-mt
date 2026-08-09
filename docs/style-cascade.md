@@ -16,6 +16,14 @@ For a **table cell paragraph**:
 4. Table style paragraph properties
 5. Document defaults (lowest)
 
+For a **table without an explicit `w:tblStyle`**, §17.4.63 applies no table
+style. The stylesheet's `w:type="table" w:default="1"` entry is not substituted
+for a missing reference. Table cell margins still cascade per side from direct
+`tblCellMar` through an explicitly associated table style; a side absent from
+the whole chain uses Word's effective default (0 twips top/bottom, 108 twips
+start/end, shown as 0.08in in Word's UI). An explicit zero remains distinct
+from an absent side.
+
 ## Document Defaults
 
 Document defaults (`w:docDefaults/w:pPrDefault`) provide the lowest-priority fallback for all paragraph properties. Common values:
@@ -53,3 +61,22 @@ In `resolve_paragraph_defaults` (build.rs):
 // Style:  spacing.before = None, spacing.line = Some(Auto(276))
 // Result: spacing.before = Some(240), spacing.line = Some(Auto(276))
 ```
+
+## Character-unit Paragraph Indents
+
+`startChars`/`leftChars`, `endChars`/`rightChars`, `firstLineChars`, and
+`hangingChars` are stored in hundredths of the resolved paragraph character
+width. They form a parallel cascade beside the twip-valued indent fields:
+
+- a non-zero character-unit value wins over its related absolute value;
+- an explicit zero clears the inherited character-unit value and exposes the
+  absolute-value cascade;
+- `hangingChars` wins over `firstLineChars`, just as `hanging` wins over
+  `firstLine`;
+- when non-zero `hangingChars` is present and `startChars`/`leftChars` is
+  absent, Word ignores the absolute start/left value. The continuation-line
+  start is the hanging width and the first-line offset is its negative.
+
+The last rule is important for compatibility documents that carry a very large
+legacy `w:left` value beside `w:hangingChars`. It is resolved from the effective
+paragraph font size at layout-build time; no value-specific threshold is used.

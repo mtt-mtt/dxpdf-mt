@@ -32,9 +32,10 @@ struct SideXml {
     w: Option<Dimension<Twips>>,
 }
 
-/// Conversion used for the table-level default (`<w:tblCellMar>`). Per
-/// OOXML §17.4.44 a table default has no further inheritance, so missing
-/// sides collapse to zero.
+/// Conversion to a fully resolved inset set. Parsing table properties uses
+/// `PartialEdgeInsets` below so style/default inheritance remains possible;
+/// this conversion is retained for callers that explicitly need zero-filled
+/// geometry.
 impl From<EdgeInsetsTwipsXml> for EdgeInsets<Twips> {
     fn from(x: EdgeInsetsTwipsXml) -> Self {
         Self::new(
