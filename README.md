@@ -10,6 +10,21 @@ dxpdf is an open-source, standalone DOCX-to-PDF conversion engine written in Rus
 
 Built by [nerdy.pro](https://nerdy.pro).
 
+This repository is the `mtt-mtt` compatibility and production-hardening branch
+of the upstream MIT-licensed project. It preserves upstream attribution and
+tracks additional Word/OOXML compatibility work. Until this repository creates
+its own tagged release, the crates.io and PyPI installation commands below refer
+to the upstream `dxpdf` 0.4 package.
+
+## Project status
+
+The current compatibility candidate is under qualification; it is not a claim
+of pixel-identical rendering for arbitrary Word or WPS documents. See:
+
+- [System architecture](docs/architecture/system-overview.md)
+- [Release gates](docs/quality/release-gates.md)
+- [Compatibility status](docs/quality/compatibility-status.md)
+
 ---
 
 ## Key Features
