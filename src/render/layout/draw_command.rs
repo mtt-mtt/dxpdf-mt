@@ -359,9 +359,27 @@ impl DrawCommand {
     }
 }
 
+/// One command in a physical page's ordered `behindDoc` layer.
+#[derive(Debug, Clone)]
+pub struct LayeredDrawCommand {
+    /// §20.4.2.3 `relativeHeight`; larger values paint later within the
+    /// behind-document layer.
+    pub relative_height: u32,
+    pub command: DrawCommand,
+}
+
 /// A fully laid-out page — ready for painting.
 #[derive(Debug, Clone)]
 pub struct LayoutedPage {
+    /// §20.4.2.3 `behindDoc=true` floating visuals.
+    ///
+    /// These commands are kept separate until painting so an object anchored
+    /// by a later paragraph cannot cover text (or a foreground float) that was
+    /// already emitted for the same physical page.  Storing them on the page,
+    /// rather than inserting at index zero in `commands`, also keeps deferred
+    /// header/footer composition from accidentally moving in front of the
+    /// background layer.
+    pub behind_doc_commands: Vec<LayeredDrawCommand>,
     pub commands: Vec<DrawCommand>,
     pub page_size: PtSize,
 }
@@ -369,9 +387,38 @@ pub struct LayoutedPage {
 impl LayoutedPage {
     pub fn new(page_size: PtSize) -> Self {
         Self {
+            behind_doc_commands: Vec::new(),
             commands: Vec::new(),
             page_size,
         }
+    }
+
+    /// Commands in their final paint order: behind-document visuals first,
+    /// followed by the ordinary page stream.
+    pub fn commands_in_paint_order(&self) -> impl Iterator<Item = &DrawCommand> {
+        self.behind_doc_commands
+            .iter()
+            .map(|layered| &layered.command)
+            .chain(self.commands.iter())
+    }
+
+    /// Insert one `behindDoc` command in stable `relativeHeight` order.
+    ///
+    /// Shapes emit their path followed by any text-box commands with the same
+    /// height. `partition_point(<=)` keeps those equal-height commands in
+    /// stable emission order while allowing a lower object discovered by a
+    /// later paragraph to move beneath an earlier one.
+    pub fn push_behind_doc_command(&mut self, relative_height: u32, command: DrawCommand) {
+        let index = self
+            .behind_doc_commands
+            .partition_point(|existing| existing.relative_height <= relative_height);
+        self.behind_doc_commands.insert(
+            index,
+            LayeredDrawCommand {
+                relative_height,
+                command,
+            },
+        );
     }
 }
 
@@ -431,8 +478,31 @@ mod tests {
     #[test]
     fn layouted_page_new() {
         let page = LayoutedPage::new(PtSize::new(Pt::new(612.0), Pt::new(792.0)));
+        assert!(page.behind_doc_commands.is_empty());
         assert!(page.commands.is_empty());
         assert_eq!(page.page_size.width.raw(), 612.0);
+    }
+
+    #[test]
+    fn behind_doc_commands_are_stably_sorted_by_relative_height() {
+        let mut page = LayoutedPage::new(PtSize::new(Pt::new(612.0), Pt::new(792.0)));
+        let rect = |x: f32| DrawCommand::Rect {
+            rect: PtRect::from_xywh(Pt::new(x), Pt::ZERO, Pt::new(1.0), Pt::new(1.0)),
+            color: RgbColor::BLACK,
+        };
+
+        page.push_behind_doc_command(20, rect(20.0));
+        page.push_behind_doc_command(10, rect(10.0));
+        page.push_behind_doc_command(20, rect(21.0));
+
+        let xs: Vec<f32> = page
+            .commands_in_paint_order()
+            .filter_map(|command| match command {
+                DrawCommand::Rect { rect, .. } => Some(rect.origin.x.raw()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(xs, vec![10.0, 20.0, 21.0]);
     }
 
     #[test]

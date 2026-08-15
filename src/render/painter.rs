@@ -88,7 +88,7 @@ fn build_outline_tree(pages: &[LayoutedPage]) -> Option<pdf::StructureElementNod
     let mut any = false;
 
     for page in pages {
-        for cmd in &page.commands {
+        for cmd in page.commands_in_paint_order() {
             let DrawCommand::Outline(OutlineMark::Begin(heading)) = cmd else {
                 continue;
             };
@@ -266,7 +266,7 @@ fn render_page(
     rect_paint.set_anti_alias(false);
     let default_paint = Paint::default();
 
-    for cmd in &page.commands {
+    for cmd in page.commands_in_paint_order() {
         match cmd {
             // §17.3.1.19: marked-content boundaries. The destination Skia gives
             // an outline entry is the union of the marks under its node, so the
@@ -1043,6 +1043,7 @@ mod tests {
     fn render_text_command_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
                 text: "Hello world".into(),
@@ -1068,6 +1069,7 @@ mod tests {
     fn render_text_with_char_spacing_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
                 text: "Spaced".into(),
@@ -1093,6 +1095,7 @@ mod tests {
     fn render_empty_text_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
                 text: Rc::from(""),
@@ -1133,6 +1136,7 @@ mod tests {
             PathVerb::Close,
         ];
         let page = LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Path {
                 origin: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
                 rotation: Dimension::new(0),
@@ -1177,6 +1181,7 @@ mod tests {
         use crate::render::resolve::shape_geometry::{PathVerb, SubPath};
 
         let page = LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Path {
                 origin: PtOffset::new(Pt::new(50.0), Pt::new(50.0)),
                 rotation: Dimension::new(0),
@@ -1217,6 +1222,7 @@ mod tests {
     fn render_unicode_text_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
                 text: "Ärzte für Ökologie — 日本語".into(),
@@ -1286,6 +1292,7 @@ mod tests {
             format: ImageFormat::Png,
         };
         let page = || LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Image {
                 rect: rect(72.0, 72.0),
                 image_data: media.clone(),
@@ -1321,6 +1328,7 @@ mod tests {
             format: ImageFormat::Png,
         };
         let page = || LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Image {
                 rect: rect(72.0, 72.0),
                 image_data: media.clone(),

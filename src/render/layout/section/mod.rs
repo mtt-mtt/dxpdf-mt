@@ -236,6 +236,7 @@ mod tests {
             dist_left: Pt::ZERO,
             dist_right: Pt::ZERO,
             behind_doc: false,
+            relative_height: 0,
         }
     }
 
@@ -243,6 +244,29 @@ mod tests {
         FloatingImage {
             y: FloatingImageY::Absolute(Pt::new(y)),
             ..floating_image(wrap_mode, height)
+        }
+    }
+
+    fn floating_shape(x: f32, behind_doc: bool, relative_height: u32) -> FloatingShape {
+        FloatingShape {
+            x: FloatingImageX::Absolute(Pt::new(x)),
+            y: FloatingImageY::RelativeToParagraph(Pt::ZERO),
+            size: PtSize::new(Pt::new(40.0), Pt::new(20.0)),
+            rotation: crate::model::dimension::Dimension::new(0),
+            flip_h: false,
+            flip_v: false,
+            wrap_mode: WrapMode::None,
+            dist_top: Pt::ZERO,
+            dist_bottom: Pt::ZERO,
+            dist_left: Pt::ZERO,
+            dist_right: Pt::ZERO,
+            behind_doc,
+            relative_height,
+            paths: vec![],
+            fill: crate::render::layout::draw_command::ResolvedFill::None,
+            stroke: None,
+            effects: vec![],
+            text_commands: vec![],
         }
     }
 
@@ -337,6 +361,190 @@ mod tests {
             floating_shapes,
             floating_images: vec![float],
         }
+    }
+
+    #[test]
+    fn body_behind_doc_float_uses_physical_page_background_layer() {
+        let mut background = floating_image(WrapMode::None, 30.0);
+        background.behind_doc = true;
+        let foreground = floating_image(WrapMode::None, 20.0);
+        let blocks = vec![
+            para_with_float("background owner", background, false),
+            para_with_float("foreground owner", foreground, false),
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0]
+                .behind_doc_commands
+                .iter()
+                .filter(|layered| matches!(layered.command, DrawCommand::Image { .. }))
+                .count(),
+            1,
+            "behindDoc image must leave the ordinary body stream"
+        );
+        assert_eq!(
+            pages[0]
+                .commands
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::Image { .. }))
+                .count(),
+            1,
+            "foreground image remains above body text"
+        );
+        assert!(matches!(
+            pages[0].commands_in_paint_order().next(),
+            Some(DrawCommand::Image { .. })
+        ));
+    }
+
+    #[test]
+    fn behind_shape_paints_before_same_paragraph_text_and_foreground_image() {
+        let mut foreground = floating_image(WrapMode::None, 20.0);
+        foreground.relative_height = 300;
+        let LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            ..
+        } = para_block("TITLE", 30.0)
+        else {
+            unreachable!()
+        };
+        let first = LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            floating_images: vec![foreground],
+            floating_shapes: vec![floating_shape(20.0, true, 200)],
+        };
+
+        // A lower background object discovered by a later paragraph must
+        // still paint beneath the first paragraph's background and text.
+        let LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            ..
+        } = para_block("AFTER", 30.0)
+        else {
+            unreachable!()
+        };
+        let second = LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            floating_images: vec![],
+            floating_shapes: vec![floating_shape(10.0, true, 100)],
+        };
+
+        let pages = layout_section(
+            &[first, second],
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+        let order: Vec<String> = pages[0]
+            .commands_in_paint_order()
+            .filter_map(|command| match command {
+                DrawCommand::Path { origin, .. } => Some(format!("path:{:.0}", origin.x.raw())),
+                DrawCommand::Text { text, .. } => Some(format!("text:{text}")),
+                DrawCommand::Image { .. } => Some("image".to_string()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            order,
+            vec!["path:10", "path:20", "text:TITLE", "image", "text:AFTER"]
+        );
+    }
+
+    #[test]
+    fn paragraph_overflow_restores_sorted_behind_doc_commands() {
+        let LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            ..
+        } = para_block("FIRST", 30.0)
+        else {
+            unreachable!()
+        };
+        let first = LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            floating_images: vec![],
+            floating_shapes: vec![floating_shape(20.0, true, 200)],
+        };
+
+        let mut moving_background = floating_shape(10.0, true, 100);
+        moving_background.wrap_mode = WrapMode::TopAndBottom;
+        let LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            ..
+        } = para_block("MOVES", 30.0)
+        else {
+            unreachable!()
+        };
+        let moving = LayoutBlock::Paragraph {
+            fragments,
+            style,
+            page_break_before,
+            footnotes,
+            floating_images: vec![],
+            floating_shapes: vec![moving_background],
+        };
+
+        let pages = layout_section(
+            &[first, empty_spacer_block(50.0), moving],
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages[0]
+                .behind_doc_commands
+                .iter()
+                .map(|command| command.relative_height)
+                .collect::<Vec<_>>(),
+            vec![200],
+            "rollback must restore the original page background, not the newly inserted lower-z object"
+        );
+        assert_eq!(
+            pages[1]
+                .behind_doc_commands
+                .iter()
+                .map(|command| command.relative_height)
+                .collect::<Vec<_>>(),
+            vec![100],
+            "the moved paragraph background must be emitted exactly once on its destination page"
+        );
     }
 
     fn image_xs(page: &crate::render::layout::draw_command::LayoutedPage) -> Vec<f32> {
@@ -4054,6 +4262,7 @@ mod tests {
                 dist_left: Pt::ZERO,
                 dist_right: Pt::ZERO,
                 behind_doc: false,
+                relative_height: 0,
             }],
             floating_shapes: vec![],
         }

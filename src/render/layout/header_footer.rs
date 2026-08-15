@@ -326,22 +326,28 @@ fn render_header(
 
     let mut header_cmds: Vec<DrawCommand> = Vec::new();
 
-    // §20.4.2.3 @behindDoc=true: paint behind text — emit before text commands.
+    // §20.4.2.3 @behindDoc=true: keep the visual in the physical page's
+    // dedicated background layer. Merely prepending it to `header_cmds` is not
+    // sufficient: the body stream is composed later and could otherwise be
+    // covered by a header-anchored background object.
     for fi in hf.floating_images.iter().filter(|fi| fi.behind_doc) {
         let img_y = match fi.y {
             super::section::FloatingImageY::Absolute(y) => y,
             super::section::FloatingImageY::RelativeToParagraph(off) => offset_y + off,
         };
-        header_cmds.push(DrawCommand::Image {
-            rect: crate::render::geometry::PtRect::from_xywh(
-                fi.x.resolve(parity),
-                img_y,
-                fi.size.width,
-                fi.size.height,
-            ),
-            image_data: fi.image_data.clone(),
-            src_rect: fi.src_rect,
-        });
+        page.push_behind_doc_command(
+            fi.relative_height,
+            DrawCommand::Image {
+                rect: crate::render::geometry::PtRect::from_xywh(
+                    fi.x.resolve(parity),
+                    img_y,
+                    fi.size.width,
+                    fi.size.height,
+                ),
+                image_data: fi.image_data.clone(),
+                src_rect: fi.src_rect,
+            },
+        );
     }
 
     // Text / table commands.
@@ -371,7 +377,7 @@ fn render_header(
     // y depends on the host paragraph). Page-anchored shapes were resolved
     // in `Page` frame so their absolute y is authoritative — emit them here
     // without applying the header's offset shift.
-    emit_page_anchored_shapes(&hf.floating_shapes, parity, &mut header_cmds);
+    emit_page_anchored_shapes(&hf.floating_shapes, parity, page, &mut header_cmds);
 
     // Prepend header commands before body content.
     header_cmds.append(&mut page.commands);
@@ -395,22 +401,25 @@ fn render_footer(
 
     let footer_y = config.page_size.height - config.footer_margin - result.height;
 
-    // §20.4.2.3 @behindDoc=true: paint behind text.
+    // §20.4.2.3 @behindDoc=true: paint in the physical page background layer.
     for fi in hf.floating_images.iter().filter(|fi| fi.behind_doc) {
         let img_y = match fi.y {
             super::section::FloatingImageY::Absolute(y) => y,
             super::section::FloatingImageY::RelativeToParagraph(off) => footer_y + off,
         };
-        page.commands.push(DrawCommand::Image {
-            rect: crate::render::geometry::PtRect::from_xywh(
-                fi.x.resolve(parity),
-                img_y,
-                fi.size.width,
-                fi.size.height,
-            ),
-            image_data: fi.image_data.clone(),
-            src_rect: fi.src_rect,
-        });
+        page.push_behind_doc_command(
+            fi.relative_height,
+            DrawCommand::Image {
+                rect: crate::render::geometry::PtRect::from_xywh(
+                    fi.x.resolve(parity),
+                    img_y,
+                    fi.size.width,
+                    fi.size.height,
+                ),
+                image_data: fi.image_data.clone(),
+                src_rect: fi.src_rect,
+            },
+        );
     }
 
     for mut cmd in result.commands {
@@ -439,7 +448,9 @@ fn render_footer(
     // y depends on the host paragraph). Page-anchored shapes were resolved
     // in `Page` frame so their absolute y is authoritative — emit them here
     // without applying the footer's stack shift.
-    emit_page_anchored_shapes(&hf.floating_shapes, parity, &mut page.commands);
+    let mut page_shape_commands = Vec::new();
+    emit_page_anchored_shapes(&hf.floating_shapes, parity, page, &mut page_shape_commands);
+    page.commands.extend(page_shape_commands);
 }
 
 /// Emit page-anchored floating shapes (§20.4.2.10 vertical anchor =
@@ -450,7 +461,8 @@ fn render_footer(
 fn emit_page_anchored_shapes(
     shapes: &[super::section::FloatingShape],
     parity: PageParity,
-    out: &mut Vec<DrawCommand>,
+    page: &mut LayoutedPage,
+    foreground_out: &mut Vec<DrawCommand>,
 ) {
     use super::section::FloatingImageY;
     for fs in shapes {
@@ -461,7 +473,7 @@ fn emit_page_anchored_shapes(
             // skip it rather than stacking on a non-existent paragraph.
             FloatingImageY::RelativeToParagraph(_) => continue,
         };
-        out.push(DrawCommand::Path {
+        let path = DrawCommand::Path {
             origin: crate::render::geometry::PtOffset::new(fs.x.resolve(parity), shape_y),
             rotation: fs.rotation,
             flip_h: fs.flip_h,
@@ -471,10 +483,19 @@ fn emit_page_anchored_shapes(
             fill: fs.fill.clone(),
             stroke: fs.stroke.clone(),
             effects: fs.effects.clone(),
-        });
+        };
+        if fs.behind_doc {
+            page.push_behind_doc_command(fs.relative_height, path);
+        } else {
+            foreground_out.push(path);
+        }
         for mut cmd in fs.text_commands.iter().cloned() {
             cmd.shift(fs.x.resolve(parity), shape_y);
-            out.push(cmd);
+            if fs.behind_doc {
+                page.push_behind_doc_command(fs.relative_height, cmd);
+            } else {
+                foreground_out.push(cmd);
+            }
         }
     }
 }

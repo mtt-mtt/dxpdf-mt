@@ -115,6 +115,8 @@ pub struct FloatingImage {
     pub dist_right: Pt,
     /// §20.4.2.3 @behindDoc: image is painted behind document text.
     pub behind_doc: bool,
+    /// §20.4.2.3 @relativeHeight: z-order within the selected paint layer.
+    pub relative_height: u32,
 }
 
 impl FloatingImage {
@@ -235,6 +237,8 @@ pub struct FloatingShape {
     pub dist_right: Pt,
     /// §20.4.2.3 @behindDoc — painted behind document text.
     pub behind_doc: bool,
+    /// §20.4.2.3 @relativeHeight: z-order within the selected paint layer.
+    pub relative_height: u32,
     /// Path subpaths in shape-local Pt (already scaled into `size`).
     pub paths: Vec<SubPath>,
     /// Resolved fill.

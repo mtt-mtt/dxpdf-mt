@@ -90,7 +90,7 @@ pub fn collect(pages: &[LayoutedPage], registry: &FontRegistry) -> CodepointUsag
         std::array::from_fn(|_| FxHashMap::default());
 
     for page in pages {
-        for cmd in &page.commands {
+        for cmd in page.commands_in_paint_order() {
             if let DrawCommand::Text {
                 text,
                 font_family,
@@ -131,6 +131,7 @@ mod tests {
 
     fn page_with_text(text: &str, family: &str, font_size: Pt, bold: bool) -> LayoutedPage {
         LayoutedPage {
+            behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
                 text: Rc::from(text),
@@ -226,6 +227,19 @@ mod tests {
         let cps = usage.per_typeface.values().next().unwrap();
         let expected: BTreeSet<Codepoint> =
             ['a', 'b', 'c'].into_iter().map(Codepoint::from).collect();
+        assert_eq!(cps, &expected);
+    }
+
+    #[test]
+    fn collect_includes_text_from_behind_doc_layer() {
+        let r = registry();
+        let mut page = page_with_text("bg", "BackgroundProbe", Pt::new(12.0), false);
+        let command = page.commands.pop().unwrap();
+        page.push_behind_doc_command(1, command);
+
+        let usage = collect(&[page], &r);
+        let cps = usage.per_typeface.values().next().unwrap();
+        let expected: BTreeSet<Codepoint> = ['b', 'g'].into_iter().map(Codepoint::from).collect();
         assert_eq!(cps, &expected);
     }
 

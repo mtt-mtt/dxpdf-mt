@@ -170,6 +170,7 @@ pub(super) fn extract_floating_images(
             dist_left: Pt::from(wrap_distance.left),
             dist_right: Pt::from(wrap_distance.right),
             behind_doc: anchor.behind_text,
+            relative_height: anchor.relative_height,
         });
     }
 
@@ -350,6 +351,7 @@ pub(super) fn extract_floating_shapes(
             dist_left: Pt::from(wrap_distance.left),
             dist_right: Pt::from(wrap_distance.right),
             behind_doc: anchor.behind_text,
+            relative_height: anchor.relative_height,
             paths: shape_path.paths,
             fill: visuals.fill,
             stroke,
@@ -521,6 +523,7 @@ fn build_vml_floating_image(
         dist_left: Pt::ZERO,
         dist_right: Pt::ZERO,
         behind_doc: false,
+        relative_height: 0,
     })
 }
 
@@ -917,6 +920,7 @@ fn build_vml_rect_shape(
         // §14.1.2 z-index drives layering. For Tier 0 we treat all
         // VML primitives as non-behind-text (drawn in document order).
         behind_doc: false,
+        relative_height: 0,
         paths,
         fill,
         stroke,

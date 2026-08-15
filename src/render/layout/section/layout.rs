@@ -1,6 +1,6 @@
 //! Core section layout — the `layout_section()` function and its private state types.
 
-use super::super::draw_command::{DrawCommand, LayoutedPage};
+use super::super::draw_command::{DrawCommand, LayeredDrawCommand, LayoutedPage};
 use super::super::float;
 use super::super::fragment::Fragment;
 use super::super::header_footer::{HeaderFooterClearance, PageBodyBounds};
@@ -446,6 +446,7 @@ impl PageFootnote<'_> {
 
 struct ParagraphFloatCheckpoint {
     command_count: usize,
+    behind_doc_commands: Vec<LayeredDrawCommand>,
     page_floats: Vec<float::ActiveFloat>,
     cursor_y: Pt,
 }
@@ -545,6 +546,7 @@ impl ParagraphFloatCheckpoint {
     fn capture(state: &PageLayoutState<'_>) -> Self {
         Self {
             command_count: state.current_page.commands.len(),
+            behind_doc_commands: state.current_page.behind_doc_commands.clone(),
             page_floats: state.page_floats.clone(),
             cursor_y: state.cursor_y,
         }
@@ -552,8 +554,27 @@ impl ParagraphFloatCheckpoint {
 
     fn restore(&self, state: &mut PageLayoutState<'_>) {
         state.current_page.commands.truncate(self.command_count);
+        state
+            .current_page
+            .behind_doc_commands
+            .clone_from(&self.behind_doc_commands);
         state.page_floats.clone_from(&self.page_floats);
         state.cursor_y = self.cursor_y;
+    }
+}
+
+fn push_floating_command(
+    state: &mut PageLayoutState<'_>,
+    behind_doc: bool,
+    relative_height: u32,
+    command: DrawCommand,
+) {
+    if behind_doc {
+        state
+            .current_page
+            .push_behind_doc_command(relative_height, command);
+    } else {
+        state.current_page.commands.push(command);
     }
 }
 
@@ -566,7 +587,7 @@ fn emit_shape_text(state: &mut PageLayoutState<'_>, fs: &FloatingShape, shape_y:
     let parity = state.parity();
     for mut cmd in fs.text_commands.iter().cloned() {
         cmd.shift(fs.x.resolve(parity), shape_y);
-        state.current_page.commands.push(cmd);
+        push_floating_command(state, fs.behind_doc, fs.relative_height, cmd);
     }
 }
 
@@ -587,11 +608,21 @@ fn register_paragraph_floats(
         let y_start = img_y - fi.dist_top;
         let y_end = img_y + fi.size.height + fi.dist_bottom;
         if fi.is_wrap_top_and_bottom() {
-            state.current_page.commands.push(DrawCommand::Image {
-                rect: PtRect::from_xywh(fi.x.resolve(parity), img_y, fi.size.width, fi.size.height),
-                image_data: fi.image_data.clone(),
-                src_rect: fi.src_rect,
-            });
+            push_floating_command(
+                state,
+                fi.behind_doc,
+                fi.relative_height,
+                DrawCommand::Image {
+                    rect: PtRect::from_xywh(
+                        fi.x.resolve(parity),
+                        img_y,
+                        fi.size.width,
+                        fi.size.height,
+                    ),
+                    image_data: fi.image_data.clone(),
+                    src_rect: fi.src_rect,
+                },
+            );
             state.page_floats.push(float::ActiveFloat {
                 page_x: content_x,
                 page_y_start: y_start,
@@ -633,17 +664,22 @@ fn register_paragraph_floats(
         let y_start = shape_y - fs.dist_top;
         let y_end = shape_y + fs.size.height + fs.dist_bottom;
         if fs.is_wrap_top_and_bottom() {
-            state.current_page.commands.push(DrawCommand::Path {
-                origin: crate::render::geometry::PtOffset::new(fs.x.resolve(parity), shape_y),
-                rotation: fs.rotation,
-                flip_h: fs.flip_h,
-                flip_v: fs.flip_v,
-                extent: fs.size,
-                paths: fs.paths.clone(),
-                fill: fs.fill.clone(),
-                stroke: fs.stroke.clone(),
-                effects: fs.effects.clone(),
-            });
+            push_floating_command(
+                state,
+                fs.behind_doc,
+                fs.relative_height,
+                DrawCommand::Path {
+                    origin: crate::render::geometry::PtOffset::new(fs.x.resolve(parity), shape_y),
+                    rotation: fs.rotation,
+                    flip_h: fs.flip_h,
+                    flip_v: fs.flip_v,
+                    extent: fs.size,
+                    paths: fs.paths.clone(),
+                    fill: fs.fill.clone(),
+                    stroke: fs.stroke.clone(),
+                    effects: fs.effects.clone(),
+                },
+            );
             emit_shape_text(state, fs, shape_y);
             state.page_floats.push(float::ActiveFloat {
                 page_x: content_x,
@@ -2671,16 +2707,21 @@ pub(crate) fn layout_section_with_clearance_result(
                             para_start_y + effective_style.space_before + offset
                         }
                     };
-                    state.current_page.commands.push(DrawCommand::Image {
-                        rect: PtRect::from_xywh(
-                            fi.x.resolve(parity),
-                            img_y,
-                            fi.size.width,
-                            fi.size.height,
-                        ),
-                        image_data: fi.image_data.clone(),
-                        src_rect: fi.src_rect,
-                    });
+                    push_floating_command(
+                        &mut state,
+                        fi.behind_doc,
+                        fi.relative_height,
+                        DrawCommand::Image {
+                            rect: PtRect::from_xywh(
+                                fi.x.resolve(parity),
+                                img_y,
+                                fi.size.width,
+                                fi.size.height,
+                            ),
+                            image_data: fi.image_data.clone(),
+                            src_rect: fi.src_rect,
+                        },
+                    );
                 }
 
                 // §20.4.2: emit floating DrawingML shapes after the
@@ -2697,20 +2738,25 @@ pub(crate) fn layout_section_with_clearance_result(
                             para_start_y + effective_style.space_before + offset
                         }
                     };
-                    state.current_page.commands.push(DrawCommand::Path {
-                        origin: crate::render::geometry::PtOffset::new(
-                            fs.x.resolve(parity),
-                            shape_y,
-                        ),
-                        rotation: fs.rotation,
-                        flip_h: fs.flip_h,
-                        flip_v: fs.flip_v,
-                        extent: fs.size,
-                        paths: fs.paths.clone(),
-                        fill: fs.fill.clone(),
-                        stroke: fs.stroke.clone(),
-                        effects: fs.effects.clone(),
-                    });
+                    push_floating_command(
+                        &mut state,
+                        fs.behind_doc,
+                        fs.relative_height,
+                        DrawCommand::Path {
+                            origin: crate::render::geometry::PtOffset::new(
+                                fs.x.resolve(parity),
+                                shape_y,
+                            ),
+                            rotation: fs.rotation,
+                            flip_h: fs.flip_h,
+                            flip_v: fs.flip_v,
+                            extent: fs.size,
+                            paths: fs.paths.clone(),
+                            fill: fs.fill.clone(),
+                            stroke: fs.stroke.clone(),
+                            effects: fs.effects.clone(),
+                        },
+                    );
                     emit_shape_text(&mut state, fs, shape_y);
                 }
 

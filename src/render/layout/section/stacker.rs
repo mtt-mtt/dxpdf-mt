@@ -482,6 +482,7 @@ mod tests {
             dist_left: Pt::ZERO,
             dist_right: Pt::ZERO,
             behind_doc: false,
+            relative_height: 0,
         }
     }
 

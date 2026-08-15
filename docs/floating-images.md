@@ -305,6 +305,24 @@ Wrapping mode determines how text flows around the image:
   line resumes below it
 - `wrapNone` — no text wrapping, image overlays text (behind or in front based on `behindDoc`)
 
+## Painting Layers
+
+`wp:anchor/@behindDoc` controls painting independently of wrapping. Top-level
+section-body floats and directly composed header/footer floats with
+`behindDoc="1"` are accumulated in a physical page background layer and painted
+before the ordinary page stream. This is a page-level bucket rather than a
+local paragraph reorder: a background object anchored by a later paragraph
+must not cover text that was already laid out on the same page. Floats nested
+inside table cells and paragraph-stacked header/footer content still use the
+ordinary stream and remain a separate compatibility item.
+
+Within that layer, `wp:anchor/@relativeHeight` is ascending z-order. Commands
+with the same height keep stable renderer emission order, and a shape's
+geometry stays before its own text-box commands. Images and shapes are still
+extracted into separate collections, so full OOXML cross-type source order is
+tracked separately from this `behindDoc` invariant. Foreground objects likewise
+retain the normal body stream order.
+
 ## Forward-Scan for Absolute Floats
 
 Word uses multi-pass layout where all floats on a page affect all text. Our single-pass renderer approximates this with forward-scanning:
