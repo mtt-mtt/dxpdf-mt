@@ -26,6 +26,7 @@ fn empty_document() -> Document {
         footers: HashMap::new(),
         footnotes: HashMap::new(),
         endnotes: HashMap::new(),
+        charts: HashMap::new(),
         media: HashMap::new(),
         embedded_fonts: vec![],
     }

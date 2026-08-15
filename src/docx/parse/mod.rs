@@ -2,6 +2,7 @@
 
 pub mod body;
 pub mod body_schema;
+pub mod chart;
 pub mod drawing;
 pub mod fonts;
 pub mod notes;
@@ -116,6 +117,44 @@ pub fn parse_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Document
         if let Some(data) = package.get_part(&media_path).map(Arc::<[u8]>::from) {
             let fmt = ImageFormat::detect(&rel.target, &data);
             media.insert(rel.id.clone(), (data, fmt));
+        }
+    }
+
+    // Cached DrawingML charts. The first chart tier supports only
+    // single-series 2-D pie/doughnut parts and deliberately ignores any
+    // `externalData` workbook relationship: cached values in chart XML are
+    // deterministic and sufficient for rendering.
+    let mut charts = HashMap::new();
+    for rel in doc_rels.filter_by_type(&RelationshipType::Chart) {
+        if !matches!(
+            rel.target_mode,
+            crate::docx::relationships::TargetMode::Internal
+        ) {
+            continue;
+        }
+        let chart_path = zip::resolve_target(doc_dir, &rel.target);
+        let Some(data) = package.get_part(&chart_path) else {
+            log::warn!(
+                "chart relationship {} targets missing part {}",
+                rel.id.as_str(),
+                chart_path
+            );
+            continue;
+        };
+        match chart::parse_chart(data) {
+            Ok(Some(chart)) => {
+                charts.insert(rel.id.clone(), chart);
+            }
+            Ok(None) => log::warn!(
+                "chart relationship {} is not a cached single-series 2-D pie/doughnut",
+                rel.id.as_str()
+            ),
+            Err(error) => log::warn!(
+                "chart relationship {} failed to parse part {}: {}",
+                rel.id.as_str(),
+                chart_path,
+                error
+            ),
         }
     }
 
@@ -245,6 +284,7 @@ pub fn parse_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Document
         footers,
         footnotes,
         endnotes,
+        charts,
         media,
         embedded_fonts,
     })
@@ -256,7 +296,7 @@ pub fn parse_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Document
 /// `rId1` in a header is unrelated to an `rId1` in the document, in
 /// a footer, or in another header.
 ///
-/// To make the parsed `Document` collision-free we synthesize **two**
+/// To make the parsed `Document` collision-free we synthesize **three**
 /// kinds of remap entries here and return them as one combined map
 /// the caller applies via `rel_rewrite::rewrite_part_rels_in_blocks`:
 ///
@@ -270,6 +310,10 @@ pub fn parse_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Document
 ///   `doc_rels` for every part, which silently re-targeted any
 ///   header/footer/note hyperlink whose rId happened to mean
 ///   something different in the document's own rels.
+/// * **Chart rels** — subordinate-part charts are not loaded by the first
+///   chart tier, but their ids are still rewritten to unique keys. This makes
+///   them safely degrade to omitted instead of accidentally resolving to a
+///   same-named main-story chart.
 ///
 /// Other relationship types (font tables, OLE objects, custom XML, …)
 /// are not modeled in the block tree yet and are skipped.
@@ -306,6 +350,14 @@ fn load_part_rel_remap(
     // already treats a URL-shaped RelId as an external link target.
     for link_rel in rels.filter_by_type(&RelationshipType::Hyperlink) {
         remap.insert(link_rel.id.clone(), RelId::new(link_rel.target.clone()));
+    }
+
+    // Preserve the part-local namespace even though this first chart tier
+    // loads only main-story chart parts. A missing unique key is safe; leaving
+    // the original rId could render an unrelated body chart by collision.
+    for chart_rel in rels.filter_by_type(&RelationshipType::Chart) {
+        let unique_id = RelId::new(format!("{}::{}", part_path, chart_rel.id.as_str()));
+        remap.insert(chart_rel.id.clone(), unique_id);
     }
 
     Ok(remap)

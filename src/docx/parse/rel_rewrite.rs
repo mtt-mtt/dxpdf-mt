@@ -9,6 +9,7 @@
 //! the rId is meaningful only with respect to the part it lives in.
 //!
 //! `Document.media` is a single document-wide `HashMap<RelId, _>`,
+//! `Document.media` and `Document.charts` are both document-wide maps,
 //! so a header part's `rId1` can't be allowed to collide with a
 //! footer part's `rId1` (the second loader would silently overwrite
 //! the first). For each subordinate part the caller (`mod.rs`'s
@@ -19,6 +20,9 @@
 //! * **hyperlink rIds** → the resolved external URL (carried as a
 //!   `RelId`-shaped string, the same way the document-level
 //!   hyperlink resolver represents a resolved external link).
+//! * **chart rIds** → globally unique synthesized ids. Subordinate charts are
+//!   not loaded by the first chart tier, so these safely remain unresolved
+//!   rather than colliding with a main-story chart.
 //!
 //! [`rewrite_part_rels_in_blocks`] walks the block tree once and
 //! applies the remap to every relationship-bearing node it knows
@@ -120,6 +124,11 @@ fn rewrite_in_image(image: &mut Image, remap: &HashMap<RelId, RelId>) {
             }
             GraphicContent::WordProcessingShape(wsp) => {
                 rewrite_in_word_processing_shape(wsp, remap);
+            }
+            GraphicContent::Chart(chart) => {
+                if let Some(new_id) = remap.get(&chart.rel_id) {
+                    chart.rel_id = new_id.clone();
+                }
             }
         }
     }
@@ -345,6 +354,29 @@ mod tests {
         };
         let new = crate::render::resolve::images::extract_image_rel_id(img).unwrap();
         assert_eq!(new.as_str(), "header3.xml::rId1");
+    }
+
+    #[test]
+    fn rewrites_chart_relationship_to_part_unique_id() {
+        let mut image = picture_with_blip("unused");
+        image.graphic = Some(GraphicContent::Chart(ChartReference {
+            rel_id: RelId::new("rId1"),
+        }));
+        let mut blocks = vec![paragraph_with_image(image)];
+        let remap = remap_one("rId1", "word/header1.xml::rId1");
+
+        rewrite_part_rels_in_blocks(&mut blocks, &remap);
+
+        let Block::Paragraph(paragraph) = &blocks[0] else {
+            panic!();
+        };
+        let Inline::Image(image) = &paragraph.content[0] else {
+            panic!();
+        };
+        let Some(GraphicContent::Chart(chart)) = image.graphic.as_ref() else {
+            panic!();
+        };
+        assert_eq!(chart.rel_id.as_str(), "word/header1.xml::rId1");
     }
 
     #[test]

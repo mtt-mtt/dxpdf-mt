@@ -79,7 +79,7 @@ fn find_anchor_images<'a>(
             // branch owns their layout path end-to-end.
             Inline::Image(img)
                 if matches!(img.placement, ImagePlacement::Anchor(_))
-                    && !matches!(img.graphic, Some(GraphicContent::WordProcessingShape(_))) =>
+                    && matches!(img.graphic, Some(GraphicContent::Picture(_))) =>
             {
                 out.push(img);
             }
@@ -194,7 +194,10 @@ fn find_anchor_shapes<'a>(
         match inline {
             Inline::Image(img)
                 if matches!(img.placement, ImagePlacement::Anchor(_))
-                    && matches!(img.graphic, Some(GraphicContent::WordProcessingShape(_))) =>
+                    && matches!(
+                        img.graphic,
+                        Some(GraphicContent::WordProcessingShape(_) | GraphicContent::Chart(_))
+                    ) =>
             {
                 out.push(img);
             }
@@ -255,6 +258,49 @@ pub(super) fn extract_floating_shapes(
             ShapeAnchorClass::PageAnchored => !anchors_to_paragraph(anchor),
         };
         if !class_match {
+            continue;
+        }
+        if let Some(GraphicContent::Chart(reference)) = img.graphic.as_ref() {
+            let Some(chart) = ctx.resolved.charts.get(&reference.rel_id) else {
+                log::warn!(
+                    "chart anchor: rel_id={} missing from supported chart table",
+                    reference.rel_id.as_str()
+                );
+                continue;
+            };
+            let w = Pt::from(img.extent.width);
+            let h = Pt::from(img.extent.height);
+            let extent = PtSize::new(w, h);
+            let commands = super::chart::build_chart_commands(chart, extent, ctx);
+            if commands.is_empty() {
+                continue;
+            }
+            let (x, y) = resolve_anchor_position(anchor, w, h, state, frame);
+            let wrap_distance = effective_wrap_distance(anchor);
+            // Reuse the floating-shape carrier for a flat group of chart-local
+            // commands. The empty outer path paints nothing; `text_commands`
+            // already accepts arbitrary DrawCommands and is shifted/emitted
+            // through the same behindDoc/relativeHeight path as shape text.
+            shapes.push(FloatingShape {
+                x,
+                y,
+                size: extent,
+                rotation: crate::model::dimension::Dimension::new(0),
+                flip_h: false,
+                flip_v: false,
+                wrap_mode: crate::render::layout::section::WrapMode::from_model(&anchor.wrap),
+                dist_top: Pt::from(wrap_distance.top),
+                dist_bottom: Pt::from(wrap_distance.bottom),
+                dist_left: Pt::from(wrap_distance.left),
+                dist_right: Pt::from(wrap_distance.right),
+                behind_doc: anchor.behind_text,
+                relative_height: anchor.relative_height,
+                paths: Vec::new(),
+                fill: crate::render::layout::draw_command::ResolvedFill::None,
+                stroke: None,
+                effects: Vec::new(),
+                text_commands: commands,
+            });
             continue;
         }
         let wsp = match img.graphic.as_ref() {
@@ -2112,6 +2158,7 @@ mod tests {
             numbering: HashMap::new(),
             font_families: Vec::new(),
             media: HashMap::new(),
+            charts: HashMap::new(),
             embedded_fonts: Vec::new(),
             pic_bullets: HashMap::new(),
             theme: None,

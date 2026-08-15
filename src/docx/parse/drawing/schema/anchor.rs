@@ -13,8 +13,9 @@ use serde::Deserialize;
 use crate::docx::dimension::{Dimension, Emu};
 use crate::docx::geometry::{EdgeInsets, Offset, Size};
 use crate::docx::model::{
-    AnchorAlignment, AnchorPosition, AnchorProperties, AnchorRelativeFrom, DocProperties,
-    GraphicContent, GraphicFrameLocks, Image, ImagePlacement, TextWrap, WrapPolygon, WrapText,
+    AnchorAlignment, AnchorPosition, AnchorProperties, AnchorRelativeFrom, ChartReference,
+    DocProperties, GraphicContent, GraphicFrameLocks, Image, ImagePlacement, RelId, TextWrap,
+    WrapPolygon, WrapText,
 };
 use crate::docx::parse::primitives::units::{
     deserialize_nonnegative_dimension, deserialize_optional_nonnegative_dimension,
@@ -131,7 +132,7 @@ impl From<CNvGraphicFramePrXml> for GraphicFrameLocks {
     }
 }
 
-/// `<a:graphic>` → `<a:graphicData>` → `<pic:pic>` or `<wps:wsp>`.
+/// `<a:graphic>` → `<a:graphicData>` → picture, shape, or chart reference.
 #[derive(Deserialize)]
 pub(crate) struct GraphicXml {
     #[serde(rename = "graphicData", default)]
@@ -144,6 +145,14 @@ pub(crate) struct GraphicDataXml {
     pub(crate) pic: Option<PictureXml>,
     #[serde(rename = "wsp", default)]
     pub(crate) wsp: Option<WspXml>,
+    #[serde(rename = "chart", default)]
+    pub(crate) chart: Option<ChartReferenceXml>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ChartReferenceXml {
+    #[serde(rename = "@r:id", alias = "@id", default)]
+    pub(crate) rel_id: Option<String>,
 }
 
 impl GraphicXml {
@@ -154,9 +163,15 @@ impl GraphicXml {
         let data = self.data?;
         if let Some(pic) = data.pic {
             Some(GraphicContent::Picture(pic.into()))
+        } else if let Some(wsp) = data.wsp {
+            Some(GraphicContent::WordProcessingShape(wsp.into_model(ctx)))
         } else {
-            data.wsp
-                .map(|w| GraphicContent::WordProcessingShape(w.into_model(ctx)))
+            data.chart.and_then(|chart| {
+                let rel_id = chart.rel_id.filter(|rel_id| !rel_id.is_empty())?;
+                Some(GraphicContent::Chart(ChartReference {
+                    rel_id: RelId::new(rel_id),
+                }))
+            })
         }
     }
 }
@@ -1017,5 +1032,49 @@ mod tests {
             img.graphic,
             Some(GraphicContent::WordProcessingShape(_))
         ));
+    }
+
+    #[test]
+    fn chart_anchor_preserves_relationship_and_z_order() {
+        let img = parse_anchor(
+            r#"<anchor distT="0" distB="0" distL="0" distR="0"
+                      simplePos="0" relativeHeight="391168"
+                      behindDoc="1" locked="0" allowOverlap="1">
+                <simplePos x="0" y="0"/>
+                <positionH relativeFrom="column"><posOffset>33121</posOffset></positionH>
+                <positionV relativeFrom="paragraph"><posOffset>477407</posOffset></positionV>
+                <wrapNone/>
+                <extent cx="3081399" cy="1791540"/>
+                <docPr id="22" name="Chart 1"/>
+                <graphic><graphicData>
+                    <chart r:id="rId12"/>
+                </graphicData></graphic>
+            </anchor>"#,
+        );
+        let ImagePlacement::Anchor(anchor) = &img.placement else {
+            panic!("expected anchor placement");
+        };
+        assert!(anchor.behind_text);
+        assert_eq!(anchor.relative_height, 391168);
+        let Some(GraphicContent::Chart(chart)) = img.graphic else {
+            panic!("expected chart relationship");
+        };
+        assert_eq!(chart.rel_id.as_str(), "rId12");
+    }
+
+    #[test]
+    fn chart_without_relationship_id_is_ignored() {
+        let img = parse_anchor(
+            r#"<anchor distT="0" distB="0" distL="0" distR="0">
+                <simplePos x="0" y="0"/>
+                <positionH relativeFrom="column"><posOffset>0</posOffset></positionH>
+                <positionV relativeFrom="paragraph"><posOffset>0</posOffset></positionV>
+                <wrapNone/>
+                <extent cx="100" cy="100"/>
+                <docPr id="23" name="Malformed chart reference"/>
+                <graphic><graphicData><chart/></graphicData></graphic>
+            </anchor>"#,
+        );
+        assert!(img.graphic.is_none());
     }
 }

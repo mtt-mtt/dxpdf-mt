@@ -43,6 +43,8 @@ pub enum RelationshipType {
     Font,
     /// §15.2.14: image.
     Image,
+    /// §15.2.7: DrawingML chart.
+    Chart,
     /// §15.3.6: hyperlink.
     Hyperlink,
     /// §11.3.1: comments part.
@@ -92,6 +94,8 @@ impl RelationshipType {
             Self::Font
         } else if uri.ends_with("/image") {
             Self::Image
+        } else if uri.ends_with("/chart") {
+            Self::Chart
         } else if uri.ends_with("/hyperlink") {
             Self::Hyperlink
         } else if uri.ends_with("/comments") {
@@ -230,6 +234,7 @@ mod tests {
         assert_eq!(classify("footnotes"), RelationshipType::Footnotes);
         assert_eq!(classify("endnotes"), RelationshipType::Endnotes);
         assert_eq!(classify("image"), RelationshipType::Image);
+        assert_eq!(classify("chart"), RelationshipType::Chart);
         assert_eq!(classify("hyperlink"), RelationshipType::Hyperlink);
     }
 

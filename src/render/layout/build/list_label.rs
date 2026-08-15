@@ -650,6 +650,7 @@ mod tests {
             numbering,
             font_families: Vec::new(),
             media: HashMap::new(),
+            charts: HashMap::new(),
             embedded_fonts: Vec::new(),
             pic_bullets: HashMap::new(),
             theme: None,

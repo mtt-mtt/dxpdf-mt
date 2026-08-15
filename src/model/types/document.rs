@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::chart::Chart;
 use super::color::Color;
 use super::content::Block;
 use super::drawing::ImageFormat;
@@ -45,6 +46,9 @@ pub struct Document {
     pub footers: HashMap<RelId, Vec<Block>>,
     pub footnotes: HashMap<NoteId, Vec<Block>>,
     pub endnotes: HashMap<NoteId, Vec<Block>>,
+    /// Supported chart parts keyed by the relationship ID used by the main
+    /// document story. Unsupported chart families are intentionally omitted.
+    pub charts: HashMap<RelId, Chart>,
     /// Embedded media (images) — raw bytes and detected format, keyed by
     /// relationship ID.
     ///

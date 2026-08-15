@@ -134,6 +134,13 @@ pub enum GraphicContent {
     Picture(Picture),
     /// §14.5 wps:wsp: Word Processing Shape.
     WordProcessingShape(WordProcessingShape),
+    /// §21.2.2.27 c:chart: relationship to a DrawingML chart part.
+    Chart(ChartReference),
+}
+
+#[derive(Clone, Debug)]
+pub struct ChartReference {
+    pub rel_id: RelId,
 }
 
 /// §14.5 wps:wsp — a Word Processing Shape.

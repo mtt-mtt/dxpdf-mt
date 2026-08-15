@@ -51,6 +51,59 @@ fn simple_docx(body_content: &str) -> Vec<u8> {
     make_docx(&xml)
 }
 
+/// A malformed optional chart part must not make otherwise valid body text
+/// unreadable. Chart relationships are intentionally best-effort content.
+fn make_docx_with_malformed_chart() -> Vec<u8> {
+    let buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(buf);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("[Content_Types].xml", options).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>
+</Types>"#,
+    )
+    .unwrap();
+
+    zip.start_file("_rels/.rels", options).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/document.xml", options).unwrap();
+    zip.write_all(
+        br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Body survives malformed chart</w:t></w:r></w:p></w:body>
+</w:document>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/_rels/document.xml.rels", options)
+        .unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/>
+</Relationships>"#,
+    )
+    .unwrap();
+
+    zip.start_file("word/charts/chart1.xml", options).unwrap();
+    zip.write_all(br#"<c:chartSpace"#).unwrap();
+
+    zip.finish().unwrap().into_inner()
+}
+
 fn make_numbered_docx(document_xml: &str, numbering_xml: &str) -> Vec<u8> {
     let buf = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(buf);
@@ -105,6 +158,13 @@ fn convert_simple_docx_to_pdf() {
     // PDF should start with the magic bytes
     assert!(pdf.len() > 4);
     assert_eq!(&pdf[..5], b"%PDF-");
+}
+
+#[test]
+fn malformed_chart_relationship_does_not_abort_document_parse() {
+    let parsed = dxpdf::docx::parse(&make_docx_with_malformed_chart()).unwrap();
+    assert_eq!(parsed.body.len(), 1);
+    assert!(parsed.charts.is_empty());
 }
 
 #[test]

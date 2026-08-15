@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::model::dimension::{Dimension, Twips};
 use crate::model::{
-    Block, Document, EmbeddedFont, NoteId, NumId, NumPicBullet, NumPicBulletId,
+    Block, Chart, Document, EmbeddedFont, NoteId, NumId, NumPicBullet, NumPicBulletId,
     ParagraphProperties, RelId, RunProperties, StyleId, Theme,
 };
 
@@ -45,6 +45,8 @@ pub struct ResolvedDocument {
     pub font_families: Vec<String>,
     /// Embedded media (images) — shared bytes with detected format, keyed by relationship ID.
     pub media: HashMap<RelId, MediaEntry>,
+    /// Cached, supported chart parts keyed by the main-story relationship ID.
+    pub charts: HashMap<RelId, Chart>,
     /// §17.8.3: embedded fonts, carried through so the font registry can be
     /// built from the resolved document alone. They belong here rather than
     /// being read back off the `Document` because [`resolve`] consumes it.
@@ -123,6 +125,7 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
         footers,
         footnotes,
         endnotes,
+        charts,
         media,
         embedded_fonts,
     } = doc;
@@ -146,6 +149,7 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
             .into_iter()
             .map(|(id, (data, format))| (id, MediaEntry { data, format }))
             .collect(),
+        charts,
         pic_bullets: numbering.pic_bullets,
         doc_defaults_paragraph: styles.doc_defaults_paragraph,
         doc_defaults_run: styles.doc_defaults_run,
@@ -181,6 +185,7 @@ mod tests {
             footers: HashMap::new(),
             footnotes: HashMap::new(),
             endnotes: HashMap::new(),
+            charts: HashMap::new(),
             media: HashMap::new(),
             embedded_fonts: vec![],
         }
