@@ -148,6 +148,7 @@ pub fn split_oversized_fragments_for_word_wrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::layout::fragment::AutoLineSpacingContribution;
     use crate::render::resolve::color::RgbColor;
 
     fn text_frag(text: &str, width: f32) -> Fragment {
@@ -161,6 +162,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                auto_line_spacing: Default::default(),
                 east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
@@ -208,6 +210,27 @@ mod tests {
                 unreachable!()
             };
             assert!((width.raw() - 30.0).abs() < 1e-4, "uniform fallback 60/2");
+        }
+    }
+
+    #[test]
+    fn split_preserves_natural_only_auto_line_spacing_role() {
+        let mut source = text_frag("ab", 60.0);
+        let Fragment::Text { font, .. } = &mut source else {
+            unreachable!();
+        };
+        Rc::make_mut(font).auto_line_spacing = AutoLineSpacingContribution::NaturalOnly;
+
+        let result = split_oversized_fragments(&[source], Pt::new(20.0), None).expect("splits");
+        assert_eq!(result.len(), 2);
+        for fragment in result {
+            let Fragment::Text { font, .. } = fragment else {
+                unreachable!();
+            };
+            assert_eq!(
+                font.auto_line_spacing,
+                AutoLineSpacingContribution::NaturalOnly
+            );
         }
     }
 

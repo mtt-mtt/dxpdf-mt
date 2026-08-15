@@ -120,6 +120,7 @@ pub(super) fn compute_line_placements(
                 width: first.width,
                 height: first.height,
                 text_height: first.text_height,
+                auto_text_height: first.auto_text_height,
                 ascent: first.ascent,
                 has_break: first.has_break,
                 hanging_punct_width: first.hanging_punct_width,
@@ -133,12 +134,14 @@ pub(super) fn compute_line_placements(
         } else {
             default_line_height
         };
-        let text_h = if fitted_line.text_height > Pt::ZERO {
-            fitted_line.text_height
-        } else {
-            default_line_height
-        };
-        let lh = resolve_line_height(natural, text_h, &style.line_spacing, style.auto_fit);
+        let (text_h, auto_text_h) = line_spacing_text_heights(&fitted_line, default_line_height);
+        let lh = resolve_line_height_with_auto_text(
+            natural,
+            text_h,
+            auto_text_h,
+            &style.line_spacing,
+            style.auto_fit,
+        );
 
         frag_idx = fitted_line.end;
         placements.push(LinePlacement {
@@ -380,14 +383,11 @@ pub(super) fn emit_line_commands(
         } else {
             default_line_height
         };
-        let text_height = if line.text_height > Pt::ZERO {
-            line.text_height
-        } else {
-            default_line_height
-        };
-        let line_height = resolve_line_height(
+        let (text_height, auto_text_height) = line_spacing_text_heights(line, default_line_height);
+        let line_height = resolve_line_height_with_auto_text(
             natural_height,
             text_height,
+            auto_text_height,
             &style.line_spacing,
             style.auto_fit,
         );
@@ -1290,6 +1290,29 @@ pub(super) fn resolve_line_height(
     rule: &LineSpacingRule,
     auto_fit: crate::render::layout::ShapeAutoFit,
 ) -> Pt {
+    resolve_line_height_with_auto_text(natural, text_height, text_height, rule, auto_fit)
+}
+
+pub(super) fn line_spacing_text_heights(
+    line: &super::super::line::FittedLine,
+    default_line_height: Pt,
+) -> (Pt, Pt) {
+    if line.text_height > Pt::ZERO {
+        (line.text_height, line.auto_text_height)
+    } else {
+        // Preserve the existing empty/image-only-line fallback while keeping
+        // a label-only line distinguishable from a line with no text at all.
+        (default_line_height, default_line_height)
+    }
+}
+
+pub(super) fn resolve_line_height_with_auto_text(
+    natural: Pt,
+    text_height: Pt,
+    auto_text_height: Pt,
+    rule: &LineSpacingRule,
+    auto_fit: crate::render::layout::ShapeAutoFit,
+) -> Pt {
     let snap_natural_to_grid = |pitch: Pt| {
         if pitch <= Pt::ZERO {
             natural
@@ -1304,7 +1327,7 @@ pub(super) fn resolve_line_height(
     };
     let resolved = match rule {
         LineSpacingRule::Auto(multiplier) => {
-            let scaled_text = text_height * *multiplier;
+            let scaled_text = auto_text_height * *multiplier;
             // Use the scaled text height or the full natural height (which
             // includes images), whichever is larger.
             scaled_text.max(natural)
@@ -1314,7 +1337,7 @@ pub(super) fn resolve_line_height(
         LineSpacingRule::Grid { pitch } => snap_natural_to_grid(*pitch),
         LineSpacingRule::GridAuto { pitch, multiplier } => {
             if *pitch <= Pt::ZERO {
-                let scaled_text = text_height * *multiplier;
+                let scaled_text = auto_text_height * *multiplier;
                 scaled_text.max(natural)
             } else {
                 let proportional = *pitch * multiplier.max(1.0);
@@ -1409,6 +1432,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                auto_line_spacing: Default::default(),
                 east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
@@ -1439,6 +1463,7 @@ mod tests {
             width: Pt::new(110.0),
             height: Pt::new(14.0),
             text_height: Pt::new(14.0),
+            auto_text_height: Pt::new(14.0),
             ascent: Pt::new(10.0),
             has_break: false,
             hanging_punct_width: Pt::new(10.0),

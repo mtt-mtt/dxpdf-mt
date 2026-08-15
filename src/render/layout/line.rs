@@ -17,6 +17,9 @@ pub struct FittedLine {
     /// §17.3.1.33: Auto line spacing multiplier applies to text metrics,
     /// not to inline image heights.
     pub text_height: Pt,
+    /// Portion of `text_height` that automatic line-spacing multipliers may
+    /// scale. Numbering labels are natural-height-only.
+    pub auto_text_height: Pt,
     /// Maximum ascent of any text fragment in this line.
     pub ascent: Pt,
     /// Whether this line ends with an explicit line break.
@@ -123,6 +126,7 @@ pub(crate) fn fit_lines_with_first_and_hanging(
     let mut margin_span_active = false;
     let mut line_height = Pt::ZERO;
     let mut line_text_height = Pt::ZERO;
+    let mut line_auto_text_height = Pt::ZERO;
     let mut line_ascent = Pt::ZERO;
     let mut last_break_point = None; // index after which we can break
                                      // Snapshot the exception actually consumed after each accepted fragment.
@@ -146,12 +150,14 @@ pub(crate) fn fit_lines_with_first_and_hanging(
                 _ => frag.height(),
             };
             line_text_height = line_text_height.max(break_text_height);
+            line_auto_text_height = line_auto_text_height.max(break_text_height);
             lines.push(FittedLine {
                 start: line_start,
                 end: i + 1,
                 width: line_width,
                 height: line_height,
                 text_height: line_text_height,
+                auto_text_height: line_auto_text_height,
                 ascent: line_ascent,
                 has_break: true,
                 hanging_punct_width: line_hanging_punct_width,
@@ -164,6 +170,7 @@ pub(crate) fn fit_lines_with_first_and_hanging(
             margin_span_active = false;
             line_height = Pt::ZERO;
             line_text_height = Pt::ZERO;
+            line_auto_text_height = Pt::ZERO;
             line_ascent = Pt::ZERO;
             last_break_point = None;
             line_hanging_punct_width = Pt::ZERO;
@@ -213,6 +220,7 @@ pub(crate) fn fit_lines_with_first_and_hanging(
                             width: m.width,
                             height: m.height,
                             text_height: m.text_height,
+                            auto_text_height: m.auto_text_height,
                             ascent: m.ascent,
                             has_break: false,
                             hanging_punct_width: hanging_after[i],
@@ -225,6 +233,7 @@ pub(crate) fn fit_lines_with_first_and_hanging(
                         margin_span_active = false;
                         line_height = Pt::ZERO;
                         line_text_height = Pt::ZERO;
+                        line_auto_text_height = Pt::ZERO;
                         line_ascent = Pt::ZERO;
                         last_break_point = None;
                         line_hanging_punct_width = Pt::ZERO;
@@ -314,6 +323,7 @@ pub(crate) fn fit_lines_with_first_and_hanging(
                 width: m.width,
                 height: m.height,
                 text_height: m.text_height,
+                auto_text_height: m.auto_text_height,
                 ascent: m.ascent,
                 has_break: false,
                 hanging_punct_width: hanging_after[break_at],
@@ -326,6 +336,7 @@ pub(crate) fn fit_lines_with_first_and_hanging(
             margin_span_active = false;
             line_height = Pt::ZERO;
             line_text_height = Pt::ZERO;
+            line_auto_text_height = Pt::ZERO;
             line_ascent = Pt::ZERO;
             last_break_point = None;
             line_hanging_punct_width = Pt::ZERO;
@@ -348,22 +359,10 @@ pub(crate) fn fit_lines_with_first_and_hanging(
         pen_x = new_pen_x;
         pen_trimmed_x = new_trimmed_pen_x;
         line_height = line_height.max(frag.height());
-        // §17.3.1.33: text_height is the Auto line spacing base — use
-        // line_height() (includes leading) for text, glyph height for tabs.
-        match frag {
-            Fragment::Text { metrics, .. } => {
-                line_text_height = line_text_height.max(metrics.line_height());
-                line_ascent = line_ascent.max(metrics.ascent);
-            }
-            // Inline graphics, like images, don't contribute to text_height.
-            Fragment::Image { .. } | Fragment::InlineGraphic { .. } => {}
-            Fragment::LineBreak { text_height, .. } => {
-                line_text_height = line_text_height.max(*text_height);
-            }
-            _ => {
-                line_text_height = line_text_height.max(frag.height());
-            }
-        }
+        let metrics = fragment_line_metrics(frag);
+        line_text_height = line_text_height.max(metrics.text_height);
+        line_auto_text_height = line_auto_text_height.max(metrics.auto_text_height);
+        line_ascent = line_ascent.max(metrics.ascent);
 
         // Track break opportunity: only after fragments that end with whitespace,
         // or non-text fragments (tabs, images). Text fragments without trailing
@@ -393,6 +392,7 @@ pub(crate) fn fit_lines_with_first_and_hanging(
             width: line_width,
             height: line_height,
             text_height: line_text_height,
+            auto_text_height: line_auto_text_height,
             ascent: line_ascent,
             has_break: false,
             hanging_punct_width: line_hanging_punct_width,
@@ -436,7 +436,63 @@ struct RangeMeasure {
     width: Pt,
     height: Pt,
     text_height: Pt,
+    auto_text_height: Pt,
     ascent: Pt,
+}
+
+#[derive(Clone, Copy)]
+struct FragmentLineMetrics {
+    text_height: Pt,
+    auto_text_height: Pt,
+    ascent: Pt,
+}
+
+fn fragment_line_metrics(fragment: &Fragment) -> FragmentLineMetrics {
+    use crate::render::layout::fragment::AutoLineSpacingContribution;
+
+    let scaled = |height: Pt, font: &crate::render::layout::fragment::FontProps| {
+        if font.auto_line_spacing == AutoLineSpacingContribution::Scaled {
+            height
+        } else {
+            Pt::ZERO
+        }
+    };
+    match fragment {
+        Fragment::Text { font, metrics, .. } => FragmentLineMetrics {
+            text_height: metrics.line_height(),
+            auto_text_height: scaled(metrics.line_height(), font),
+            ascent: metrics.ascent,
+        },
+        // Inline graphics, like images, don't contribute to text height.
+        Fragment::Image { .. } | Fragment::InlineGraphic { .. } => FragmentLineMetrics {
+            text_height: Pt::ZERO,
+            auto_text_height: Pt::ZERO,
+            ascent: Pt::ZERO,
+        },
+        Fragment::Tab {
+            line_height, font, ..
+        }
+        | Fragment::PTab {
+            line_height, font, ..
+        } => FragmentLineMetrics {
+            text_height: *line_height,
+            auto_text_height: scaled(*line_height, font),
+            ascent: Pt::ZERO,
+        },
+        Fragment::LineBreak { text_height, .. } => FragmentLineMetrics {
+            text_height: *text_height,
+            auto_text_height: *text_height,
+            ascent: Pt::ZERO,
+        },
+        other => {
+            let height = other.height();
+            FragmentLineMetrics {
+                text_height: height,
+                auto_text_height: height,
+                ascent: Pt::ZERO,
+            }
+        }
+    }
 }
 
 /// Measure total width, max height, text height, and ascent for a range of fragments.
@@ -445,24 +501,16 @@ fn measure_range(fragments: &[Fragment], start: usize, end: usize) -> RangeMeasu
         width: Pt::ZERO,
         height: Pt::ZERO,
         text_height: Pt::ZERO,
+        auto_text_height: Pt::ZERO,
         ascent: Pt::ZERO,
     };
     for frag in &fragments[start..end] {
         m.width += frag.width();
         m.height = m.height.max(frag.height());
-        match frag {
-            Fragment::Text { metrics, .. } => {
-                m.text_height = m.text_height.max(metrics.line_height());
-                m.ascent = m.ascent.max(metrics.ascent);
-            }
-            Fragment::Image { .. } => {}
-            Fragment::LineBreak { text_height, .. } => {
-                m.text_height = m.text_height.max(*text_height);
-            }
-            _ => {
-                m.text_height = m.text_height.max(frag.height());
-            }
-        }
+        let metrics = fragment_line_metrics(frag);
+        m.text_height = m.text_height.max(metrics.text_height);
+        m.auto_text_height = m.auto_text_height.max(metrics.auto_text_height);
+        m.ascent = m.ascent.max(metrics.ascent);
     }
     m
 }
@@ -485,6 +533,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                auto_line_spacing: Default::default(),
                 east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
@@ -504,6 +553,21 @@ mod tests {
             text_offset: Pt::ZERO,
             is_footnote_ref: false,
         }
+    }
+
+    fn natural_only_text_frag(text: &str, width: f32) -> Fragment {
+        let mut fragment = text_frag(text, width);
+        let Fragment::Text { font, metrics, .. } = &mut fragment else {
+            unreachable!();
+        };
+        Rc::make_mut(font).auto_line_spacing =
+            crate::render::layout::fragment::AutoLineSpacingContribution::NaturalOnly;
+        *metrics = TextMetrics {
+            ascent: Pt::new(11.0),
+            descent: Pt::new(4.0),
+            leading: Pt::new(1.0),
+        };
+        fragment
     }
 
     fn text_frag_with_trimmed_width(text: &str, width: f32, trimmed_width: f32) -> Fragment {
@@ -542,6 +606,42 @@ mod tests {
         assert_eq!(lines[0].end, 1);
         assert_eq!(lines[0].width.raw(), 30.0);
         assert_eq!(lines[0].height.raw(), 14.0);
+    }
+
+    #[test]
+    fn natural_only_label_keeps_natural_metrics_but_not_auto_multiplier_metrics() {
+        let frags = vec![natural_only_text_frag("o", 10.0), text_frag("body", 30.0)];
+        let lines = fit_lines(&frags, Pt::new(100.0));
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].height, Pt::new(15.0));
+        assert_eq!(lines[0].text_height, Pt::new(16.0));
+        assert_eq!(lines[0].auto_text_height, Pt::new(14.0));
+        assert_eq!(lines[0].ascent, Pt::new(11.0));
+    }
+
+    #[test]
+    fn overflow_rollback_preserves_natural_only_label_and_tab_metrics() {
+        let label = natural_only_text_frag("o", 10.0);
+        let label_font = label.font_props().unwrap().clone();
+        let frags = vec![
+            label,
+            Fragment::Tab {
+                line_height: Pt::new(16.0),
+                font: Rc::new(label_font),
+                color: RgbColor::BLACK,
+                fitting_width: None,
+            },
+            text_frag("body", 95.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(100.0));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].start, lines[0].end), (0, 2));
+        assert_eq!(lines[0].height, Pt::new(16.0));
+        assert_eq!(lines[0].text_height, Pt::new(16.0));
+        assert_eq!(lines[0].auto_text_height, Pt::ZERO);
+        assert_eq!(lines[1].auto_text_height, Pt::new(14.0));
     }
 
     #[test]
@@ -602,6 +702,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                auto_line_spacing: Default::default(),
                 east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
@@ -812,7 +913,7 @@ mod tests {
         let frags = vec![
             text_frag("text", 80.0),
             Fragment::Tab {
-                line_height: Pt::new(14.0),
+                line_height: Pt::new(18.0),
                 font: Rc::new(FontProps {
                     family: Rc::from("Test"),
                     size: Pt::new(12.0),
@@ -821,6 +922,7 @@ mod tests {
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    auto_line_spacing: Default::default(),
                     east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,
@@ -835,6 +937,7 @@ mod tests {
         let lines = fit_lines(&frags, Pt::new(100.0));
 
         assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].auto_text_height, Pt::new(18.0));
     }
 
     #[test]
@@ -850,6 +953,7 @@ mod tests {
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    auto_line_spacing: Default::default(),
                     east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,
@@ -879,6 +983,7 @@ mod tests {
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    auto_line_spacing: Default::default(),
                     east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,

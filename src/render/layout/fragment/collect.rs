@@ -602,6 +602,7 @@ fn emit_field_substitution<F>(
         underline: false,
         char_spacing: Pt::ZERO,
         text_scale: 1.0,
+        auto_line_spacing: Default::default(),
         east_asian_language: None,
         underline_position: Pt::ZERO,
         underline_thickness: Pt::ZERO,
@@ -644,6 +645,7 @@ where
         underline: false,
         char_spacing: Pt::ZERO,
         text_scale: 1.0,
+        auto_line_spacing: Default::default(),
         east_asian_language,
         underline_position: Pt::ZERO,
         underline_thickness: Pt::ZERO,
@@ -1267,6 +1269,7 @@ where
                         underline: false,
                         char_spacing: Pt::ZERO,
                         text_scale: 1.0,
+                        auto_line_spacing: Default::default(),
                         east_asian_language: super::EastAsianLanguage::from_lang(
                             ctx.paragraph_run_defaults
                                 .and_then(|props| props.lang.as_ref()),
@@ -1315,6 +1318,7 @@ where
                         underline: false,
                         char_spacing: Pt::ZERO,
                         text_scale: 1.0,
+                        auto_line_spacing: Default::default(),
                         east_asian_language: super::EastAsianLanguage::from_lang(
                             ctx.paragraph_run_defaults
                                 .and_then(|props| props.lang.as_ref()),
@@ -1355,6 +1359,7 @@ where
                         underline: false,
                         char_spacing: Pt::ZERO,
                         text_scale: 1.0,
+                        auto_line_spacing: Default::default(),
                         east_asian_language: super::EastAsianLanguage::from_lang(
                             ctx.paragraph_run_defaults
                                 .and_then(|props| props.lang.as_ref()),

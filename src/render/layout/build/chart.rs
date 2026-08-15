@@ -470,6 +470,7 @@ fn font_props(style: &EffectiveTextStyle) -> FontProps {
         underline: false,
         char_spacing: Pt::ZERO,
         text_scale: 1.0,
+        auto_line_spacing: Default::default(),
         east_asian_language: None,
         underline_position: Pt::ZERO,
         underline_thickness: Pt::ZERO,

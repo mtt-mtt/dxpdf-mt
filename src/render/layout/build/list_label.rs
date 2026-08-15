@@ -287,6 +287,8 @@ fn inject_text_label(
     // flows from cascade.resolve() into `font_props_from_run`. After
     // remapping, override the family if it changed.
     let mut label_font = build_label_font_props(&cascade, &default_family, default_size, auto_fit);
+    label_font.auto_line_spacing =
+        crate::render::layout::fragment::AutoLineSpacingContribution::NaturalOnly;
     if label_family != *label_font.family {
         label_font.family = Rc::from(label_family.as_str());
     }
@@ -828,6 +830,16 @@ mod tests {
             }]);
             let (fragments, _) = inject(&resolved, &mut BuildState::default(), 0);
             assert_eq!(label_text(&fragments), "1", "{suffix:?}");
+            for fragment in &fragments {
+                match fragment {
+                    Fragment::Text { font, .. } | Fragment::Tab { font, .. } => assert_eq!(
+                        font.auto_line_spacing,
+                        crate::render::layout::fragment::AutoLineSpacingContribution::NaturalOnly,
+                        "{suffix:?} label fragments must not become the Auto multiplier base"
+                    ),
+                    _ => {}
+                }
+            }
 
             let got = match fragments.get(1) {
                 None => "none",
@@ -870,9 +882,16 @@ mod tests {
                 .fold(Pt::ZERO, |width, fragment| width + fragment.width());
             let expected_offset = total_width * factor;
             for fragment in label_fragments {
-                let Fragment::Text { text_offset, .. } = fragment else {
+                let Fragment::Text {
+                    text_offset, font, ..
+                } = fragment
+                else {
                     panic!("label contains a non-text fragment: {fragment:?}");
                 };
+                assert_eq!(
+                    font.auto_line_spacing,
+                    crate::render::layout::fragment::AutoLineSpacingContribution::NaturalOnly
+                );
                 assert!(
                     (text_offset.raw() - expected_offset.raw()).abs() < 1e-3,
                     "every label span shares the whole-label justification offset"
@@ -882,6 +901,13 @@ mod tests {
             let Fragment::Tab { fitting_width, .. } = &fragments[tab_index] else {
                 unreachable!();
             };
+            let Fragment::Tab { font, .. } = &fragments[tab_index] else {
+                unreachable!();
+            };
+            assert_eq!(
+                font.auto_line_spacing,
+                crate::render::layout::fragment::AutoLineSpacingContribution::NaturalOnly
+            );
             let got = fitting_width.expect("label tab has a fitting width");
             assert!(
                 (got.raw() - (72.0 - total_width.raw())).abs() < 1e-3,

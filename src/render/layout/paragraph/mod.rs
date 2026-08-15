@@ -25,9 +25,11 @@ use crate::render::geometry::{PtOffset, PtRect, PtSize};
 use crate::render::layout::fragment::split_oversized_fragments_for_word_wrap;
 
 use borders::{emit_paragraph_borders_and_shading, emit_segment_borders_and_shading, SegmentEdges};
+#[cfg(test)]
+use line_emit::resolve_line_height;
 use line_emit::{
-    compute_line_placements, emit_line_commands, full_width_float_clearance, resolve_line_height,
-    resolved_text_baseline_ascent,
+    compute_line_placements, emit_line_commands, full_width_float_clearance,
+    line_spacing_text_heights, resolve_line_height_with_auto_text, resolved_text_baseline_ascent,
 };
 
 // ── Tab leader rendering constants ────────────────────────────────────────────
@@ -269,12 +271,15 @@ pub(crate) fn place_paragraph<'a>(
                 } else {
                     default_line_height
                 };
-                let text_h = if lp.line.text_height > Pt::ZERO {
-                    lp.line.text_height
-                } else {
-                    default_line_height
-                };
-                let lh = resolve_line_height(natural, text_h, &style.line_spacing, style.auto_fit);
+                let (text_h, auto_text_h) =
+                    line_spacing_text_heights(&lp.line, default_line_height);
+                let lh = resolve_line_height_with_auto_text(
+                    natural,
+                    text_h,
+                    auto_text_h,
+                    &style.line_spacing,
+                    style.auto_fit,
+                );
                 if i == n - 1 {
                     y += resolved_text_baseline_ascent(
                         lp.line.ascent,
@@ -301,13 +306,15 @@ pub(crate) fn place_paragraph<'a>(
             } else {
                 default_line_height
             };
-            let text_h = if lp.line.text_height > Pt::ZERO {
-                lp.line.text_height
-            } else {
-                default_line_height
-            };
+            let (text_h, auto_text_h) = line_spacing_text_heights(&lp.line, default_line_height);
             lp.clearance_before
-                + resolve_line_height(natural, text_h, &style.line_spacing, style.auto_fit)
+                + resolve_line_height_with_auto_text(
+                    natural,
+                    text_h,
+                    auto_text_h,
+                    &style.line_spacing,
+                    style.auto_fit,
+                )
         })
         .collect();
 
@@ -623,6 +630,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                auto_line_spacing: Default::default(),
                 east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
@@ -661,6 +669,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::new(2.0),
             text_scale: 0.75,
+            auto_line_spacing: Default::default(),
             east_asian_language: Some(EastAsianLanguage::ChineseSimplified),
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,
@@ -1953,6 +1962,118 @@ mod tests {
     }
 
     #[test]
+    fn resolve_line_height_auto_scales_body_text_not_taller_list_label() {
+        let numbered_first = resolve_line_height_with_auto_text(
+            Pt::new(15.0),
+            Pt::new(16.0),
+            Pt::new(14.0),
+            &LineSpacingRule::Auto(1.15),
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+        let continuation = resolve_line_height_with_auto_text(
+            Pt::new(14.0),
+            Pt::new(14.0),
+            Pt::new(14.0),
+            &LineSpacingRule::Auto(1.15),
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+
+        assert!((numbered_first.raw() - 16.1).abs() < 0.001);
+        assert_eq!(numbered_first, continuation);
+    }
+
+    #[test]
+    fn natural_only_label_still_controls_grid_and_fixed_line_height_rules() {
+        let exact = resolve_line_height_with_auto_text(
+            Pt::new(15.0),
+            Pt::new(16.0),
+            Pt::ZERO,
+            &LineSpacingRule::Exact(Pt::new(20.0)),
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+        let at_least = resolve_line_height_with_auto_text(
+            Pt::new(15.0),
+            Pt::new(16.0),
+            Pt::ZERO,
+            &LineSpacingRule::AtLeast(Pt::new(12.0)),
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+        let grid = resolve_line_height_with_auto_text(
+            Pt::new(15.0),
+            Pt::new(16.0),
+            Pt::ZERO,
+            &LineSpacingRule::Grid {
+                pitch: Pt::new(10.0),
+            },
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+        let grid_auto_without_pitch = resolve_line_height_with_auto_text(
+            Pt::new(15.0),
+            Pt::new(16.0),
+            Pt::ZERO,
+            &LineSpacingRule::GridAuto {
+                pitch: Pt::ZERO,
+                multiplier: 1.15,
+            },
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+        let grid_auto_with_pitch = resolve_line_height_with_auto_text(
+            Pt::new(15.0),
+            Pt::new(16.0),
+            Pt::ZERO,
+            &LineSpacingRule::GridAuto {
+                pitch: Pt::new(10.0),
+                multiplier: 1.15,
+            },
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+        let grid_at_least = resolve_line_height_with_auto_text(
+            Pt::new(15.0),
+            Pt::new(16.0),
+            Pt::ZERO,
+            &LineSpacingRule::GridAtLeast {
+                pitch: Pt::new(10.0),
+                minimum: Pt::new(12.0),
+            },
+            crate::render::layout::ShapeAutoFit::NONE,
+        );
+
+        assert_eq!(exact, Pt::new(20.0));
+        assert_eq!(at_least, Pt::new(15.0));
+        assert_eq!(grid, Pt::new(20.0));
+        assert_eq!(grid_auto_without_pitch, Pt::new(15.0));
+        assert_eq!(grid_auto_with_pitch, Pt::new(20.0));
+        assert_eq!(grid_at_least, Pt::new(20.0));
+    }
+
+    #[test]
+    fn label_only_line_does_not_fall_back_to_scaled_default_text_height() {
+        let line = crate::render::layout::line::FittedLine {
+            start: 0,
+            end: 1,
+            width: Pt::new(8.0),
+            height: Pt::new(15.0),
+            text_height: Pt::new(16.0),
+            auto_text_height: Pt::ZERO,
+            ascent: Pt::new(11.0),
+            has_break: false,
+            hanging_punct_width: Pt::ZERO,
+        };
+        let (full, auto) = line_spacing_text_heights(&line, Pt::new(14.0));
+        assert_eq!((full, auto), (Pt::new(16.0), Pt::ZERO));
+        assert_eq!(
+            resolve_line_height_with_auto_text(
+                line.height,
+                full,
+                auto,
+                &LineSpacingRule::Auto(1.15),
+                crate::render::layout::ShapeAutoFit::NONE,
+            ),
+            Pt::new(15.0)
+        );
+    }
+
+    #[test]
     fn resolve_line_height_exact_overrides() {
         assert_eq!(
             resolve_line_height(
@@ -2688,6 +2809,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::ZERO,
             text_scale: 1.0,
+            auto_line_spacing: Default::default(),
             east_asian_language: None,
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,

@@ -119,6 +119,18 @@ impl EastAsianLanguage {
     }
 }
 
+/// Whether a fragment's text metrics are multiplied by `Auto` line spacing.
+///
+/// Numbering labels still contribute their full glyph box to the natural line
+/// height, but Word does not use their (potentially larger) label font as the
+/// multiplier base for the paragraph's automatic line spacing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoLineSpacingContribution {
+    #[default]
+    Scaled,
+    NaturalOnly,
+}
+
 /// Font properties needed for rendering a text fragment.
 #[derive(Clone, Debug)]
 pub struct FontProps {
@@ -134,6 +146,7 @@ pub struct FontProps {
     /// (`char_spacing`) is **not** scaled by this — the spec keeps the two
     /// independent.
     pub text_scale: f32,
+    pub auto_line_spacing: AutoLineSpacingContribution,
     /// Parent run language used solely for Word's language-specific hanging
     /// punctuation table.
     pub east_asian_language: Option<EastAsianLanguage>,
@@ -527,6 +540,7 @@ pub fn font_props_from_run(
         underline: matches!(rp.underline, Some(s) if s != UnderlineStyle::None),
         char_spacing,
         text_scale,
+        auto_line_spacing: AutoLineSpacingContribution::Scaled,
         east_asian_language: EastAsianLanguage::from_lang(rp.lang.as_ref()),
         // Populated by the measurer from Skia font metrics.
         underline_position: Pt::ZERO,
