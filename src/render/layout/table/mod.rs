@@ -338,6 +338,7 @@ where
         .iter()
         .map(|mr| mr.height + mr.border_gap_below)
         .sum();
+    let header_footnote_height = measured_range_footnote_height(&measured, 0..header_count);
 
     let groups = build_row_groups(rows, &measured);
 
@@ -605,6 +606,20 @@ where
             next_page_height
         };
         if next_remaining > remaining {
+            let fresh_group_footnote_cost =
+                footnote_page_cost(group_footnote_height, false, footnote_separator_height);
+            let initial_slice_contains_only_headers = slices.is_empty()
+                && !is_header
+                && header_count > 0
+                && header_footnote_height == Pt::ZERO
+                && rows[..header_count]
+                    .iter()
+                    .all(|row| row.cant_split != Some(true))
+                && !current_slice.is_empty()
+                && current_slice.iter().all(
+                    |item| matches!(item, SliceItem::Range(range) if range.end <= header_count),
+                )
+                && group.height + fresh_group_footnote_cost <= next_remaining;
             log::trace!(
                 "[table] spill group={}-{} to slice={} next_remaining={:.2}pt",
                 group.start,
@@ -612,6 +627,13 @@ where
                 slices.len() + 1,
                 next_remaining.raw(),
             );
+            // A repeating header is not a useful first table fragment by
+            // itself. When the first body group fits on a fresh page, move
+            // the initial header with it instead of emitting an orphaned
+            // header at the bottom and immediately repeating it.
+            if initial_slice_contains_only_headers {
+                current_slice.clear();
+            }
             slices.push(std::mem::take(&mut current_slice));
             remaining = next_page_height;
             page_has_footnotes = false;
@@ -2534,6 +2556,78 @@ mod tests {
             .count();
         assert_eq!(count0, 3, "slice 0: header (1) + body0 (2)");
         assert_eq!(count1, 3, "slice 1: header repeated (1) + body1 (2)");
+    }
+
+    #[test]
+    fn initial_header_moves_with_the_first_body_row_instead_of_orphaning() {
+        let mut header = tall_row(1); // 14pt
+        header.is_header = Some(true);
+        let mut body = tall_row(2); // 28pt
+        body.cant_split = Some(true);
+
+        let slices = layout_table_paginated(
+            &[header, body],
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                // The header fits here by itself, while a fresh page fits
+                // the header and first body row together.
+                available_height: Pt::new(20.0),
+                page_height: Pt::new(200.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert_eq!(slices.len(), 2, "empty first slice + complete table");
+        let text_counts = slices
+            .iter()
+            .map(|slice| {
+                slice
+                    .commands
+                    .iter()
+                    .filter(|command| matches!(command, DrawCommand::Text { .. }))
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text_counts, vec![0, 3]);
+    }
+
+    #[test]
+    fn cant_split_headers_may_remain_as_a_standalone_first_fragment() {
+        let mut header = tall_row(1); // 14pt
+        header.is_header = Some(true);
+        header.cant_split = Some(true);
+        let mut body = tall_row(2); // 28pt
+        body.cant_split = Some(true);
+
+        let slices = layout_table_paginated(
+            &[header, body],
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(20.0),
+                page_height: Pt::new(200.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        let text_counts = slices
+            .iter()
+            .map(|slice| {
+                slice
+                    .commands
+                    .iter()
+                    .filter(|command| matches!(command, DrawCommand::Text { .. }))
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text_counts, vec![1, 3]);
     }
 
     #[test]
