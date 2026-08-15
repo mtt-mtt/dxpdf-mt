@@ -5,10 +5,12 @@
 //! via the `split` method — the style id is routed separately because the
 //! property cascade applies it before direct formatting.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::docx::model::dimension::{Dimension, HalfPoints, Twips, Unit};
-use crate::docx::model::{RunProperties, StrikeStyle, StyleId, TextScale, UnderlineStyle};
+use crate::docx::model::{
+    DrawingFill, RunProperties, StrikeStyle, StyleId, TextScale, UnderlineStyle,
+};
 use crate::docx::parse::primitives::st_enums::{StHighlightColor, StUnderline, StVerticalAlignRun};
 use crate::docx::parse::primitives::units::deserialize_nonnegative_dimension;
 use crate::docx::parse::primitives::{last_toggle, HexColor, OnOff};
@@ -95,6 +97,29 @@ pub(crate) struct RPrXml {
     lang: Option<LangXml>,
     #[serde(rename = "bdr", default)]
     bdr: Option<BorderXml>,
+    /// Office 2010 text-effect fill (`w14:textFill`). Kept outside the ordinary
+    /// run cascade; WordArt consumes it as a shape-wide visual sidecar.
+    #[serde(rename = "textFill", default)]
+    text_fill: Option<TextFillXml>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TextFillXml {
+    fill: Option<DrawingFill>,
+}
+
+impl<'de> Deserialize<'de> for TextFillXml {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawTextFillXml {
+            #[serde(rename = "$value", default)]
+            fill: Option<crate::docx::parse::drawing::schema::fill::DrawingFillXml>,
+        }
+        let raw = RawTextFillXml::deserialize(deserializer)?;
+        Ok(Self {
+            fill: raw.fill.map(|fill| fill.into_word_text_effect()),
+        })
+    }
 }
 
 /// `<w:u w:val="..."/>` — underline. Unlike other ST-enum wrappers we can't
@@ -139,6 +164,10 @@ struct NonNegativeDimensionVal<U: Unit> {
 }
 
 impl RPrXml {
+    pub(crate) fn text_effect_fill(&self) -> Option<&DrawingFill> {
+        self.text_fill.as_ref()?.fill.as_ref()
+    }
+
     /// Split into `(properties, style_id)`. The style id applies first in
     /// the cascade (§17.7.2), so it stays separate from the direct-formatting
     /// `RunProperties`.
@@ -322,6 +351,62 @@ mod tests {
 
         let (rp, _) = parse(r#"<rPr><color val="auto"/></rPr>"#);
         assert_eq!(rp.color, Some(Color::Auto));
+    }
+
+    #[test]
+    fn office_2010_text_fill_keeps_a_linear_gradient_sidecar() {
+        let xml = r#"<w:rPr
+                xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+            <w14:textFill><w14:gradFill><w14:gsLst>
+                <w14:gs w14:pos="0"><w14:schemeClr w14:val="accent5">
+                    <w14:futureTransform w14:val="42"/>
+                </w14:schemeClr></w14:gs>
+                <w14:gs w14:pos="100000"><w14:schemeClr w14:val="accent2"/></w14:gs>
+            </w14:gsLst><w14:lin w14:ang="0" w14:scaled="1"/></w14:gradFill></w14:textFill>
+        </w:rPr>"#;
+        let properties: RPrXml = quick_xml::de::from_str(xml).expect("deserialize w14:textFill");
+        let DrawingFill::Gradient(gradient) = properties
+            .text_effect_fill()
+            .expect("text-effect fill sidecar")
+        else {
+            panic!("expected a gradient text fill")
+        };
+        assert_eq!(gradient.stops.len(), 2);
+        assert!(gradient.stops[0].color.transforms().is_empty());
+        assert!(matches!(
+            gradient.shade_properties,
+            crate::docx::model::GradientShadeProperties::Linear { angle, .. }
+                if angle.raw() == 0
+        ));
+    }
+
+    #[test]
+    fn unknown_text_fill_kind_is_ignorable() {
+        let xml = r#"<w:rPr
+                xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+            <w14:textFill><w14:futureFill w14:mode="new"/></w14:textFill>
+            <w:b/>
+        </w:rPr>"#;
+        let properties: RPrXml = quick_xml::de::from_str(xml).expect("ignore future text fill");
+        assert_eq!(properties.split().0.bold, Some(true));
+    }
+
+    #[test]
+    fn unknown_text_fill_base_color_is_ignorable() {
+        let xml = r#"<w:rPr
+                xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+                xmlns:w16="urn:future-wordml">
+            <w14:textFill><w14:gradFill><w14:gsLst>
+                <w14:gs w14:pos="0"><w16:futureClr><w16:data/></w16:futureClr></w14:gs>
+            </w14:gsLst></w14:gradFill></w14:textFill>
+            <w:b/>
+        </w:rPr>"#;
+        let properties: RPrXml =
+            quick_xml::de::from_str(xml).expect("ignore future text-fill base color");
+        assert_eq!(properties.split().0.bold, Some(true));
     }
 
     #[test]

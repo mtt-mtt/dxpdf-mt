@@ -35,6 +35,12 @@ pub enum DrawingColorXml {
     Scheme(SchemeClrXml),
     #[serde(rename = "prstClr")]
     Prst(PrstClrXml),
+    /// Future or foreign color choices are ignorable. This is particularly
+    /// important for `w14:textFill`, which may contain markup introduced by a
+    /// newer Office version: unsupported color syntax must not reject the
+    /// whole DOCX.
+    #[serde(other)]
+    Other,
 }
 
 impl From<DrawingColorXml> for DrawingColor {
@@ -69,7 +75,55 @@ impl From<DrawingColorXml> for DrawingColor {
                 name: x.val.into(),
                 transforms: convert_transforms(x.transforms),
             },
+            // Legacy consumers require a concrete color. Unknown choices
+            // retain their established black fallback; the new Word text-fill
+            // path filters them out before conversion.
+            DrawingColorXml::Other => Self::Srgb {
+                rgb: 0,
+                transforms: Vec::new(),
+            },
         }
+    }
+}
+
+impl DrawingColorXml {
+    /// Word 2010 text effects reuse DrawingML's color tree but define `tint`
+    /// and `shade` as the fraction of the input color that remains. The
+    /// renderer's established transform model stores the complementary amount
+    /// mixed toward white/black, so adapt only this w14 sidecar at parse time.
+    pub(crate) fn into_word_text_effect(self) -> Option<DrawingColor> {
+        Some(match self {
+            DrawingColorXml::Srgb(x) => DrawingColor::Srgb {
+                rgb: x.val.0,
+                transforms: convert_word_text_transforms(x.transforms),
+            },
+            DrawingColorXml::ScRgb(x) => DrawingColor::ScRgb {
+                r: x.r,
+                g: x.g,
+                b: x.b,
+                transforms: convert_word_text_transforms(x.transforms),
+            },
+            DrawingColorXml::Hsl(x) => DrawingColor::Hsl {
+                hue: x.hue,
+                sat: x.sat,
+                lum: x.lum,
+                transforms: convert_word_text_transforms(x.transforms),
+            },
+            DrawingColorXml::Sys(x) => DrawingColor::Sys {
+                name: x.val.into(),
+                last_clr: x.last_clr.map(|color| color.0),
+                transforms: convert_word_text_transforms(x.transforms),
+            },
+            DrawingColorXml::Scheme(x) => DrawingColor::Scheme {
+                name: x.val.into(),
+                transforms: convert_word_text_transforms(x.transforms),
+            },
+            DrawingColorXml::Prst(x) => DrawingColor::Prst {
+                name: x.val.into(),
+                transforms: convert_word_text_transforms(x.transforms),
+            },
+            DrawingColorXml::Other => return None,
+        })
     }
 }
 
@@ -156,6 +210,10 @@ pub enum ColorTransformXml {
     Tint(PctVal),
     #[serde(rename = "shade")]
     Shade(PctVal),
+    /// Office 2010 Word text effects serialize WordprocessingML's byte shade
+    /// factor inside the otherwise DrawingML-compatible color tree.
+    #[serde(rename = "wordShade")]
+    WordShade(ByteVal),
     #[serde(rename = "alpha")]
     Alpha(PctVal),
     #[serde(rename = "alphaOff")]
@@ -200,6 +258,10 @@ pub enum ColorTransformXml {
     Hue(AngleVal),
     #[serde(rename = "hueOff")]
     HueOff(AngleVal),
+    /// Office extensions may add transforms to an otherwise usable base
+    /// color. Ignore unknown transforms rather than discarding the document.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,43 +276,76 @@ pub struct AngleVal {
     pub val: Dimension<SixtieThousandthDeg>,
 }
 
-fn convert_transforms(xs: Vec<ColorTransformXml>) -> Vec<ColorTransform> {
-    xs.into_iter().map(Into::into).collect()
+#[derive(Debug, Deserialize)]
+pub struct ByteVal {
+    #[serde(rename = "@val")]
+    pub val: u8,
 }
 
-impl From<ColorTransformXml> for ColorTransform {
-    fn from(c: ColorTransformXml) -> Self {
+fn convert_transforms(xs: Vec<ColorTransformXml>) -> Vec<ColorTransform> {
+    xs.into_iter()
+        .filter_map(ColorTransformXml::into_model)
+        .collect()
+}
+
+fn convert_word_text_transforms(xs: Vec<ColorTransformXml>) -> Vec<ColorTransform> {
+    xs.into_iter()
+        .filter_map(ColorTransformXml::into_word_text_model)
+        .collect()
+}
+
+impl ColorTransformXml {
+    fn into_word_text_model(self) -> Option<ColorTransform> {
         use ColorTransformXml as X;
-        match c {
-            X::Comp => Self::Comp,
-            X::Inv => Self::Inv,
-            X::Gray => Self::Gray,
-            X::Gamma => Self::Gamma,
-            X::InvGamma => Self::InvGamma,
-            X::Tint(v) => Self::Tint(v.val),
-            X::Shade(v) => Self::Shade(v.val),
-            X::Alpha(v) => Self::Alpha(v.val),
-            X::AlphaOff(v) => Self::AlphaOff(v.val),
-            X::AlphaMod(v) => Self::AlphaMod(v.val),
-            X::HueMod(v) => Self::HueMod(v.val),
-            X::Sat(v) => Self::Sat(v.val),
-            X::SatOff(v) => Self::SatOff(v.val),
-            X::SatMod(v) => Self::SatMod(v.val),
-            X::Lum(v) => Self::Lum(v.val),
-            X::LumOff(v) => Self::LumOff(v.val),
-            X::LumMod(v) => Self::LumMod(v.val),
-            X::Red(v) => Self::Red(v.val),
-            X::RedOff(v) => Self::RedOff(v.val),
-            X::RedMod(v) => Self::RedMod(v.val),
-            X::Green(v) => Self::Green(v.val),
-            X::GreenOff(v) => Self::GreenOff(v.val),
-            X::GreenMod(v) => Self::GreenMod(v.val),
-            X::Blue(v) => Self::Blue(v.val),
-            X::BlueOff(v) => Self::BlueOff(v.val),
-            X::BlueMod(v) => Self::BlueMod(v.val),
-            X::Hue(v) => Self::Hue(v.val),
-            X::HueOff(v) => Self::HueOff(v.val),
+        let complement = |value: Dimension<ThousandthPercent>| {
+            Dimension::new(100_000 - value.raw().clamp(0, 100_000))
+        };
+        match self {
+            X::Tint(value) => Some(ColorTransform::Tint(complement(value.val))),
+            X::Shade(value) => Some(ColorTransform::Shade(complement(value.val))),
+            other => other.into_model(),
         }
+    }
+
+    fn into_model(self) -> Option<ColorTransform> {
+        use ColorTransformXml as X;
+        Some(match self {
+            X::Comp => ColorTransform::Comp,
+            X::Inv => ColorTransform::Inv,
+            X::Gray => ColorTransform::Gray,
+            X::Gamma => ColorTransform::Gamma,
+            X::InvGamma => ColorTransform::InvGamma,
+            X::Tint(v) => ColorTransform::Tint(v.val),
+            X::Shade(v) => ColorTransform::Shade(v.val),
+            // Word's byte is the fraction of the source color that remains;
+            // this crate's existing DrawingML `Shade` model stores the
+            // complementary amount mixed toward black.
+            X::WordShade(v) => ColorTransform::Shade(Dimension::new(
+                (i64::from(255 - v.val) * 100_000 + 127) / 255,
+            )),
+            X::Alpha(v) => ColorTransform::Alpha(v.val),
+            X::AlphaOff(v) => ColorTransform::AlphaOff(v.val),
+            X::AlphaMod(v) => ColorTransform::AlphaMod(v.val),
+            X::HueMod(v) => ColorTransform::HueMod(v.val),
+            X::Sat(v) => ColorTransform::Sat(v.val),
+            X::SatOff(v) => ColorTransform::SatOff(v.val),
+            X::SatMod(v) => ColorTransform::SatMod(v.val),
+            X::Lum(v) => ColorTransform::Lum(v.val),
+            X::LumOff(v) => ColorTransform::LumOff(v.val),
+            X::LumMod(v) => ColorTransform::LumMod(v.val),
+            X::Red(v) => ColorTransform::Red(v.val),
+            X::RedOff(v) => ColorTransform::RedOff(v.val),
+            X::RedMod(v) => ColorTransform::RedMod(v.val),
+            X::Green(v) => ColorTransform::Green(v.val),
+            X::GreenOff(v) => ColorTransform::GreenOff(v.val),
+            X::GreenMod(v) => ColorTransform::GreenMod(v.val),
+            X::Blue(v) => ColorTransform::Blue(v.val),
+            X::BlueOff(v) => ColorTransform::BlueOff(v.val),
+            X::BlueMod(v) => ColorTransform::BlueMod(v.val),
+            X::Hue(v) => ColorTransform::Hue(v.val),
+            X::HueOff(v) => ColorTransform::HueOff(v.val),
+            X::Other => return None,
+        })
     }
 }
 
@@ -797,6 +892,20 @@ mod tests {
         c.into()
     }
 
+    fn parse_word_text_color(xml: &str) -> DrawingColor {
+        let wrapped = format!(r#"<wrap xmlns:w14="urn:w14">{xml}</wrap>"#);
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(rename = "$value")]
+            color: DrawingColorXml,
+        }
+        quick_xml::de::from_str::<Wrap>(&wrapped)
+            .unwrap()
+            .color
+            .into_word_text_effect()
+            .expect("supported Word text color")
+    }
+
     #[test]
     fn srgb_with_no_transforms() {
         let c = parse(r#"<srgbClr val="FF0000"/>"#);
@@ -822,6 +931,33 @@ mod tests {
             }
             other => panic!("expected Srgb, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn office_word_shade_byte_maps_to_the_drawing_shade_factor() {
+        let c = parse(r#"<schemeClr val="accent5"><wordShade val="191"/></schemeClr>"#);
+        let DrawingColor::Scheme { transforms, .. } = c else {
+            panic!("expected Scheme")
+        };
+        assert!(matches!(
+            transforms.as_slice(),
+            [ColorTransform::Shade(value)] if value.raw() == 25_098
+        ));
+    }
+
+    #[test]
+    fn office_text_tint_and_shade_keep_the_documented_input_fraction() {
+        let color = parse_word_text_color(
+            r#"<schemeClr val="accent5"><tint val="10000"/><shade val="20000"/></schemeClr>"#,
+        );
+        let DrawingColor::Scheme { transforms, .. } = color else {
+            panic!("expected Scheme")
+        };
+        assert!(matches!(
+            transforms.as_slice(),
+            [ColorTransform::Tint(tint), ColorTransform::Shade(shade)]
+                if tint.raw() == 90_000 && shade.raw() == 80_000
+        ));
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub enum DrawingFillXml {
     BlipFill(BlipFillXml),
     #[serde(rename = "pattFill")]
     PattFill(PattFillXml),
+    /// Extension fill kinds are ignorable here; consumers retain their
+    /// established no-fill fallback instead of rejecting the whole DOCX.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -54,6 +58,27 @@ impl From<DrawingFillXml> for DrawingFill {
             DrawingFillXml::GradFill(g) => Self::Gradient(g.into()),
             DrawingFillXml::BlipFill(b) => Self::Blip(b.into()),
             DrawingFillXml::PattFill(p) => Self::Pattern(p.into()),
+            DrawingFillXml::Other => Self::None,
+        }
+    }
+}
+
+impl DrawingFillXml {
+    /// Convert a `w14:textFill`, whose tint/shade percentages use Word's
+    /// input-retention convention rather than the ordinary DrawingML one.
+    pub(crate) fn into_word_text_effect(self) -> DrawingFill {
+        match self {
+            Self::NoFill(_) => DrawingFill::None,
+            Self::GrpFill(_) => DrawingFill::Group,
+            Self::SolidFill(solid) => solid
+                .color
+                .and_then(DrawingColorXml::into_word_text_effect)
+                .map(DrawingFill::Solid)
+                .unwrap_or(DrawingFill::None),
+            Self::GradFill(gradient) => DrawingFill::Gradient(gradient.into_word_text_effect()),
+            Self::BlipFill(blip) => DrawingFill::Blip(blip.into()),
+            Self::PattFill(pattern) => DrawingFill::Pattern(pattern.into()),
+            Self::Other => DrawingFill::None,
         }
     }
 }
@@ -215,6 +240,53 @@ impl From<GradFillXml> for GradientFill {
             flip: x.flip.map(Into::into),
             rot_with_shape: x.rot_with_shape.map(|o| o.0),
             tile_rect: x.tile_rect.map(Into::into),
+        }
+    }
+}
+
+impl GradFillXml {
+    fn into_word_text_effect(self) -> GradientFill {
+        let stops = self
+            .gs_lst
+            .map(|list| {
+                list.stops
+                    .into_iter()
+                    .filter_map(|stop| {
+                        stop.color
+                            .into_word_text_effect()
+                            .map(|color| GradientStop {
+                                position: stop.pos,
+                                color,
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shade_properties = if let Some(linear) = self.lin {
+            GradientShadeProperties::Linear {
+                angle: linear.angle.unwrap_or_default(),
+                scaled: linear.scaled.map(|value| value.0),
+            }
+        } else if let Some(path) = self.path {
+            GradientShadeProperties::Path {
+                path_type: path
+                    .path_type
+                    .map(Into::into)
+                    .unwrap_or(PathShadeType::Circle),
+                fill_to_rect: path.fill_to_rect.map(Into::into),
+            }
+        } else {
+            GradientShadeProperties::Linear {
+                angle: Dimension::new(0),
+                scaled: None,
+            }
+        };
+        GradientFill {
+            stops,
+            shade_properties,
+            flip: self.flip.map(Into::into),
+            rot_with_shape: self.rot_with_shape.map(|value| value.0),
+            tile_rect: self.tile_rect.map(Into::into),
         }
     }
 }

@@ -3,7 +3,7 @@
 
 use crate::model::{self, Paragraph};
 use crate::render::dimension::Pt;
-use crate::render::geometry::PtSize;
+use crate::render::geometry::{PtOffset, PtSize};
 use crate::render::layout::section::{
     FloatingImage, FloatingImageX, FloatingImageY, FloatingShape, PageParity,
 };
@@ -1658,10 +1658,36 @@ pub(crate) fn build_shape_text_commands(
         PageParity::Odd,
     );
 
+    let content_height = (extent.height - top_inset - bot_inset).max(Pt::ZERO);
+    if matches!(
+        wsp.body_pr
+            .as_ref()
+            .and_then(|body| body.text_warp.as_ref())
+            .map(|warp| &warp.preset),
+        Some(crate::model::PresetTextWarpType::TextCircle)
+    ) && matches!(
+        wsp.txbx_content.as_slice(),
+        [crate::model::Block::Paragraph(_)]
+    ) {
+        if let Some(commands) = build_text_circle_commands(
+            &result.commands,
+            PtOffset::new(left_inset, top_inset),
+            PtSize::new(content_width, content_height),
+            wsp.body_pr
+                .as_ref()
+                .and_then(|body| body.text_warp.as_ref())
+                .expect("textCircle guard retains its warp"),
+            wsp.text_fill.as_ref(),
+            ctx.resolved.theme.as_ref(),
+            ctx.measurer,
+        ) {
+            return commands;
+        }
+    }
+
     // §20.1.10.60: `bIns` closes off the bottom of the box the body sits in,
     // and `anchor` decides where in that box it sits. Both were previously
     // dropped, which pinned every body to the top.
-    let content_height = (extent.height - top_inset - bot_inset).max(Pt::ZERO);
     let anchor = BodyAnchor::resolve(wsp.body_pr.as_ref().and_then(|bp| bp.anchor));
     let body_top = top_inset + anchor.offset(content_height, result.height);
 
@@ -1684,6 +1710,359 @@ pub(crate) fn build_shape_text_commands(
         commands.push(cmd);
     }
     commands
+}
+
+#[derive(Clone)]
+struct CircleGlyph {
+    text: std::rc::Rc<str>,
+    font_family: std::rc::Rc<str>,
+    font_size: Pt,
+    bold: bool,
+    italic: bool,
+    color: crate::render::resolve::color::RgbColor,
+    text_scale: f32,
+    raw_glyph_width: f32,
+    raw_spacing: f32,
+    raw_ascent: f32,
+}
+
+/// Render the DrawingML `textCircle` curve as independently shaped grapheme
+/// clusters following its preset ellipse. This is deliberately narrow: the
+/// ordinary text-box result is retained whenever the body contains complex
+/// script, decoration, images, or any command other than plain text.
+fn build_text_circle_commands(
+    source: &[crate::render::layout::draw_command::DrawCommand],
+    content_origin: PtOffset,
+    content_size: PtSize,
+    warp: &crate::model::PresetTextWarp,
+    text_fill: Option<&crate::model::DrawingFill>,
+    theme: Option<&crate::model::Theme>,
+    measurer: &crate::render::layout::measurer::TextMeasurer<'_>,
+) -> Option<Vec<crate::render::layout::draw_command::DrawCommand>> {
+    use crate::render::layout::draw_command::DrawCommand;
+    use crate::render::layout::fragment::{AutoLineSpacingContribution, FontProps};
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if content_size.width <= Pt::ZERO || content_size.height <= Pt::ZERO {
+        return None;
+    }
+
+    let mut glyphs = Vec::new();
+    for command in source {
+        let DrawCommand::Text {
+            text,
+            font_family,
+            char_spacing,
+            font_size,
+            bold,
+            italic,
+            color,
+            text_scale,
+            rotation_degrees,
+            ..
+        } = command
+        else {
+            return None;
+        };
+        if rotation_degrees.abs() > f32::EPSILON
+            || !font_size.raw().is_finite()
+            || font_size <= &Pt::ZERO
+            || !text_scale.is_finite()
+            || *text_scale <= 0.0
+            || !text.chars().all(|ch| ch.is_ascii() && !ch.is_control())
+        {
+            return None;
+        }
+
+        for grapheme in text.graphemes(true) {
+            let font = FontProps {
+                family: font_family.clone(),
+                size: *font_size,
+                bold: *bold,
+                italic: *italic,
+                underline: false,
+                char_spacing: Pt::ZERO,
+                text_scale: *text_scale,
+                auto_line_spacing: AutoLineSpacingContribution::Scaled,
+                east_asian_language: None,
+                underline_position: Pt::ZERO,
+                underline_thickness: Pt::ZERO,
+            };
+            let (width, metrics) = measurer.measure(grapheme, &font);
+            let spacing = char_spacing.raw() * grapheme.chars().count() as f32;
+            if !width.raw().is_finite() || !metrics.ascent.raw().is_finite() || !spacing.is_finite()
+            {
+                return None;
+            }
+            glyphs.push(CircleGlyph {
+                text: std::rc::Rc::from(grapheme),
+                font_family: font_family.clone(),
+                font_size: *font_size,
+                bold: *bold,
+                italic: *italic,
+                color: *color,
+                text_scale: *text_scale,
+                raw_glyph_width: width.raw().max(0.0),
+                raw_spacing: spacing.max(0.0),
+                raw_ascent: metrics.ascent.raw().max(0.0),
+            });
+        }
+    }
+
+    if glyphs.is_empty() || !glyphs.iter().any(|glyph| !glyph.text.trim().is_empty()) {
+        return None;
+    }
+    let raw_advance: f32 = glyphs
+        .iter()
+        .map(|glyph| glyph.raw_glyph_width + glyph.raw_spacing)
+        .sum();
+    let raw_ascent = glyphs
+        .iter()
+        .map(|glyph| glyph.raw_ascent)
+        .fold(0.0_f32, f32::max);
+    if raw_advance <= f32::EPSILON || raw_ascent <= f32::EPSILON {
+        return None;
+    }
+
+    let (start_angle, sweep_angle) = text_circle_angles(warp);
+    if sweep_angle <= f32::EPSILON {
+        return None;
+    }
+    let half_width = content_size.width.raw() * 0.5;
+    let half_height = content_size.height.raw() * 0.5;
+    let mut scale = 1.0_f32;
+    for _ in 0..12 {
+        // Our painter follows a baseline, while the preset curve describes the
+        // visible text path. Pull the baseline in by the ascent so the glyphs,
+        // rather than their baseline, stay inside the inset body box.
+        let safety = 2.5_f32;
+        let rx = half_width - raw_ascent * scale - safety;
+        let ry = half_height - raw_ascent * scale - safety;
+        if rx <= 1.0 || ry <= 1.0 {
+            return None;
+        }
+        let (_, path_length) = ellipse_arc_table(rx, ry, start_angle, sweep_angle);
+        let next = (path_length * 0.80 / raw_advance).clamp(0.05, 1.0);
+        if (next - scale).abs() < 0.0005 {
+            scale = next;
+            break;
+        }
+        scale = next;
+    }
+
+    let rx = half_width - raw_ascent * scale - 2.5;
+    let ry = half_height - raw_ascent * scale - 2.5;
+    if rx <= 1.0 || ry <= 1.0 {
+        return None;
+    }
+    let (arc, path_length) = ellipse_arc_table(rx, ry, start_angle, sweep_angle);
+    if path_length <= f32::EPSILON {
+        return None;
+    }
+    // The minimum scale is a legibility floor, not permission to stack an
+    // arbitrarily long string at the arc end. Fall back to the ordinary text
+    // box when even that floor cannot preserve the intended seam.
+    if raw_advance * scale > path_length * 0.80 * 1.001 {
+        return None;
+    }
+
+    let center_x = content_origin.x.raw() + half_width;
+    let center_y = content_origin.y.raw() + half_height;
+    let gradient = text_fill.and_then(|fill| resolve_circle_gradient(fill, theme));
+    let mut cursor = 0.0_f32;
+    let mut result = Vec::with_capacity(glyphs.len());
+    for glyph in glyphs {
+        let glyph_width = glyph.raw_glyph_width * scale;
+        let spacing = glyph.raw_spacing * scale;
+        let midpoint = (cursor + glyph_width * 0.5).min(path_length);
+        let theta = theta_at_arc_length(&arc, midpoint);
+        let tangent_x = -rx * theta.sin();
+        let tangent_y = ry * theta.cos();
+        let tangent_length = tangent_x.hypot(tangent_y).max(f32::EPSILON);
+        let unit_x = tangent_x / tangent_length;
+        let unit_y = tangent_y / tangent_length;
+        let mid_x = center_x + rx * theta.cos();
+        let mid_y = center_y + ry * theta.sin();
+        let position = PtOffset::new(
+            Pt::new(mid_x - unit_x * glyph_width * 0.5),
+            Pt::new(mid_y - unit_y * glyph_width * 0.5),
+        );
+        result.push(DrawCommand::Text {
+            position,
+            text: glyph.text,
+            font_family: glyph.font_family,
+            char_spacing: Pt::ZERO,
+            font_size: glyph.font_size * scale,
+            bold: glyph.bold,
+            italic: glyph.italic,
+            color: gradient
+                .as_ref()
+                .map(|gradient| gradient.color_at(mid_x, mid_y, content_origin, content_size))
+                .unwrap_or(glyph.color),
+            text_scale: glyph.text_scale,
+            rotation_degrees: tangent_y.atan2(tangent_x).to_degrees(),
+        });
+        cursor += glyph_width + spacing;
+    }
+    Some(result)
+}
+
+struct CircleGradient {
+    angle_radians: f32,
+    scaled: bool,
+    stops: Vec<(f32, crate::render::resolve::color::RgbColor)>,
+}
+
+impl CircleGradient {
+    fn color_at(
+        &self,
+        x: f32,
+        y: f32,
+        origin: PtOffset,
+        size: PtSize,
+    ) -> crate::render::resolve::color::RgbColor {
+        let mut dir_x = self.angle_radians.cos();
+        let mut dir_y = self.angle_radians.sin();
+        if self.scaled {
+            dir_x *= size.width.raw();
+            dir_y *= size.height.raw();
+            let length = dir_x.hypot(dir_y).max(f32::EPSILON);
+            dir_x /= length;
+            dir_y /= length;
+        }
+        let center_x = origin.x.raw() + size.width.raw() * 0.5;
+        let center_y = origin.y.raw() + size.height.raw() * 0.5;
+        let half_projection =
+            (dir_x.abs() * size.width.raw() + dir_y.abs() * size.height.raw()) * 0.5;
+        let t = if half_projection > f32::EPSILON {
+            (0.5 + ((x - center_x) * dir_x + (y - center_y) * dir_y) / (2.0 * half_projection))
+                .clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let upper = self
+            .stops
+            .iter()
+            .position(|(position, _)| *position >= t)
+            .unwrap_or(self.stops.len() - 1);
+        if upper == 0 {
+            return self.stops[0].1;
+        }
+        let (p0, c0) = self.stops[upper - 1];
+        let (p1, c1) = self.stops[upper];
+        let amount = if p1 > p0 {
+            ((t - p0) / (p1 - p0)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
+        crate::render::resolve::color::RgbColor {
+            r: channel(c0.r, c1.r),
+            g: channel(c0.g, c1.g),
+            b: channel(c0.b, c1.b),
+        }
+    }
+}
+
+fn resolve_circle_gradient(
+    fill: &crate::model::DrawingFill,
+    theme: Option<&crate::model::Theme>,
+) -> Option<CircleGradient> {
+    let crate::model::DrawingFill::Gradient(gradient) = fill else {
+        return None;
+    };
+    let crate::model::GradientShadeProperties::Linear { angle, scaled } = gradient.shade_properties
+    else {
+        return None;
+    };
+    if gradient.stops.len() < 2 {
+        return None;
+    }
+    let context = crate::render::resolve::drawing_color::DrawingColorContext::new(theme);
+    let mut stops = gradient
+        .stops
+        .iter()
+        .map(|stop| {
+            let rgba =
+                crate::render::resolve::drawing_color::resolve_drawing_color(&stop.color, &context);
+            (
+                (stop.position.raw() as f32 / 100_000.0).clamp(0.0, 1.0),
+                crate::render::resolve::color::rgb_from_u32(rgba.to_rgb24()),
+            )
+        })
+        .collect::<Vec<_>>();
+    stops.sort_by(|left, right| left.0.total_cmp(&right.0));
+    Some(CircleGradient {
+        angle_radians: angle.raw() as f32 / 60_000.0 * std::f32::consts::PI / 180.0,
+        scaled: scaled.unwrap_or(false),
+        stops,
+    })
+}
+
+/// ECMA-376 `presetTextWarpDefinitions.xml`, `textCircle` guide equations.
+/// Angles are returned in radians in DrawingML's clockwise, y-down frame.
+fn text_circle_angles(warp: &crate::model::PresetTextWarp) -> (f32, f32) {
+    let mut adjustment = 10_800_000_i64;
+    if let Some(guide) = warp.adjust_values.iter().find(|guide| guide.name == "adj") {
+        let mut terms = guide.formula.split_whitespace();
+        if terms.next() == Some("val") {
+            if let Some(value) = terms.next().and_then(|value| value.parse::<i64>().ok()) {
+                adjustment = value;
+            }
+        }
+    }
+    let adval = adjustment.clamp(0, 21_599_999);
+    let d0 = adval - 10_800_000;
+    let d1 = 10_800_000 - adval;
+    let d2 = 21_600_000 - adval;
+    let d3 = if d1 > 0 { d1 } else { 10_799_999 };
+    let d4 = if d0 > 0 { d2 } else { d3 };
+    let sweep = d4 * 2;
+    let unit_to_radians = std::f32::consts::PI / 10_800_000.0;
+    (
+        adval as f32 * unit_to_radians,
+        sweep as f32 * unit_to_radians,
+    )
+}
+
+fn ellipse_arc_table(rx: f32, ry: f32, start: f32, sweep: f32) -> (Vec<(f32, f32)>, f32) {
+    const STEPS: usize = 512;
+    let mut samples = Vec::with_capacity(STEPS + 1);
+    let mut total = 0.0_f32;
+    let mut previous_x = rx * start.cos();
+    let mut previous_y = ry * start.sin();
+    samples.push((start, total));
+    for step in 1..=STEPS {
+        let theta = start + sweep * step as f32 / STEPS as f32;
+        let x = rx * theta.cos();
+        let y = ry * theta.sin();
+        total += (x - previous_x).hypot(y - previous_y);
+        samples.push((theta, total));
+        previous_x = x;
+        previous_y = y;
+    }
+    (samples, total)
+}
+
+fn theta_at_arc_length(samples: &[(f32, f32)], target: f32) -> f32 {
+    let mut low = 1_usize;
+    let mut high = samples.len() - 1;
+    while low < high {
+        let mid = (low + high) / 2;
+        if samples[mid].1 < target {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    let (theta1, length1) = samples[low];
+    let (theta0, length0) = samples[low - 1];
+    let fraction = if length1 > length0 {
+        ((target - length0) / (length1 - length0)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    theta0 + (theta1 - theta0) * fraction
 }
 
 /// Lay out a legacy VML text box through the same WordprocessingML sub-layout
@@ -1722,6 +2101,7 @@ pub(crate) fn build_vml_text_commands(
             }),
             vert_overflow: None,
             auto_fit: None,
+            text_warp: None,
         });
     let adapter = crate::model::WordProcessingShape {
         cnv_pr: None,
@@ -1731,6 +2111,7 @@ pub(crate) fn build_vml_text_commands(
         style_fill_ref: None,
         style_font_ref: None,
         body_pr,
+        text_fill: None,
         txbx_content: text_box.content.clone(),
     };
     build_shape_text_commands(&adapter, extent, ctx, state)
@@ -1806,6 +2187,7 @@ mod tests {
                 style_fill_ref: None,
                 style_font_ref: None,
                 body_pr: None,
+                text_fill: None,
                 txbx_content: vec![],
             })),
             placement: ImagePlacement::Anchor(AnchorProperties {
@@ -2354,6 +2736,7 @@ mod tests {
             style_fill_ref: None,
             style_font_ref: None,
             body_pr,
+            text_fill: None,
             txbx_content: vec![crate::model::Block::Paragraph(Box::new(ModelParagraph {
                 style_id: None,
                 properties: ParagraphProperties::default(),
@@ -2381,6 +2764,7 @@ mod tests {
             bottom_inset: Some(Dimension::new(inset_emu)),
             anchor,
             auto_fit: None,
+            text_warp: None,
         }
     }
 
@@ -2404,6 +2788,221 @@ mod tests {
                 _ => None,
             })
             .expect("the shape body emits text")
+    }
+
+    fn text_circle_warp(adjustment: i64) -> crate::model::PresetTextWarp {
+        crate::model::PresetTextWarp {
+            preset: crate::model::PresetTextWarpType::TextCircle,
+            adjust_values: vec![crate::model::GeomGuide {
+                name: "adj".into(),
+                formula: format!("val {adjustment}"),
+            }],
+        }
+    }
+
+    #[test]
+    fn text_circle_adjustment_controls_start_and_sweep() {
+        let (start, sweep) = super::text_circle_angles(&text_circle_warp(10_800_000));
+        assert!((start - std::f32::consts::PI).abs() < 1e-5);
+        assert!((sweep - std::f32::consts::TAU).abs() < 1e-5);
+
+        let (start, sweep) = super::text_circle_angles(&text_circle_warp(16_200_000));
+        assert!((start - 1.5 * std::f32::consts::PI).abs() < 1e-5);
+        assert!((sweep - std::f32::consts::PI).abs() < 1e-5);
+    }
+
+    #[test]
+    fn text_circle_preserves_ascii_graphemes_and_follows_the_ellipse() {
+        use crate::render::geometry::PtOffset;
+        use crate::render::layout::draw_command::DrawCommand;
+        use crate::render::resolve::color::RgbColor;
+        use std::rc::Rc;
+
+        let source_text = "THE TEXT CAN BE MADE LIKE THIS.";
+        let source = DrawCommand::Text {
+            position: PtOffset::default(),
+            text: Rc::from(source_text),
+            font_family: Rc::from("Arial"),
+            char_spacing: Pt::new(8.5),
+            font_size: Pt::new(36.0),
+            bold: true,
+            italic: false,
+            color: RgbColor::BLACK,
+            text_scale: 1.0,
+            rotation_degrees: 0.0,
+        };
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let commands = super::build_text_circle_commands(
+            &[source],
+            PtOffset::default(),
+            PtSize::new(Pt::new(130.101), Pt::new(130.252)),
+            &text_circle_warp(10_800_000),
+            None,
+            None,
+            &measurer,
+        )
+        .expect("simple Latin WordArt follows the circle");
+
+        let mut reconstructed = String::new();
+        let mut rotations = Vec::new();
+        for command in &commands {
+            let DrawCommand::Text {
+                position,
+                text,
+                font_size,
+                char_spacing,
+                rotation_degrees,
+                ..
+            } = command
+            else {
+                panic!("textCircle emits only text commands")
+            };
+            reconstructed.push_str(text);
+            assert_eq!(text.chars().count(), 1, "ASCII graphemes remain atomic");
+            assert_eq!(*char_spacing, Pt::ZERO);
+            assert!(font_size.raw() > 0.0 && font_size.raw() < 36.0);
+            assert!((-5.0..=135.0).contains(&position.x.raw()));
+            assert!((-5.0..=135.0).contains(&position.y.raw()));
+            rotations.push(*rotation_degrees);
+        }
+        assert_eq!(reconstructed, source_text);
+        assert!((rotations[0] + 90.0).abs() < 20.0);
+        assert!(rotations.iter().any(|angle| *angle < -60.0));
+        assert!(rotations.iter().any(|angle| *angle > 60.0));
+    }
+
+    #[test]
+    fn text_circle_falls_back_for_contextual_scripts() {
+        use crate::render::geometry::PtOffset;
+        use crate::render::layout::draw_command::DrawCommand;
+        use crate::render::resolve::color::RgbColor;
+        use std::rc::Rc;
+
+        let source = DrawCommand::Text {
+            position: PtOffset::default(),
+            text: Rc::from("مرحبا"),
+            font_family: Rc::from("Arial"),
+            char_spacing: Pt::ZERO,
+            font_size: Pt::new(24.0),
+            bold: false,
+            italic: false,
+            color: RgbColor::BLACK,
+            text_scale: 1.0,
+            rotation_degrees: 0.0,
+        };
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        assert!(super::build_text_circle_commands(
+            &[source],
+            PtOffset::default(),
+            PtSize::new(Pt::new(130.0), Pt::new(130.0)),
+            &text_circle_warp(10_800_000),
+            None,
+            None,
+            &measurer,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn text_circle_falls_back_instead_of_stacking_overlong_text_at_the_seam() {
+        use crate::render::geometry::PtOffset;
+        use crate::render::layout::draw_command::DrawCommand;
+        use crate::render::resolve::color::RgbColor;
+        use std::rc::Rc;
+
+        let source = DrawCommand::Text {
+            position: PtOffset::default(),
+            text: Rc::from("A".repeat(10_000)),
+            font_family: Rc::from("Arial"),
+            char_spacing: Pt::new(8.5),
+            font_size: Pt::new(36.0),
+            bold: true,
+            italic: false,
+            color: RgbColor::BLACK,
+            text_scale: 1.0,
+            rotation_degrees: 0.0,
+        };
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        assert!(super::build_text_circle_commands(
+            &[source],
+            PtOffset::default(),
+            PtSize::new(Pt::new(130.0), Pt::new(130.0)),
+            &text_circle_warp(10_800_000),
+            None,
+            None,
+            &measurer,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn text_circle_gradient_samples_left_to_right() {
+        use crate::render::geometry::PtOffset;
+        use crate::render::resolve::color::RgbColor;
+
+        let gradient = super::CircleGradient {
+            angle_radians: 0.0,
+            scaled: false,
+            stops: vec![
+                (
+                    0.0,
+                    RgbColor {
+                        r: 68,
+                        g: 114,
+                        b: 196,
+                    },
+                ),
+                (
+                    1.0,
+                    RgbColor {
+                        r: 237,
+                        g: 125,
+                        b: 49,
+                    },
+                ),
+            ],
+        };
+        let origin = PtOffset::default();
+        let size = PtSize::new(Pt::new(100.0), Pt::new(80.0));
+        assert_eq!(
+            gradient.color_at(0.0, 40.0, origin, size),
+            gradient.stops[0].1
+        );
+        assert_eq!(
+            gradient.color_at(100.0, 40.0, origin, size),
+            gradient.stops[1].1
+        );
+        let middle = gradient.color_at(50.0, 40.0, origin, size);
+        assert!(middle.r > gradient.stops[0].1.r && middle.r < gradient.stops[1].1.r);
+    }
+
+    #[test]
+    fn text_circle_gradient_honors_scaled_angle_on_a_non_square_box() {
+        use crate::render::geometry::PtOffset;
+        use crate::render::resolve::color::RgbColor;
+
+        let stops = vec![(0.0, RgbColor::BLACK), (1.0, RgbColor::WHITE)];
+        let unscaled = super::CircleGradient {
+            angle_radians: std::f32::consts::FRAC_PI_4,
+            scaled: false,
+            stops: stops.clone(),
+        };
+        let scaled = super::CircleGradient {
+            angle_radians: std::f32::consts::FRAC_PI_4,
+            scaled: true,
+            stops,
+        };
+        let origin = PtOffset::default();
+        let size = PtSize::new(Pt::new(100.0), Pt::new(50.0));
+        let unscaled_top = unscaled.color_at(50.0, 0.0, origin, size);
+        let scaled_top = scaled.color_at(50.0, 0.0, origin, size);
+        assert!(
+            scaled_top.r > unscaled_top.r,
+            "scaling 45° by a wide box rotates the gradient toward horizontal"
+        );
     }
 
     /// §20.1.10.60: `anchor` places the body within the box `bIns` closes off.

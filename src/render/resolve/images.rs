@@ -231,6 +231,7 @@ mod tests {
                 style_fill_ref: None,
                 style_font_ref: None,
                 body_pr: None,
+                text_fill: None,
                 txbx_content: vec![],
             })),
             placement: ImagePlacement::Inline {

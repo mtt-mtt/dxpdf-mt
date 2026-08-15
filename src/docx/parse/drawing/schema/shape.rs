@@ -17,9 +17,10 @@ use crate::docx::dimension::{Dimension, Emu, SixtieThousandthDeg, ThousandthPerc
 use crate::docx::geometry::Offset;
 use crate::docx::model::{
     BlackWhiteMode, Block, BodyProperties, DrawingFill, FontCollectionIndex, FontReference,
-    GeomGuide, NormalAutoFit, PresetGeometryDef, PresetShapeType, ShapeGeometry, ShapeProperties,
-    StyleMatrixRef, TextAnchoringType, TextAutoFit, TextVertOverflow, TextVerticalType,
-    TextWrappingType, Transform2D, WordProcessingShape,
+    GeomGuide, NormalAutoFit, PresetGeometryDef, PresetShapeType, PresetTextWarp,
+    PresetTextWarpType, ShapeGeometry, ShapeProperties, StyleMatrixRef, TextAnchoringType,
+    TextAutoFit, TextVertOverflow, TextVerticalType, TextWrappingType, Transform2D,
+    WordProcessingShape,
 };
 use crate::docx::parse::primitives::units::deserialize_nonnegative_dimension;
 
@@ -423,6 +424,16 @@ pub struct BodyPrXml {
     pub norm_autofit: Option<NormAutofitXml>,
     #[serde(rename = "spAutoFit", default)]
     pub sp_autofit: Option<super::fill::Empty>,
+    #[serde(rename = "prstTxWarp", default)]
+    pub prst_tx_warp: Option<PrstTextWarpXml>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrstTextWarpXml {
+    #[serde(rename = "@prst")]
+    pub prst: String,
+    #[serde(rename = "avLst", default)]
+    pub av_lst: Option<super::geometry::GdListXml>,
 }
 
 /// §20.1.2.1.18 CT_TextNormalAutofit. Both attributes are `ST_TextFontScalePercentOrPercentString`
@@ -459,6 +470,24 @@ impl From<BodyPrXml> for BodyProperties {
             anchor: x.anchor.map(Into::into),
             vert_overflow: x.vert_overflow.map(Into::into),
             auto_fit,
+            text_warp: x.prst_tx_warp.map(|warp| PresetTextWarp {
+                preset: match warp.prst.as_str() {
+                    "textCircle" => PresetTextWarpType::TextCircle,
+                    other => PresetTextWarpType::Other(other.to_owned()),
+                },
+                adjust_values: warp
+                    .av_lst
+                    .map(|list| {
+                        list.guides
+                            .into_iter()
+                            .map(|guide| GeomGuide {
+                                name: guide.name,
+                                formula: guide.fmla,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
         }
     }
 }
@@ -580,6 +609,11 @@ impl WspXml {
         self,
         ctx: &mut crate::docx::parse::body::ConvertCtx,
     ) -> WordProcessingShape {
+        let text_fill = self
+            .txbx
+            .as_ref()
+            .and_then(|txbx| txbx.content.as_ref())
+            .and_then(shape_text_effect_fill);
         let txbx_content: Vec<Block> = self
             .txbx
             .and_then(|t| t.content)
@@ -605,9 +639,26 @@ impl WspXml {
             style_fill_ref,
             style_font_ref,
             body_pr: self.body_pr.map(Into::into),
+            text_fill,
             txbx_content,
         }
     }
+}
+
+fn shape_text_effect_fill(content: &TxbxContentXml) -> Option<DrawingFill> {
+    use crate::docx::parse::body_schema::{BlockChildXml, ParaChildXml};
+
+    content.children.iter().find_map(|block| {
+        let BlockChildXml::Paragraph(paragraph) = block else {
+            return None;
+        };
+        paragraph.content.iter().find_map(|child| {
+            let ParaChildXml::PPr(properties) = child else {
+                return None;
+            };
+            properties.text_effect_fill().cloned()
+        })
+    })
 }
 
 // ── ST enums ──────────────────────────────────────────────────────────────
@@ -908,6 +959,29 @@ mod tests {
         assert_eq!(bp.auto_fit, Some(TextAutoFit::NoAutoFit));
     }
 
+    #[test]
+    fn body_pr_keeps_text_circle_and_adjustment_guide() {
+        let bp = parse_body_pr(
+            r#"<bodyPr><prstTxWarp prst="textCircle"><avLst>
+                <gd name="adj" fmla="val 10800000"/>
+            </avLst></prstTxWarp></bodyPr>"#,
+        );
+        let warp = bp.text_warp.expect("text warp");
+        assert_eq!(warp.preset, PresetTextWarpType::TextCircle);
+        assert_eq!(warp.adjust_values.len(), 1);
+        assert_eq!(warp.adjust_values[0].name, "adj");
+        assert_eq!(warp.adjust_values[0].formula, "val 10800000");
+    }
+
+    #[test]
+    fn body_pr_retains_unknown_text_warp_for_safe_fallback() {
+        let bp = parse_body_pr(r#"<bodyPr><prstTxWarp prst="textWave1"/></bodyPr>"#);
+        assert_eq!(
+            bp.text_warp.expect("text warp").preset,
+            PresetTextWarpType::Other("textWave1".to_owned())
+        );
+    }
+
     /// §20.1.2.1.18: `normAutofit` carries the shrink Word already computed.
     /// Both attributes are thousandths of a percent — `62500` is 62.5%, not
     /// 62500%.
@@ -1029,6 +1103,40 @@ mod tests {
             Block::Paragraph(_) => (),
             other => panic!("expected Paragraph, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wsp_keeps_the_paragraph_mark_text_fill_for_wordart() {
+        let xml = r#"<wrap xmlns:wps="urn:wps"
+                xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+                xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <wsp>
+                <cNvPr id="25" name="WordArt"/><spPr><prstGeom prst="rect"/></spPr>
+                <txbx><txbxContent><w:p><w:pPr><w:rPr>
+                    <w14:textFill><w14:gradFill><w14:gsLst>
+                        <w14:gs w14:pos="0"><w14:schemeClr w14:val="accent5"/></w14:gs>
+                        <w14:gs w14:pos="100000"><w14:schemeClr w14:val="accent2"/></w14:gs>
+                    </w14:gsLst><w14:lin w14:ang="0"/></w14:gradFill></w14:textFill>
+                </w:rPr></w:pPr><w:r><w:t>Circle</w:t></w:r></w:p></txbxContent></txbx>
+                <bodyPr><prstTxWarp prst="textCircle"/></bodyPr>
+            </wsp>
+        </wrap>"#;
+        #[derive(Deserialize)]
+        struct Wrap {
+            wsp: WspXml,
+        }
+        let parsed: Wrap = quick_xml::de::from_str(xml).unwrap();
+        let mut ctx = crate::docx::parse::body::ConvertCtx::new();
+        let wsp = parsed.wsp.into_model(&mut ctx);
+        assert!(matches!(wsp.text_fill, Some(DrawingFill::Gradient(_))));
+        assert!(matches!(
+            wsp.body_pr
+                .as_ref()
+                .and_then(|body| body.text_warp.as_ref())
+                .map(|warp| &warp.preset),
+            Some(PresetTextWarpType::TextCircle)
+        ));
     }
 
     #[test]

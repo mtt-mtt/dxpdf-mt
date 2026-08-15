@@ -169,6 +169,10 @@ pub struct WordProcessingShape {
     pub style_font_ref: Option<FontReference>,
     /// §20.1.2.1.1: body properties (text layout within the shape).
     pub body_pr: Option<BodyProperties>,
+    /// Office 2010 `w14:textFill` inherited by the shape text. Kept as a
+    /// shape-wide sidecar for WordArt; ordinary body text continues to use the
+    /// established WordprocessingML color cascade.
+    pub text_fill: Option<DrawingFill>,
     /// §17.17.1: text content inside the shape.
     pub txbx_content: Vec<Block>,
 }
@@ -226,6 +230,23 @@ pub struct BodyProperties {
     pub vert_overflow: Option<TextVertOverflow>,
     /// Auto-fit mode.
     pub auto_fit: Option<TextAutoFit>,
+    /// §20.1.9.19 `a:prstTxWarp`: preset geometry that deforms the text body.
+    /// Unknown presets are retained for a safe ordinary-text fallback.
+    pub text_warp: Option<PresetTextWarp>,
+}
+
+/// Preset text-warp geometry and its adjustment guides.
+#[derive(Clone, Debug)]
+pub struct PresetTextWarp {
+    pub preset: PresetTextWarpType,
+    pub adjust_values: Vec<GeomGuide>,
+}
+
+/// `ST_TextShapeType`. Only `textCircle` has a specialised renderer today.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresetTextWarpType {
+    TextCircle,
+    Other(String),
 }
 
 /// `a:bodyPr/@vertOverflow` (ST_TextVertOverflowType) — what a text body does

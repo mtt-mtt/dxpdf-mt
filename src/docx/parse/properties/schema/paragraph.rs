@@ -304,6 +304,10 @@ impl From<FramePrXml> for FrameKind {
 use crate::docx::parse::primitives::AttrBool;
 
 impl PPrXml {
+    pub(crate) fn text_effect_fill(&self) -> Option<&crate::docx::model::DrawingFill> {
+        self.r_pr.as_ref()?.text_effect_fill()
+    }
+
     pub(crate) fn split(self) -> ParsedPPr {
         let style_id = self.p_style.map(|v| StyleId::new(v.val));
 
