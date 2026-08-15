@@ -86,11 +86,7 @@ fn find_anchor_images<'a>(
             Inline::Hyperlink(link) => find_anchor_images(&link.content, out),
             Inline::Field(f) => find_anchor_images(&f.content, out),
             Inline::AlternateContent(ac) => match live_mc_branch(ac) {
-                McBranch::Choices(choices) => {
-                    for choice in choices {
-                        find_anchor_images(&choice.content, out);
-                    }
-                }
+                McBranch::Choice(content) => find_anchor_images(content, out),
                 McBranch::Fallback(fallback) => find_anchor_images(fallback, out),
                 McBranch::Neither => {}
             },
@@ -210,11 +206,7 @@ fn find_anchor_shapes<'a>(
             // walker makes, so the two cannot disagree about which one the
             // paragraph contains.
             Inline::AlternateContent(ac) => match live_mc_branch(ac) {
-                McBranch::Choices(choices) => {
-                    for choice in choices {
-                        find_anchor_shapes(&choice.content, out);
-                    }
-                }
+                McBranch::Choice(content) => find_anchor_shapes(content, out),
                 McBranch::Fallback(fallback) => find_anchor_shapes(fallback, out),
                 McBranch::Neither => {}
             },
@@ -438,10 +430,8 @@ fn extract_vml_floating_images(
             // draw plus a Fallback holding a VML image left the anchor with no
             // geometry at all while its text still reached the page.
             Inline::AlternateContent(ac) => match live_mc_branch(ac) {
-                McBranch::Choices(choices) => {
-                    for choice in choices {
-                        extract_vml_floating_images(&choice.content, state, frame, ctx, out);
-                    }
+                McBranch::Choice(content) => {
+                    extract_vml_floating_images(content, state, frame, ctx, out)
                 }
                 McBranch::Fallback(fallback) => {
                     extract_vml_floating_images(fallback, state, frame, ctx, out)
@@ -562,10 +552,8 @@ fn extract_vml_primitive_shapes(
             // anticipate. [`live_mc_branch`] is now that Choice-fed signal,
             // and the same one `find_anchor_shapes` asks.
             Inline::AlternateContent(ac) => match live_mc_branch(ac) {
-                McBranch::Choices(choices) => {
-                    for choice in choices {
-                        extract_vml_primitive_shapes(&choice.content, state, frame, ctx, out);
-                    }
+                McBranch::Choice(content) => {
+                    extract_vml_primitive_shapes(content, state, frame, ctx, out)
                 }
                 McBranch::Fallback(fallback) => {
                     extract_vml_primitive_shapes(fallback, state, frame, ctx, out)
@@ -1358,7 +1346,7 @@ pub(super) fn find_vml_absolute_position(inline: &model::Inline) -> Option<(Pt, 
             crate::render::layout::McBranch::Fallback(fallback) => {
                 fallback.iter().find_map(find_vml_absolute_position)
             }
-            crate::render::layout::McBranch::Choices(_)
+            crate::render::layout::McBranch::Choice(_)
             | crate::render::layout::McBranch::Neither => None,
         },
         _ => None,
@@ -1770,7 +1758,7 @@ mod tests {
     fn an_anchored_shape_in_a_choice_makes_that_choice_live() {
         assert!(matches!(
             live_mc_branch(&ac_with_wps_choice()),
-            McBranch::Choices(_)
+            McBranch::Choice(_)
         ));
     }
 
@@ -1816,7 +1804,70 @@ mod tests {
             }],
             fallback: Some(vec![Inline::InstrText(String::new())]),
         };
-        assert!(matches!(live_mc_branch(&ac), McBranch::Choices(_)));
+        assert!(matches!(live_mc_branch(&ac), McBranch::Choice(_)));
+    }
+
+    #[test]
+    fn an_inline_picture_makes_its_choice_live() {
+        let ac = AlternateContent {
+            choices: vec![McChoice {
+                requires: vec![McRequires::Wpg],
+                content: vec![Inline::Image(Box::new(inline_picture()))],
+            }],
+            fallback: Some(vec![Inline::InstrText("fallback".into())]),
+        };
+
+        assert!(matches!(live_mc_branch(&ac), McBranch::Choice(_)));
+    }
+
+    #[test]
+    fn an_inline_wps_shape_still_yields_to_the_fallback() {
+        let mut image = anchored_wps_image();
+        image.placement = ImagePlacement::Inline {
+            distance: EdgeInsets::new(
+                Dimension::new(0),
+                Dimension::new(0),
+                Dimension::new(0),
+                Dimension::new(0),
+            ),
+        };
+        let ac = AlternateContent {
+            choices: vec![McChoice {
+                requires: vec![McRequires::Wps],
+                content: vec![Inline::Image(Box::new(image))],
+            }],
+            fallback: Some(vec![Inline::InstrText("fallback".into())]),
+        };
+
+        assert!(matches!(live_mc_branch(&ac), McBranch::Fallback(_)));
+    }
+
+    #[test]
+    fn only_the_first_drawable_choice_is_live() {
+        let ac = AlternateContent {
+            choices: vec![
+                McChoice {
+                    requires: vec![McRequires::Wpg],
+                    content: vec![
+                        Inline::InstrText("first".into()),
+                        Inline::Image(Box::new(inline_picture())),
+                    ],
+                },
+                McChoice {
+                    requires: vec![McRequires::Wpg],
+                    content: vec![
+                        Inline::InstrText("second".into()),
+                        Inline::Image(Box::new(inline_picture())),
+                    ],
+                },
+            ],
+            fallback: Some(vec![Inline::InstrText("fallback".into())]),
+        };
+
+        let McBranch::Choice(content) = live_mc_branch(&ac) else {
+            panic!("expected a live Choice")
+        };
+        assert!(matches!(&content[0], Inline::InstrText(text) if text == "first"));
     }
 
     /// §M.1.2's content model for a branch is `drawing | pict`, so this shape
@@ -1839,7 +1890,7 @@ mod tests {
             }],
             fallback: Some(vec![Inline::InstrText(String::new())]),
         };
-        assert!(matches!(live_mc_branch(&outer), McBranch::Choices(_)));
+        assert!(matches!(live_mc_branch(&outer), McBranch::Choice(_)));
     }
 
     /// …and the converse: an inner element that draws nothing leaves the outer
@@ -2286,6 +2337,19 @@ mod tests {
             },
             shape_properties: None,
         }));
+        img
+    }
+
+    fn inline_picture() -> Image {
+        let mut img = anchored_picture();
+        img.placement = ImagePlacement::Inline {
+            distance: EdgeInsets::new(
+                Dimension::new(0),
+                Dimension::new(0),
+                Dimension::new(0),
+                Dimension::new(0),
+            ),
+        };
         img
     }
 

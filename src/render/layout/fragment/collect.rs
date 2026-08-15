@@ -1218,18 +1218,31 @@ where
                     // §M.1.2 / §17.17.1: only the live branch contributes, and
                     // `live_mc_branch` is the one place that decides which.
                     //
-                    // A drawable Choice is drawn as float geometry by the
-                    // floating extractor — and for a wps shape, its `txbx`
-                    // contents are laid out into shape-local commands emitted
-                    // on top of the shape's path. Walking the Fallback here as
-                    // well would duplicate that text into the host paragraph at
-                    // the wrong y.
+                    // Anchored Choice content is drawn by the floating
+                    // extractor — and for a wps shape, its `txbx` contents are
+                    // laid out into shape-local commands over the shape path.
+                    // Inline DrawingML pictures in the same live branch belong
+                    // here, though: the ordinary `Inline::Image` arm turns them
+                    // into line fragments. The Fallback remains inert so the
+                    // same object cannot be emitted twice.
                     //
                     // A live Fallback does come through here, and must: its VML
                     // geometry goes to the float walkers, its text box to this
                     // collector, landing at the host paragraph y as the Tier 0
                     // placeholder it has always been.
                     match live_mc_branch(ac) {
+                        McBranch::Choice(content) => {
+                            let mut sub = collect_fragments(
+                                content,
+                                ctx,
+                                hyperlink_url,
+                                measure_text,
+                                footnotes,
+                                endnote_counter,
+                                field_ctx,
+                            );
+                            fragments.append(&mut sub);
+                        }
                         McBranch::Fallback(fallback) => {
                             let mut sub = collect_fragments(
                                 fallback,
@@ -1242,7 +1255,7 @@ where
                             );
                             fragments.append(&mut sub);
                         }
-                        McBranch::Choices(_) | McBranch::Neither => {}
+                        McBranch::Neither => {}
                     }
                 }
                 Inline::Symbol(sym) => {
@@ -1444,6 +1457,7 @@ where
 mod tests {
     use super::*;
     use crate::model::dimension::{Dimension, HalfPoints};
+    use crate::model::geometry::{EdgeInsets, Size};
     use crate::model::*;
 
     #[test]
@@ -2303,6 +2317,80 @@ mod tests {
         if let Fragment::Text { text, .. } = &frags[0] {
             assert_eq!(&**text, "fallback");
         }
+    }
+
+    #[test]
+    fn alternate_content_collects_a_live_inline_picture_once() {
+        let picture = Image {
+            extent: Size::new(Dimension::new(1_260_000), Dimension::new(792_000)),
+            effect_extent: None,
+            doc_properties: DocProperties {
+                id: 1,
+                name: "inline-picture".into(),
+                description: None,
+                hidden: None,
+                title: None,
+            },
+            graphic_frame_locks: None,
+            graphic: Some(GraphicContent::Picture(Picture {
+                nv_pic_pr: NvPicProperties {
+                    cnv_pr: DocProperties {
+                        id: 2,
+                        name: "picture".into(),
+                        description: None,
+                        hidden: None,
+                        title: None,
+                    },
+                    cnv_pic_pr: None,
+                },
+                blip_fill: BlipFill {
+                    rotate_with_shape: None,
+                    dpi: None,
+                    blip: Some(Blip {
+                        embed: Some(RelId::new("rId7")),
+                        link: None,
+                        compression: None,
+                    }),
+                    src_rect: None,
+                    fill_kind: BlipFillKind::Unspecified,
+                },
+                shape_properties: None,
+            })),
+            placement: ImagePlacement::Inline {
+                distance: EdgeInsets::new(
+                    Dimension::new(0),
+                    Dimension::new(0),
+                    Dimension::new(0),
+                    Dimension::new(0),
+                ),
+            },
+        };
+        let inlines = vec![Inline::AlternateContent(AlternateContent {
+            choices: vec![McChoice {
+                requires: vec![McRequires::Wpg],
+                content: vec![Inline::Image(Box::new(picture))],
+            }],
+            fallback: Some(vec![text_run("fallback")]),
+        })];
+        let ctx = default_ctx(12.0);
+
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+
+        assert_eq!(frags.len(), 1, "the fallback must remain inert");
+        let Fragment::Image { size, rel_id, .. } = &frags[0] else {
+            panic!("expected the Choice's inline picture")
+        };
+        assert_eq!(rel_id, "rId7");
+        assert!((size.width.raw() - 99.2126).abs() < 0.001);
+        assert!((size.height.raw() - 62.3622).abs() < 0.001);
     }
 
     #[test]

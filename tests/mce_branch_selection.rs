@@ -199,6 +199,40 @@ fn inline_wps_shape() -> String {
         .to_string()
 }
 
+/// A DrawingML picture in `<wp:inline>`. This is the modern branch used by
+/// ONLYOFFICE's table-cell image previews even though the Choice declares
+/// `Requires="wpg"` rather than `pic`.
+fn inline_picture() -> String {
+    r#"<w:drawing>
+         <wp:inline distT="0" distB="0" distL="0" distR="0">
+           <wp:extent cx="1260000" cy="792000"/>
+           <wp:docPr id="3" name="InlinePicture"/>
+           <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+             <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+               <pic:nvPicPr><pic:cNvPr id="3" name="picture"/></pic:nvPicPr>
+               <pic:blipFill><a:blip r:embed="rId7"/><a:stretch/></pic:blipFill>
+             </pic:pic>
+           </a:graphicData></a:graphic>
+         </wp:inline>
+       </w:drawing>"#
+        .to_string()
+}
+
+/// An inline Word 2010 group. The outer drawing parses, but `wpg:wgp` has no
+/// fragment renderer yet, so its VML fallback must remain live.
+fn inline_wpg_group() -> String {
+    r#"<w:drawing>
+         <wp:inline distT="0" distB="0" distL="0" distR="0">
+           <wp:extent cx="1260000" cy="792000"/>
+           <wp:docPr id="4" name="InlineGroup"/>
+           <a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup">
+             <wpg:wgp xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"/>
+           </a:graphicData></a:graphic>
+         </wp:inline>
+       </w:drawing>"#
+        .to_string()
+}
+
 /// An `<mc:AlternateContent>` with one Choice declaring `requires`.
 ///
 /// `requires="wps"` is a namespace this renderer understands, so the Choice
@@ -356,6 +390,35 @@ fn a_meetable_choice_with_nothing_drawable_still_yields_to_the_fallback() {
         path_count(&pages) >= 1,
         "and its rect reaches the page as geometry",
     );
+}
+
+/// A supported inline picture is owned by the fragment collector. Selecting
+/// the Choice must make every part of the VML fallback inert, otherwise the
+/// fallback rect and label are rendered alongside the picture.
+#[test]
+fn an_inline_picture_choice_reaches_the_page_without_its_fallback() {
+    let pages = layout(&alternate_content(
+        "wpg",
+        &inline_picture(),
+        &vml_rect("Fallback"),
+    ));
+
+    assert_eq!(image_count(&pages), 1, "the Choice's inline picture");
+    assert_eq!(path_count(&pages), 0, "the fallback rect stays inert");
+    assert_eq!(text_count(&pages, "Fallback"), 0);
+}
+
+#[test]
+fn an_inline_wpg_group_still_yields_to_the_fallback() {
+    let pages = layout(&alternate_content(
+        "wpg",
+        &inline_wpg_group(),
+        &vml_rect("Fallback"),
+    ));
+
+    assert_eq!(image_count(&pages), 0);
+    assert!(path_count(&pages) >= 1, "the fallback rect is live");
+    assert_eq!(text_count(&pages, "Fallback"), 1);
 }
 
 /// A Fallback with no anchored content at all keeps its long-standing

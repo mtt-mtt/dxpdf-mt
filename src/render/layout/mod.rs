@@ -42,8 +42,8 @@ use crate::render::geometry::{PtEdgeInsets, PtSize};
 /// part it owns. Naming an owner per variant would look tidier and would drop
 /// the text of every VML rect that has one.
 pub(crate) enum McBranch<'a> {
-    /// The `<mc:Choice>` elements, in document order.
-    Choices(&'a [crate::model::McChoice]),
+    /// The first drawable `<mc:Choice>`, represented by its live content.
+    Choice(&'a [crate::model::Inline]),
     /// The `<mc:Fallback>`, reached only when no Choice carries anything we
     /// can draw.
     Fallback(&'a [crate::model::Inline]),
@@ -56,10 +56,10 @@ pub(crate) enum McBranch<'a> {
 /// The test is **content-based**, not a `Requires` namespace check: a Choice
 /// may declare a namespace we nominally support and still hold nothing this
 /// renderer turns into geometry, and the honest question is whether we will
-/// actually draw it. What counts is an *anchor* — an anchored `wps:wsp` shape
-/// and an anchored picture are both `Inline::Image` with
-/// `ImagePlacement::Anchor`, so one question covers shapes and pictures alike
-/// and no walker has to ask a narrower version of it for itself.
+/// actually draw it. What counts is either an *anchor* — preserving the
+/// renderer's established floating-object behaviour — or an inline DrawingML
+/// picture. Inline `wps:wsp` shapes and `wpg` groups are not layout fragments,
+/// so they must continue to yield to their VML fallback.
 ///
 /// Recurses through `Hyperlink`/`Field` wrappers and nested elements. §M.1.2's
 /// content model for a branch is `drawing | pict`, so a nested
@@ -67,22 +67,27 @@ pub(crate) enum McBranch<'a> {
 /// and resolving it innermost-first is the only reading under which the outer
 /// answer stays consistent with the inner one.
 pub(crate) fn live_mc_branch(ac: &crate::model::AlternateContent) -> McBranch<'_> {
-    use crate::model::{ImagePlacement, Inline};
+    use crate::model::{GraphicContent, ImagePlacement, Inline};
 
-    fn draws_an_anchor(inlines: &[Inline]) -> bool {
+    fn is_drawable(inlines: &[Inline]) -> bool {
         inlines.iter().any(|inline| match inline {
-            Inline::Image(img) => matches!(img.placement, ImagePlacement::Anchor(_)),
-            Inline::Hyperlink(link) => draws_an_anchor(&link.content),
-            Inline::Field(f) => draws_an_anchor(&f.content),
+            Inline::Image(img) => match img.placement {
+                ImagePlacement::Anchor(_) => true,
+                ImagePlacement::Inline { .. } => {
+                    matches!(&img.graphic, Some(GraphicContent::Picture(_)))
+                }
+            },
+            Inline::Hyperlink(link) => is_drawable(&link.content),
+            Inline::Field(f) => is_drawable(&f.content),
             Inline::AlternateContent(inner) => {
-                matches!(live_mc_branch(inner), McBranch::Choices(_))
+                matches!(live_mc_branch(inner), McBranch::Choice(_))
             }
             _ => false,
         })
     }
 
-    if ac.choices.iter().any(|c| draws_an_anchor(&c.content)) {
-        McBranch::Choices(&ac.choices)
+    if let Some(choice) = ac.choices.iter().find(|c| is_drawable(&c.content)) {
+        McBranch::Choice(&choice.content)
     } else {
         match ac.fallback {
             Some(ref fallback) => McBranch::Fallback(fallback),

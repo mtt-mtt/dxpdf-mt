@@ -140,21 +140,24 @@ copies of the same object on the page; drawing neither loses it.
 walker that meets the element consults it, so the answer is a property of the
 element rather than of who asked:
 
-| Walker | On `Choices` | On `Fallback` |
+| Walker | On `Choice` | On `Fallback` |
 |---|---|---|
-| `find_anchor_images` (DrawingML pictures) | recurse into the Choices | recurse into the Fallback |
+| `find_anchor_images` (DrawingML pictures) | recurse into the live Choice | recurse into the Fallback |
 | `find_anchor_shapes` (`wps:wsp` shapes) | ” | ” |
 | `extract_vml_floating_images` (VML images) | ” | ” |
 | `extract_vml_primitive_shapes` (VML rects) | ” | ” |
-| `fragment::collect` (inline text) | skip | collect |
+| `fragment::collect` (inline content) | collect inline pictures; anchors naturally skip | collect |
 | `find_vml_absolute_position` | `None` | probe the Fallback |
 
 The test is **content-based, not a `Requires` namespace check** — a Choice can
 declare a namespace we nominally support and still hold nothing that becomes
-geometry, and the honest question is whether we will actually draw it. A Choice
-carrying any anchored drawing wins; otherwise the Fallback is live; if there is
-no Fallback, nothing is. An anchored `wps:wsp` shape and an anchored picture are
-both `Inline::Image` with `ImagePlacement::Anchor`, so one question covers both.
+geometry, and the honest question is whether we will actually draw it. The
+first Choice carrying either an anchored drawing or an inline DrawingML picture
+wins; otherwise the Fallback is live; if there is no Fallback, nothing is.
+Inline `wps:wsp` shapes and `wpg` groups do not yet have a fragment renderer and
+therefore continue to yield to their VML fallback. Returning one Choice rather
+than the whole Choice list also enforces MCE's exactly-one-branch rule when a
+producer supplies multiple usable alternatives.
 
 ### Why one predicate, and why the `Fallback` arm has no owner
 
@@ -187,10 +190,9 @@ resolves it innermost-first, because that is the only reading under which the
 outer answer stays consistent with the inner one.
 
 Coverage is `tests/mce_branch_selection.rs` (page-level, against inline
-fixtures) plus the `live_mc_branch` unit tests. The corpus cannot exercise any
-of it: every run-level `<mc:AlternateContent>` in `test-files/` and
-`test-cases/` is a `Requires="wps"` Choice holding a drawable `wps:wsp`, i.e.
-the one case that was already correct.
+fixtures) plus the `live_mc_branch` and fragment-collector unit tests. The
+inline-picture case is pinned separately from inline `wps:wsp` and `wpg`
+groups so widening Choice support cannot strand their still-required fallback.
 
 ## Shape Text Bodies — §20.1.2.1.1 / §20.1.10.60
 
