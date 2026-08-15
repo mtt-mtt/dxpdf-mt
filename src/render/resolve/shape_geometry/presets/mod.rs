@@ -10,6 +10,7 @@
 //! remaining ~60; Tier 3 completes the spec's ~200.
 
 mod accent_callout;
+mod donut;
 mod ellipse;
 mod line;
 mod rect;
@@ -27,6 +28,7 @@ pub fn build_preset(def: &PresetGeometryDef, extent: PtSize) -> Option<ShapePath
         PresetShapeType::Line => Some(line::build(extent)),
         PresetShapeType::Rect => Some(rect::build(extent)),
         PresetShapeType::Ellipse => Some(ellipse::build(extent)),
+        PresetShapeType::Donut => Some(donut::build(def, extent)),
         PresetShapeType::AccentCallout1 => Some(accent_callout::build(def, extent, 2)),
         PresetShapeType::AccentCallout2 => Some(accent_callout::build(def, extent, 3)),
         PresetShapeType::AccentCallout3 => Some(accent_callout::build(def, extent, 4)),
@@ -76,6 +78,15 @@ mod tests {
         let p = build_preset(
             &def(PresetShapeType::Ellipse),
             PtSize::new(Pt::new(10.0), Pt::new(20.0)),
+        );
+        assert!(p.is_some());
+    }
+
+    #[test]
+    fn donut_dispatches() {
+        let p = build_preset(
+            &def(PresetShapeType::Donut),
+            PtSize::new(Pt::new(20.0), Pt::new(20.0)),
         );
         assert!(p.is_some());
     }
