@@ -303,6 +303,11 @@ impl ColorTransformXml {
         match self {
             X::Tint(value) => Some(ColorTransform::Tint(complement(value.val))),
             X::Shade(value) => Some(ColorTransform::Shade(complement(value.val))),
+            // `wordShade` is a Word text-effect sidecar, not DrawingML's
+            // standard `shade`: WPS renders every byte value identically to
+            // omission. Keep the generic DrawingML conversion untouched and
+            // ignore it only on this w14 word-text path.
+            X::WordShade(_) => None,
             other => other.into_model(),
         }
     }
@@ -934,19 +939,17 @@ mod tests {
     }
 
     #[test]
-    fn office_word_shade_byte_maps_to_the_drawing_shade_factor() {
-        let c = parse(r#"<schemeClr val="accent5"><wordShade val="191"/></schemeClr>"#);
+    fn office_word_shade_byte_is_ignored_for_word_text_effects() {
+        let c =
+            parse_word_text_color(r#"<schemeClr val="accent5"><wordShade val="191"/></schemeClr>"#);
         let DrawingColor::Scheme { transforms, .. } = c else {
             panic!("expected Scheme")
         };
-        assert!(matches!(
-            transforms.as_slice(),
-            [ColorTransform::Shade(value)] if value.raw() == 25_098
-        ));
+        assert!(transforms.is_empty());
     }
 
     #[test]
-    fn office_text_tint_and_shade_keep_the_documented_input_fraction() {
+    fn office_text_standard_tint_and_shade_still_convert() {
         let color = parse_word_text_color(
             r#"<schemeClr val="accent5"><tint val="10000"/><shade val="20000"/></schemeClr>"#,
         );

@@ -11,6 +11,7 @@ use crate::render::dimension::Pt;
 use crate::render::emoji::resolve::{EmojiFamily, EmojiResolver, EmojiTypeface, RegistryLookup};
 use crate::render::emoji::shape::ClusterShaper;
 use crate::render::fonts::{self, FontRegistry, TypefaceEntry, TypefaceId};
+use crate::render::geometry::{PtOffset, PtRect, PtSize};
 
 use super::fragment::{FontProps, TextMetrics};
 
@@ -246,6 +247,102 @@ impl<'r> TextMeasurer<'r> {
             (scaled_width + spacing_extra - punctuation_compression).max(Pt::ZERO),
             text_metrics,
         )
+    }
+
+    /// Return Skia's baseline-relative vertical ink bounds for `text`.
+    ///
+    /// This deliberately exposes only the top and bottom of the glyph ink:
+    /// callers that need a visible-height fit must not substitute the font's
+    /// line metrics. Horizontal `text_scale` does not affect these bounds.
+    /// Empty ink (for example a whitespace-only string) and non-finite bounds
+    /// are rejected.
+    pub(crate) fn vertical_ink_bounds(
+        &self,
+        text: &str,
+        font_props: &FontProps,
+    ) -> Option<(Pt, Pt)> {
+        let mut cache = self.font_cache.borrow_mut();
+        let font = cache.get(
+            self.registry,
+            &font_props.family,
+            font_props.size,
+            font_props.bold,
+            font_props.italic,
+        );
+        let (_, bounds) = font.measure_str(text, None);
+        (bounds.top.is_finite() && bounds.bottom.is_finite() && bounds.bottom > bounds.top)
+            .then(|| (Pt::new(bounds.top), Pt::new(bounds.bottom)))
+    }
+
+    /// Return the tight page-space outline bounds produced by the same font,
+    /// horizontal scale, baseline position, and pivoted rotation as painting.
+    ///
+    /// This deliberately bypasses axis-aligned font bounds: rotating those
+    /// bounds would include empty corners and cannot safely centre warped ink.
+    /// Empty or non-finite outlines and invalid transform inputs are rejected.
+    pub(crate) fn transformed_ink_bounds(
+        &self,
+        text: &str,
+        font_props: &FontProps,
+        position: PtOffset,
+        rotation_degrees: f32,
+    ) -> Option<PtRect> {
+        let font_size = font_props.size.raw();
+        let text_scale = font_props.text_scale;
+        let position_x = position.x.raw();
+        let position_y = position.y.raw();
+        if text.trim().is_empty()
+            || !font_size.is_finite()
+            || font_size <= 0.0
+            || !text_scale.is_finite()
+            || text_scale <= 0.0
+            || !position_x.is_finite()
+            || !position_y.is_finite()
+            || !rotation_degrees.is_finite()
+        {
+            return None;
+        }
+
+        let mut cache = self.font_cache.borrow_mut();
+        let mut font = cache
+            .get(
+                self.registry,
+                &font_props.family,
+                font_props.size,
+                font_props.bold,
+                font_props.italic,
+            )
+            .clone();
+        font.set_scale_x(text_scale);
+
+        let pivot = skia_safe::Point::new(position_x, position_y);
+        let path = skia_safe::Path::from_str(text, pivot, &font);
+        if path.is_empty() || !path.is_finite() {
+            return None;
+        }
+        let transformed = path.try_make_transform(&skia_safe::Matrix::rotate_deg_pivot(
+            rotation_degrees,
+            pivot,
+        ))?;
+        if transformed.is_empty() || !transformed.is_finite() {
+            return None;
+        }
+        let bounds = transformed.compute_tight_bounds();
+        let [left, top, right, bottom] = [bounds.left, bounds.top, bounds.right, bounds.bottom];
+        let width = right - left;
+        let height = bottom - top;
+        if ![left, top, right, bottom, width, height]
+            .into_iter()
+            .all(f32::is_finite)
+            || width <= f32::EPSILON
+            || height <= f32::EPSILON
+        {
+            return None;
+        }
+        Some(PtRect {
+            origin: PtOffset::new(Pt::new(left), Pt::new(top)),
+            size: PtSize::new(Pt::new(width), Pt::new(height)),
+        })
     }
 
     /// Query font metrics for underline positioning.
@@ -516,5 +613,123 @@ mod tests {
             expected_glyph_w1,
             observed_glyph_delta,
         );
+    }
+
+    #[test]
+    fn vertical_ink_bounds_scale_with_font_size_and_reject_empty_ink() {
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let small = fp_at_scale(1.0);
+        let mut large = small.clone();
+        large.size = small.size * 2.0;
+
+        assert!(measurer.vertical_ink_bounds("   ", &small).is_none());
+        let Some((small_top, small_bottom)) = measurer.vertical_ink_bounds("Ag", &small) else {
+            // Some headless CI hosts expose no measurable default font.
+            return;
+        };
+        let (large_top, large_bottom) = measurer
+            .vertical_ink_bounds("Ag", &large)
+            .expect("the same face remains measurable at a larger size");
+        let small_height = small_bottom.raw() - small_top.raw();
+        let large_height = large_bottom.raw() - large_top.raw();
+
+        assert!(small_top < Pt::ZERO);
+        assert!(small_bottom > Pt::ZERO);
+        assert!(small_height > 0.0);
+        assert!(large_top < small_top);
+        assert!(large_bottom > small_bottom);
+        assert!(large_height > small_height);
+
+        let horizontally_scaled = fp_at_scale(2.0);
+        assert_eq!(
+            measurer.vertical_ink_bounds("Ag", &horizontally_scaled),
+            Some((small_top, small_bottom))
+        );
+    }
+
+    #[test]
+    fn transformed_ink_bounds_translation_is_exact() {
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let font = fp_at_scale(1.0);
+        let first_position = PtOffset::new(Pt::new(11.0), Pt::new(23.0));
+        let second_position = PtOffset::new(Pt::new(18.0), Pt::new(20.0));
+        let Some(first) = measurer.transformed_ink_bounds("Ag", &font, first_position, 17.0) else {
+            // Some headless CI hosts expose no outline-bearing default face.
+            return;
+        };
+        let second = measurer
+            .transformed_ink_bounds("Ag", &font, second_position, 17.0)
+            .expect("the same face keeps its outline after translation");
+        let close = |actual: f32, expected: f32| {
+            assert!((actual - expected).abs() < 1e-3, "{actual} != {expected}")
+        };
+        close(second.origin.x.raw() - first.origin.x.raw(), 7.0);
+        close(second.origin.y.raw() - first.origin.y.raw(), -3.0);
+        close(second.size.width.raw(), first.size.width.raw());
+        close(second.size.height.raw(), first.size.height.raw());
+    }
+
+    #[test]
+    fn transformed_ink_bounds_honors_scale_x_and_rotation() {
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let normal = fp_at_scale(1.0);
+        let position = PtOffset::new(Pt::new(31.0), Pt::new(47.0));
+        let Some(base) = measurer.transformed_ink_bounds("Ag", &normal, position, 0.0) else {
+            return;
+        };
+        let wide = measurer
+            .transformed_ink_bounds("Ag", &fp_at_scale(2.0), position, 0.0)
+            .expect("a wider scale preserves the outline");
+        assert!(wide.size.width.raw() > base.size.width.raw() * 1.8);
+        assert!((wide.size.height.raw() - base.size.height.raw()).abs() < 1e-3);
+
+        let quarter_turn = measurer
+            .transformed_ink_bounds("Ag", &normal, position, 90.0)
+            .expect("a finite quarter turn preserves the outline");
+        assert!((quarter_turn.size.width.raw() - base.size.height.raw()).abs() < 1e-3);
+        assert!((quarter_turn.size.height.raw() - base.size.width.raw()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn transformed_ink_bounds_rejects_empty_and_nonfinite_input() {
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let valid = fp_at_scale(1.0);
+        let position = PtOffset::new(Pt::new(10.0), Pt::new(20.0));
+        assert!(measurer
+            .transformed_ink_bounds("", &valid, position, 0.0)
+            .is_none());
+        assert!(measurer
+            .transformed_ink_bounds("   ", &valid, position, 0.0)
+            .is_none());
+        assert!(measurer
+            .transformed_ink_bounds(
+                "A",
+                &valid,
+                PtOffset::new(Pt::new(f32::NAN), position.y),
+                0.0,
+            )
+            .is_none());
+        assert!(measurer
+            .transformed_ink_bounds("A", &valid, position, f32::NAN)
+            .is_none());
+
+        for (size, scale) in [
+            (0.0, 1.0),
+            (-1.0, 1.0),
+            (f32::INFINITY, 1.0),
+            (12.0, 0.0),
+            (12.0, f32::NAN),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.size = Pt::new(size);
+            invalid.text_scale = scale;
+            assert!(measurer
+                .transformed_ink_bounds("A", &invalid, position, 0.0)
+                .is_none());
+        }
     }
 }

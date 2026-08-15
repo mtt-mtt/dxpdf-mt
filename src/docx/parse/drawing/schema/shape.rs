@@ -473,6 +473,7 @@ impl From<BodyPrXml> for BodyProperties {
             text_warp: x.prst_tx_warp.map(|warp| PresetTextWarp {
                 preset: match warp.prst.as_str() {
                     "textCircle" => PresetTextWarpType::TextCircle,
+                    "textDeflateInflateDeflate" => PresetTextWarpType::TextDeflateInflateDeflate,
                     other => PresetTextWarpType::Other(other.to_owned()),
                 },
                 adjust_values: warp
@@ -974,11 +975,31 @@ mod tests {
     }
 
     #[test]
+    fn body_pr_keeps_text_deflate_inflate_deflate_and_adjustment() {
+        let bp = parse_body_pr(
+            r#"<bodyPr><prstTxWarp prst="textDeflateInflateDeflate"><avLst>
+                <gd name="adj" fmla="val 24159"/>
+            </avLst></prstTxWarp></bodyPr>"#,
+        );
+        let warp = bp.text_warp.expect("text warp");
+        assert_eq!(warp.preset, PresetTextWarpType::TextDeflateInflateDeflate);
+        assert_eq!(warp.adjust_values.len(), 1);
+        assert_eq!(warp.adjust_values[0].name, "adj");
+        assert_eq!(warp.adjust_values[0].formula, "val 24159");
+    }
+
+    #[test]
     fn body_pr_retains_unknown_text_warp_for_safe_fallback() {
         let bp = parse_body_pr(r#"<bodyPr><prstTxWarp prst="textWave1"/></bodyPr>"#);
         assert_eq!(
             bp.text_warp.expect("text warp").preset,
             PresetTextWarpType::Other("textWave1".to_owned())
+        );
+        let similar =
+            parse_body_pr(r#"<bodyPr><prstTxWarp prst="textDeflateInflateDeflate2"/></bodyPr>"#);
+        assert_eq!(
+            similar.text_warp.expect("text warp").preset,
+            PresetTextWarpType::Other("textDeflateInflateDeflate2".to_owned())
         );
     }
 

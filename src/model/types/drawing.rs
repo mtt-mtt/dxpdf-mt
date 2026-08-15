@@ -273,10 +273,12 @@ pub struct PresetTextWarp {
     pub adjust_values: Vec<GeomGuide>,
 }
 
-/// `ST_TextShapeType`. Only `textCircle` has a specialised renderer today.
+/// `ST_TextShapeType`. Only the explicitly typed presets have specialised
+/// renderers today; every other token is retained for ordinary-text fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresetTextWarpType {
     TextCircle,
+    TextDeflateInflateDeflate,
     Other(String),
 }
 

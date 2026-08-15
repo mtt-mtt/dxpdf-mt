@@ -487,6 +487,7 @@ fn build_word_processing_shape_local(
         None if !wsp.txbx_content.is_empty() => (fallback_text_box_shape_path(extent), true),
         None => return None,
     };
+    let geometry_text_rect = shape_path.text_rect;
 
     let visuals = resolve_shape_visuals(
         shape_props,
@@ -527,7 +528,13 @@ fn build_word_processing_shape_local(
         fill: visuals.fill,
         stroke,
         effects: visuals.effects,
-        text_commands: build_shape_text_commands(wsp, extent, ctx, state),
+        text_commands: build_shape_text_commands_with_geometry_rect(
+            wsp,
+            extent,
+            geometry_text_rect,
+            ctx,
+            state,
+        ),
     })
 }
 
@@ -1815,6 +1822,16 @@ pub(crate) fn build_shape_text_commands(
     ctx: &BuildContext,
     state: &BuildState,
 ) -> Vec<crate::render::layout::draw_command::DrawCommand> {
+    build_shape_text_commands_with_geometry_rect(wsp, extent, None, ctx, state)
+}
+
+fn build_shape_text_commands_with_geometry_rect(
+    wsp: &crate::model::WordProcessingShape,
+    extent: PtSize,
+    geometry_text_rect: Option<crate::render::geometry::PtRect>,
+    ctx: &BuildContext,
+    state: &BuildState,
+) -> Vec<crate::render::layout::draw_command::DrawCommand> {
     if wsp.txbx_content.is_empty() {
         return Vec::new();
     }
@@ -1943,6 +1960,40 @@ pub(crate) fn build_shape_text_commands(
         }
     }
 
+    if matches!(
+        wsp.body_pr
+            .as_ref()
+            .and_then(|body| body.text_warp.as_ref())
+            .map(|warp| &warp.preset),
+        Some(crate::model::PresetTextWarpType::TextDeflateInflateDeflate)
+    ) && matches!(
+        wsp.txbx_content.as_slice(),
+        [
+            crate::model::Block::Paragraph(_),
+            crate::model::Block::Paragraph(_),
+            crate::model::Block::Paragraph(_)
+        ]
+    ) {
+        if let Some(warp_rect) = geometry_text_rect.and_then(|rect| {
+            inset_deflate_text_rect(rect, left_inset, top_inset, right_inset, bot_inset)
+        }) {
+            if let Some(commands) = build_text_deflate_inflate_deflate_commands(
+                &result.commands,
+                warp_rect.origin,
+                warp_rect.size,
+                wsp.body_pr
+                    .as_ref()
+                    .and_then(|body| body.text_warp.as_ref())
+                    .expect("deflate-inflate-deflate guard retains its warp"),
+                wsp.text_fill.as_ref(),
+                ctx.resolved.theme.as_ref(),
+                ctx.measurer,
+            ) {
+                return commands;
+            }
+        }
+    }
+
     // §20.1.10.60: `bIns` closes off the bottom of the box the body sits in,
     // and `anchor` decides where in that box it sits. Both were previously
     // dropped, which pinned every body to the top.
@@ -1968,6 +2019,540 @@ pub(crate) fn build_shape_text_commands(
         commands.push(cmd);
     }
     commands
+}
+
+fn inset_deflate_text_rect(
+    rect: crate::render::geometry::PtRect,
+    left: Pt,
+    top: Pt,
+    right: Pt,
+    bottom: Pt,
+) -> Option<crate::render::geometry::PtRect> {
+    let origin = PtOffset::new(rect.origin.x + left, rect.origin.y + top);
+    let size = PtSize::new(
+        rect.size.width - left - right,
+        rect.size.height - top - bottom,
+    );
+    if ![
+        origin.x.raw(),
+        origin.y.raw(),
+        size.width.raw(),
+        size.height.raw(),
+    ]
+    .into_iter()
+    .all(f32::is_finite)
+        || size.width <= Pt::ZERO
+        || size.height <= Pt::ZERO
+    {
+        return None;
+    }
+    Some(crate::render::geometry::PtRect { origin, size })
+}
+
+#[derive(Clone)]
+struct DeflateGlyph {
+    text: std::rc::Rc<str>,
+    font_family: std::rc::Rc<str>,
+    font_size: Pt,
+    bold: bool,
+    italic: bool,
+    text_scale: f32,
+    raw_glyph_width: f32,
+    raw_spacing: f32,
+    raw_ink_bounds: Option<(f32, f32)>,
+}
+
+struct DeflateLine {
+    glyphs: Vec<DeflateGlyph>,
+    raw_advance: f32,
+    raw_ink_top: f32,
+    raw_ink_bottom: f32,
+}
+
+fn union_deflate_ink_bounds(bounds: impl IntoIterator<Item = (f32, f32)>) -> Option<(f32, f32)> {
+    let mut union: Option<(f32, f32)> = None;
+    for (top, bottom) in bounds {
+        if !top.is_finite() || !bottom.is_finite() || bottom <= top {
+            return None;
+        }
+        union = Some(match union {
+            Some((union_top, union_bottom)) => (union_top.min(top), union_bottom.max(bottom)),
+            None => (top, bottom),
+        });
+    }
+    union.filter(|(top, bottom)| (bottom - top).is_finite() && bottom - top > f32::EPSILON)
+}
+
+fn union_deflate_outline_x(
+    bounds: impl IntoIterator<Item = crate::render::geometry::PtRect>,
+) -> Option<(f32, f32)> {
+    let mut union: Option<(f32, f32)> = None;
+    for bounds in bounds {
+        let left = bounds.origin.x.raw();
+        let width = bounds.size.width.raw();
+        let right = left + width;
+        if ![left, width, right].into_iter().all(f32::is_finite)
+            || width <= f32::EPSILON
+            || right <= left
+        {
+            return None;
+        }
+        union = Some(match union {
+            Some((union_left, union_right)) => (union_left.min(left), union_right.max(right)),
+            None => (left, right),
+        });
+    }
+    union.filter(|(left, right)| {
+        let width = right - left;
+        left.is_finite() && right.is_finite() && width.is_finite() && width > f32::EPSILON
+    })
+}
+
+/// Rigidly translate one completed deflate line after all warp-dependent
+/// fields have been fixed. Validation is completed before any command is
+/// changed so callers never observe a partially translated line.
+fn center_deflate_line_commands(
+    commands: &mut [crate::render::layout::draw_command::DrawCommand],
+    ink_left: f32,
+    ink_right: f32,
+    warp_center_x: f32,
+    warp_width: f32,
+) -> Option<f32> {
+    use crate::render::layout::draw_command::DrawCommand;
+
+    let ink_width = ink_right - ink_left;
+    let ink_center_x = ink_left + ink_width * 0.5;
+    let dx = warp_center_x - ink_center_x;
+    if commands.is_empty()
+        || ![
+            ink_left,
+            ink_right,
+            ink_width,
+            ink_center_x,
+            warp_center_x,
+            warp_width,
+            dx,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+        || ink_width <= f32::EPSILON
+        || warp_width <= f32::EPSILON
+        || dx.abs() > warp_width
+    {
+        return None;
+    }
+
+    for command in commands.iter() {
+        let DrawCommand::Text { position, .. } = command else {
+            return None;
+        };
+        if !position.x.raw().is_finite() || !(position.x.raw() + dx).is_finite() {
+            return None;
+        }
+    }
+    for command in commands {
+        let DrawCommand::Text { position, .. } = command else {
+            unreachable!("the validation pass accepts text commands only")
+        };
+        position.x = Pt::new(position.x.raw() + dx);
+    }
+    Some(dx)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeflateInflateDeflateGuides {
+    y1: f32,
+    y2: f32,
+    y3: f32,
+    y4: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeflateBandSample {
+    top: f32,
+    bottom: f32,
+    top_derivative: f32,
+    bottom_derivative: f32,
+}
+
+impl DeflateInflateDeflateGuides {
+    fn from_warp(warp: &crate::model::PresetTextWarp) -> Self {
+        let mut adjustment = 25_000_i64;
+        if let Some(guide) = warp.adjust_values.iter().find(|guide| guide.name == "adj") {
+            let mut terms = guide.formula.split_whitespace();
+            let parsed = (terms.next() == Some("val"))
+                .then(|| terms.next().and_then(|value| value.parse::<i64>().ok()))
+                .flatten()
+                .filter(|_| terms.next().is_none());
+            if let Some(value) = parsed {
+                adjustment = value;
+            }
+        }
+        let a = adjustment.clamp(3_000, 47_000) as f32 / 100_000.0;
+        let delta = 0.03_f32;
+        let [e1, e2, e3, e4] = [0.30_f32, 0.36, 0.63, 0.70];
+        Self {
+            y1: 2.0 * (a - delta) - e1,
+            y2: 2.0 * (a + delta) - e2,
+            y3: 2.0 * ((1.0 - a) - delta) - e3,
+            y4: 2.0 * ((1.0 - a) + delta) - e4,
+        }
+    }
+
+    fn band(self, index: usize, u: f32) -> Option<DeflateBandSample> {
+        let constant = |value| (value, 0.0_f32);
+        let quadratic = |edge: f32, control: f32| {
+            (
+                edge + 2.0 * (control - edge) * u * (1.0 - u),
+                2.0 * (control - edge) * (1.0 - 2.0 * u),
+            )
+        };
+        let ((top, top_derivative), (bottom, bottom_derivative)) = match index {
+            0 => (constant(0.0), quadratic(0.30, self.y1)),
+            1 => (quadratic(0.36, self.y2), quadratic(0.63, self.y3)),
+            2 => (quadratic(0.70, self.y4), constant(1.0)),
+            _ => return None,
+        };
+        Some(DeflateBandSample {
+            top,
+            bottom,
+            top_derivative,
+            bottom_derivative,
+        })
+    }
+}
+
+/// Render the DrawingML `textDeflateInflateDeflate` preset for the one safe
+/// shape supported today: three plain ASCII lines, each mapped into one ECMA
+/// guide band. Any unsupported command or invalid measurement returns `None`
+/// so the caller can emit the complete ordinary text-box result unchanged.
+fn build_text_deflate_inflate_deflate_commands(
+    source: &[crate::render::layout::draw_command::DrawCommand],
+    warp_origin: PtOffset,
+    warp_size: PtSize,
+    warp: &crate::model::PresetTextWarp,
+    text_fill: Option<&crate::model::DrawingFill>,
+    theme: Option<&crate::model::Theme>,
+    measurer: &crate::render::layout::measurer::TextMeasurer<'_>,
+) -> Option<Vec<crate::render::layout::draw_command::DrawCommand>> {
+    use crate::render::layout::draw_command::DrawCommand;
+    use crate::render::layout::fragment::{AutoLineSpacingContribution, FontProps};
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if ![
+        warp_origin.x.raw(),
+        warp_origin.y.raw(),
+        warp_size.width.raw(),
+        warp_size.height.raw(),
+    ]
+    .into_iter()
+    .all(f32::is_finite)
+        || warp_size.width <= Pt::ZERO
+        || warp_size.height <= Pt::ZERO
+        || !warp_size
+            .width
+            .raw()
+            .hypot(warp_size.height.raw())
+            .is_finite()
+    {
+        return None;
+    }
+    let gradient = resolve_circle_gradient(text_fill?, theme)?;
+
+    const BASELINE_TOLERANCE: f32 = 0.05;
+    const MAX_SOURCE_COMMANDS: usize = 64;
+    const MAX_GRAPHEMES: usize = 256;
+    if source.is_empty() || source.len() > MAX_SOURCE_COMMANDS {
+        return None;
+    }
+    let mut grouped: Vec<(f32, Vec<DeflateGlyph>)> = Vec::with_capacity(3);
+    let mut grapheme_count = 0_usize;
+    for command in source {
+        let DrawCommand::Text {
+            position,
+            text,
+            font_family,
+            char_spacing,
+            font_size,
+            bold,
+            italic,
+            color: _,
+            text_scale,
+            rotation_degrees,
+        } = command
+        else {
+            return None;
+        };
+        let baseline = position.y.raw();
+        if !position.x.raw().is_finite()
+            || !baseline.is_finite()
+            || !rotation_degrees.is_finite()
+            || rotation_degrees.abs() > f32::EPSILON
+            || !font_size.raw().is_finite()
+            || font_size <= &Pt::ZERO
+            || !char_spacing.raw().is_finite()
+            || char_spacing < &Pt::ZERO
+            || !text_scale.is_finite()
+            || *text_scale <= 0.0
+            || !text.chars().all(|ch| ch.is_ascii() && !ch.is_control())
+        {
+            return None;
+        }
+
+        let line_index = match grouped.last() {
+            Some((last_baseline, _)) if (baseline - last_baseline).abs() <= BASELINE_TOLERANCE => {
+                grouped.len() - 1
+            }
+            Some((last_baseline, _)) if baseline <= *last_baseline => return None,
+            _ => {
+                if grouped.len() == 3 {
+                    return None;
+                }
+                grouped.push((baseline, Vec::new()));
+                grouped.len() - 1
+            }
+        };
+
+        let font = FontProps {
+            family: font_family.clone(),
+            size: *font_size,
+            bold: *bold,
+            italic: *italic,
+            underline: false,
+            char_spacing: Pt::ZERO,
+            text_scale: *text_scale,
+            auto_line_spacing: AutoLineSpacingContribution::Scaled,
+            east_asian_language: None,
+            underline_position: Pt::ZERO,
+            underline_thickness: Pt::ZERO,
+        };
+        for grapheme in text.graphemes(true) {
+            grapheme_count += 1;
+            if grapheme_count > MAX_GRAPHEMES {
+                return None;
+            }
+            let (width, _) = measurer.measure(grapheme, &font);
+            let spacing = char_spacing.raw() * grapheme.chars().count() as f32;
+            let raw_ink_bounds = if grapheme.trim().is_empty() {
+                None
+            } else {
+                let (top, bottom) = measurer.vertical_ink_bounds(grapheme, &font)?;
+                Some((top.raw(), bottom.raw()))
+            };
+            if !width.raw().is_finite() || width < Pt::ZERO || !spacing.is_finite() {
+                return None;
+            }
+            grouped[line_index].1.push(DeflateGlyph {
+                text: std::rc::Rc::from(grapheme),
+                font_family: font_family.clone(),
+                font_size: *font_size,
+                bold: *bold,
+                italic: *italic,
+                text_scale: *text_scale,
+                raw_glyph_width: width.raw(),
+                raw_spacing: spacing,
+                raw_ink_bounds,
+            });
+        }
+    }
+
+    if grouped.len() != 3 {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(3);
+    for (_, mut glyphs) in grouped {
+        while glyphs
+            .last()
+            .is_some_and(|glyph| glyph.text.trim().is_empty())
+        {
+            glyphs.pop();
+        }
+        if glyphs.is_empty() || !glyphs.iter().any(|glyph| !glyph.text.trim().is_empty()) {
+            return None;
+        }
+        let raw_advance = glyphs
+            .iter()
+            .map(|glyph| glyph.raw_glyph_width + glyph.raw_spacing)
+            .sum::<f32>();
+        if !raw_advance.is_finite() || raw_advance <= f32::EPSILON {
+            return None;
+        }
+        let (raw_ink_top, raw_ink_bottom) =
+            union_deflate_ink_bounds(glyphs.iter().filter_map(|glyph| glyph.raw_ink_bounds))?;
+        lines.push(DeflateLine {
+            glyphs,
+            raw_advance,
+            raw_ink_top,
+            raw_ink_bottom,
+        });
+    }
+
+    let longest_advance = lines
+        .iter()
+        .map(|line| line.raw_advance)
+        .fold(0.0_f32, f32::max);
+    let sx = warp_size.width.raw() / longest_advance;
+    if !sx.is_finite() || !(0.05..=20.0).contains(&sx) {
+        return None;
+    }
+
+    let guides = DeflateInflateDeflateGuides::from_warp(warp);
+    if (0..3).any(|index| {
+        guides
+            .band(index, 0.5)
+            .is_none_or(|band| band.bottom - band.top <= f32::EPSILON)
+    }) {
+        return None;
+    }
+    let warp_center_x = warp_origin.x.raw() + warp_size.width.raw() * 0.5;
+    if !warp_center_x.is_finite() {
+        return None;
+    }
+    let mut result = Vec::with_capacity(lines.iter().map(|line| line.glyphs.len()).sum());
+    for (line_index, line) in lines.into_iter().enumerate() {
+        let line_command_count = line.glyphs.len();
+        let line_width = line.raw_advance * sx;
+        let line_ink_height = line.raw_ink_bottom - line.raw_ink_top;
+        let baseline_fraction = -line.raw_ink_top / line_ink_height;
+        let mut cursor = warp_origin.x.raw() + (warp_size.width.raw() - line_width) * 0.5;
+        if !line_width.is_finite()
+            || !line_ink_height.is_finite()
+            || line_ink_height <= f32::EPSILON
+            || !baseline_fraction.is_finite()
+            || !cursor.is_finite()
+        {
+            return None;
+        }
+        let mut line_commands = Vec::with_capacity(line_command_count);
+        let mut outline_bounds = Vec::with_capacity(line_command_count);
+        for glyph in line.glyphs {
+            let glyph_width = glyph.raw_glyph_width * sx;
+            let spacing = glyph.raw_spacing * sx;
+            let mid_x = cursor + glyph_width * 0.5;
+            if !glyph_width.is_finite()
+                || glyph_width < 0.0
+                || !spacing.is_finite()
+                || spacing < 0.0
+                || !mid_x.is_finite()
+            {
+                return None;
+            }
+            let normalized_x = (mid_x - warp_origin.x.raw()) / warp_size.width.raw();
+            if !normalized_x.is_finite() {
+                return None;
+            }
+            let u = normalized_x.clamp(0.0, 1.0);
+            let sample = guides.band(line_index, u)?;
+            if ![
+                sample.top,
+                sample.bottom,
+                sample.top_derivative,
+                sample.bottom_derivative,
+            ]
+            .into_iter()
+            .all(f32::is_finite)
+            {
+                return None;
+            }
+            let band_height = (sample.bottom - sample.top) * warp_size.height.raw();
+            let sy = band_height / line_ink_height;
+            if !band_height.is_finite()
+                || band_height <= f32::EPSILON
+                || !sy.is_finite()
+                || sy <= f32::EPSILON
+            {
+                return None;
+            }
+
+            let band_top_y = warp_origin.y.raw() + sample.top * warp_size.height.raw();
+            let baseline_y = band_top_y - line.raw_ink_top * sy;
+            let baseline_derivative = sample.top_derivative
+                + (sample.bottom_derivative - sample.top_derivative) * baseline_fraction;
+            let slope = baseline_derivative * warp_size.height.raw() / warp_size.width.raw();
+            if !band_top_y.is_finite()
+                || !baseline_y.is_finite()
+                || !baseline_derivative.is_finite()
+                || !slope.is_finite()
+            {
+                return None;
+            }
+            let angle = slope.atan();
+            let unit_x = angle.cos();
+            let unit_y = angle.sin();
+            let position_x = mid_x - unit_x * glyph_width * 0.5;
+            let position_y = baseline_y - unit_y * glyph_width * 0.5;
+            let band_mid_y =
+                warp_origin.y.raw() + (sample.top + sample.bottom) * 0.5 * warp_size.height.raw();
+            if !angle.is_finite()
+                || !unit_x.is_finite()
+                || !unit_y.is_finite()
+                || !position_x.is_finite()
+                || !position_y.is_finite()
+                || !band_mid_y.is_finite()
+            {
+                return None;
+            }
+            let position = PtOffset::new(Pt::new(position_x), Pt::new(position_y));
+            let output_font_size = glyph.font_size * sy;
+            let output_text_scale = glyph.text_scale * sx / sy;
+            let rotation_degrees = angle.to_degrees();
+            if !output_font_size.raw().is_finite()
+                || output_font_size <= Pt::ZERO
+                || !output_text_scale.is_finite()
+                || output_text_scale <= f32::EPSILON
+                || !rotation_degrees.is_finite()
+            {
+                return None;
+            }
+            if !glyph.text.trim().is_empty() {
+                let output_font = FontProps {
+                    family: glyph.font_family.clone(),
+                    size: output_font_size,
+                    bold: glyph.bold,
+                    italic: glyph.italic,
+                    underline: false,
+                    char_spacing: Pt::ZERO,
+                    text_scale: output_text_scale,
+                    auto_line_spacing: AutoLineSpacingContribution::Scaled,
+                    east_asian_language: None,
+                    underline_position: Pt::ZERO,
+                    underline_thickness: Pt::ZERO,
+                };
+                outline_bounds.push(measurer.transformed_ink_bounds(
+                    &glyph.text,
+                    &output_font,
+                    position,
+                    rotation_degrees,
+                )?);
+            }
+            line_commands.push(DrawCommand::Text {
+                position,
+                text: glyph.text,
+                font_family: glyph.font_family,
+                char_spacing: Pt::ZERO,
+                font_size: output_font_size,
+                bold: glyph.bold,
+                italic: glyph.italic,
+                color: gradient.color_at(mid_x, band_mid_y, warp_origin, warp_size),
+                text_scale: output_text_scale,
+                rotation_degrees,
+            });
+            cursor += glyph_width + spacing;
+            if !cursor.is_finite() {
+                return None;
+            }
+        }
+        let (ink_left, ink_right) = union_deflate_outline_x(outline_bounds)?;
+        center_deflate_line_commands(
+            &mut line_commands,
+            ink_left,
+            ink_right,
+            warp_center_x,
+            warp_size.width.raw(),
+        )?;
+        result.extend(line_commands);
+    }
+    Some(result)
 }
 
 #[derive(Clone)]
@@ -2421,7 +3006,7 @@ mod tests {
         ShapeProperties, TextWrap, Transform2D, WordProcessingShape,
     };
     use crate::render::dimension::Pt;
-    use crate::render::geometry::PtSize;
+    use crate::render::geometry::{PtOffset, PtSize};
     use crate::render::layout::{live_mc_branch, McBranch};
 
     /// A minimally-populated anchored `wps:wsp` shape (as `Inline::Image`).
@@ -3083,6 +3668,482 @@ mod tests {
                 formula: format!("val {adjustment}"),
             }],
         }
+    }
+
+    fn deflate_warp(formula: Option<&str>) -> crate::model::PresetTextWarp {
+        crate::model::PresetTextWarp {
+            preset: crate::model::PresetTextWarpType::TextDeflateInflateDeflate,
+            adjust_values: formula
+                .map(|formula| crate::model::GeomGuide {
+                    name: "adj".into(),
+                    formula: formula.into(),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn deflate_gradient() -> crate::model::DrawingFill {
+        use crate::model::{DrawingColor, GradientFill, GradientShadeProperties, GradientStop};
+        crate::model::DrawingFill::Gradient(GradientFill {
+            stops: vec![
+                GradientStop {
+                    position: Dimension::new(0),
+                    color: DrawingColor::Srgb {
+                        rgb: 0x4472C4,
+                        transforms: vec![],
+                    },
+                },
+                GradientStop {
+                    position: Dimension::new(100_000),
+                    color: DrawingColor::Srgb {
+                        rgb: 0xED7D31,
+                        transforms: vec![],
+                    },
+                },
+            ],
+            shade_properties: GradientShadeProperties::Linear {
+                angle: Dimension::new(0),
+                scaled: Some(true),
+            },
+            flip: None,
+            rot_with_shape: None,
+            tile_rect: None,
+        })
+    }
+
+    fn deflate_source(lines: &[&str]) -> Vec<crate::render::layout::draw_command::DrawCommand> {
+        use crate::render::layout::draw_command::DrawCommand;
+        use crate::render::resolve::color::RgbColor;
+        use std::rc::Rc;
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, text)| DrawCommand::Text {
+                position: PtOffset::new(Pt::ZERO, Pt::new(12.0 + index as f32 * 14.0)),
+                text: Rc::from(*text),
+                font_family: Rc::from("Arial"),
+                char_spacing: Pt::ZERO,
+                font_size: Pt::new(10.0),
+                bold: true,
+                italic: false,
+                color: RgbColor::WHITE,
+                text_scale: 1.0,
+                rotation_degrees: 0.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deflate_inflate_deflate_target_guides_match_ecma() {
+        let guides =
+            super::DeflateInflateDeflateGuides::from_warp(&deflate_warp(Some("val 24159")));
+        let close = |actual: f32, expected: f32| {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}")
+        };
+        let first = guides.band(0, 0.5).unwrap();
+        let middle = guides.band(1, 0.5).unwrap();
+        let last = guides.band(2, 0.5).unwrap();
+        close(first.bottom, 0.21159);
+        close(middle.top, 0.27159);
+        close(middle.bottom, 0.72841);
+        close(last.top, 0.78841);
+
+        close(guides.band(0, 0.0).unwrap().bottom, 0.30);
+        close(guides.band(1, 0.0).unwrap().top, 0.36);
+        close(guides.band(1, 0.0).unwrap().bottom, 0.63);
+        close(guides.band(2, 0.0).unwrap().top, 0.70);
+    }
+
+    #[test]
+    fn deflate_inflate_deflate_adjustment_defaults_and_clamps() {
+        let default = super::DeflateInflateDeflateGuides::from_warp(&deflate_warp(None));
+        let malformed =
+            super::DeflateInflateDeflateGuides::from_warp(&deflate_warp(Some("*/ 1 2")));
+        assert!((default.y1 - malformed.y1).abs() < f32::EPSILON);
+
+        let low = super::DeflateInflateDeflateGuides::from_warp(&deflate_warp(Some("val 0")));
+        let high = super::DeflateInflateDeflateGuides::from_warp(&deflate_warp(Some("val 50000")));
+        assert!(low.band(0, 0.5).unwrap().bottom.abs() < 1e-6);
+        let high_middle = high.band(1, 0.5).unwrap();
+        assert!((high_middle.bottom - high_middle.top).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deflate_line_ink_bounds_union_uses_outermost_numeric_edges() {
+        let union = super::union_deflate_ink_bounds([(-7.25, 0.125), (-5.5, 1.75), (-8.0, 0.5)])
+            .expect("valid glyph ink has a union");
+        assert_eq!(union, (-8.0, 1.75));
+        assert!(super::union_deflate_ink_bounds([]).is_none());
+        assert!(super::union_deflate_ink_bounds([(f32::NAN, 1.0)]).is_none());
+        assert!(super::union_deflate_ink_bounds([(0.0, 0.0)]).is_none());
+    }
+
+    #[test]
+    fn target_text_rect_and_insets_define_the_warp_box() {
+        let rect = crate::render::geometry::PtRect::from_xywh(
+            Pt::new(17.187_181),
+            Pt::new(14.874_94),
+            Pt::new(82.987_05),
+            Pt::new(71.822_56),
+        );
+        let inset = Pt::new(18_000.0 / 12_700.0);
+        let got = super::inset_deflate_text_rect(rect, inset, inset, inset, inset).unwrap();
+        assert!((got.origin.x.raw() - 18.604_504).abs() < 1e-5);
+        assert!((got.origin.y.raw() - 16.292_263).abs() < 1e-5);
+        assert!((got.size.width.raw() - 80.152_405).abs() < 1e-5);
+        assert!((got.size.height.raw() - 68.987_915).abs() < 1e-5);
+    }
+
+    #[test]
+    fn three_plain_lines_emit_trimmed_gradient_graphemes_in_three_bands() {
+        use crate::render::layout::draw_command::DrawCommand;
+
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let fill = deflate_gradient();
+        let output = super::build_text_deflate_inflate_deflate_commands(
+            &deflate_source(&["You can ", "draw here ", "as well "]),
+            PtOffset::default(),
+            PtSize::new(Pt::new(100.0), Pt::new(90.0)),
+            &deflate_warp(Some("val 24159")),
+            Some(&fill),
+            None,
+            &measurer,
+        )
+        .expect("the exact three-line ASCII body is supported");
+
+        let mut reconstructed = String::new();
+        let mut sizes = [0.0_f32; 3];
+        let mut scales = Vec::new();
+        let mut colors = Vec::new();
+        for (index, command) in output.iter().enumerate() {
+            let DrawCommand::Text {
+                text,
+                font_size,
+                color,
+                text_scale,
+                char_spacing,
+                ..
+            } = command
+            else {
+                panic!("the specialised branch emits text only")
+            };
+            reconstructed.push_str(text);
+            let line = if index < 7 {
+                0
+            } else if index < 16 {
+                1
+            } else {
+                2
+            };
+            sizes[line] = sizes[line].max(font_size.raw());
+            scales.push(font_size.raw() / 10.0 * text_scale);
+            colors.push(*color);
+            assert_eq!(*char_spacing, Pt::ZERO);
+            assert_ne!(*color, crate::render::resolve::color::RgbColor::WHITE);
+        }
+        assert_eq!(reconstructed, "You candraw hereas well");
+        assert_eq!(output.len(), 23);
+        assert!(sizes[1] > sizes[0] && sizes[1] > sizes[2]);
+        assert!(scales
+            .windows(2)
+            .all(|pair| (pair[0] - pair[1]).abs() < 1e-4));
+        assert!(colors.first().unwrap().b > colors.last().unwrap().b);
+        assert!(colors.first().unwrap().r < colors.last().unwrap().r);
+    }
+
+    #[test]
+    fn deflate_lines_center_transformed_outline_on_warp_rect() {
+        use crate::render::layout::draw_command::DrawCommand;
+        use crate::render::layout::fragment::{AutoLineSpacingContribution, FontProps};
+
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let fill = deflate_gradient();
+        let output = super::build_text_deflate_inflate_deflate_commands(
+            &deflate_source(&["You can ", "draw here ", "as well "]),
+            PtOffset::default(),
+            PtSize::new(Pt::new(100.0), Pt::new(90.0)),
+            &deflate_warp(Some("val 24159")),
+            Some(&fill),
+            None,
+            &measurer,
+        )
+        .expect("the supported body has measurable outlines");
+
+        let mut start = 0;
+        for line_len in [7, 9, 7] {
+            let bounds = output[start..start + line_len]
+                .iter()
+                .filter_map(|command| {
+                    let DrawCommand::Text {
+                        position,
+                        text,
+                        font_family,
+                        font_size,
+                        bold,
+                        italic,
+                        text_scale,
+                        rotation_degrees,
+                        ..
+                    } = command
+                    else {
+                        panic!("the specialised branch emits text only")
+                    };
+                    if text.trim().is_empty() {
+                        return None;
+                    }
+                    let font = FontProps {
+                        family: font_family.clone(),
+                        size: *font_size,
+                        bold: *bold,
+                        italic: *italic,
+                        underline: false,
+                        char_spacing: Pt::ZERO,
+                        text_scale: *text_scale,
+                        auto_line_spacing: AutoLineSpacingContribution::Scaled,
+                        east_asian_language: None,
+                        underline_position: Pt::ZERO,
+                        underline_thickness: Pt::ZERO,
+                    };
+                    Some(
+                        measurer
+                            .transformed_ink_bounds(text, &font, *position, *rotation_degrees)
+                            .expect("every non-space output glyph keeps its outline"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (left, right) =
+                super::union_deflate_outline_x(bounds).expect("each line has visible ink");
+            assert!(
+                ((left + (right - left) * 0.5) - 50.0).abs() < 1e-3,
+                "line outline [{left}, {right}] is not centred"
+            );
+            start += line_len;
+        }
+        assert_eq!(start, output.len());
+    }
+
+    fn assert_text_commands_differ_only_by_x(
+        before: &[crate::render::layout::draw_command::DrawCommand],
+        after: &[crate::render::layout::draw_command::DrawCommand],
+        dx: f32,
+    ) {
+        use crate::render::layout::draw_command::DrawCommand;
+
+        assert_eq!(before.len(), after.len());
+        for (before, after) in before.iter().zip(after) {
+            let (
+                DrawCommand::Text {
+                    position: before_position,
+                    text: before_text,
+                    font_family: before_family,
+                    char_spacing: before_spacing,
+                    font_size: before_size,
+                    bold: before_bold,
+                    italic: before_italic,
+                    color: before_color,
+                    text_scale: before_scale,
+                    rotation_degrees: before_rotation,
+                },
+                DrawCommand::Text {
+                    position: after_position,
+                    text: after_text,
+                    font_family: after_family,
+                    char_spacing: after_spacing,
+                    font_size: after_size,
+                    bold: after_bold,
+                    italic: after_italic,
+                    color: after_color,
+                    text_scale: after_scale,
+                    rotation_degrees: after_rotation,
+                },
+            ) = (before, after)
+            else {
+                panic!("line centring accepts text commands only")
+            };
+            assert!((after_position.x.raw() - before_position.x.raw() - dx).abs() < 1e-6);
+            assert_eq!(after_position.y, before_position.y);
+            assert_eq!(after_text, before_text);
+            assert_eq!(after_family, before_family);
+            assert_eq!(after_spacing, before_spacing);
+            assert_eq!(after_size, before_size);
+            assert_eq!(after_bold, before_bold);
+            assert_eq!(after_italic, before_italic);
+            assert_eq!(after_color, before_color);
+            assert_eq!(after_scale, before_scale);
+            assert_eq!(after_rotation, before_rotation);
+        }
+    }
+
+    #[test]
+    fn deflate_post_centering_is_a_rigid_x_translation() {
+        let mut line = deflate_source(&["A", "B", "C"]);
+        let before = line.clone();
+        let dx = super::center_deflate_line_commands(&mut line, 10.0, 30.0, 50.0, 100.0)
+            .expect("a finite line can be centred");
+        assert_eq!(dx, 30.0);
+        assert_text_commands_differ_only_by_x(&before, &line, dx);
+    }
+
+    #[test]
+    fn deflate_internal_space_moves_with_its_line_and_text_order_survives() {
+        use crate::render::layout::draw_command::DrawCommand;
+
+        let mut line = deflate_source(&["A", " ", "B"]);
+        let before = line.clone();
+        let dx = super::center_deflate_line_commands(&mut line, 4.0, 24.0, 40.0, 80.0)
+            .expect("a line containing an internal space can be centred");
+        assert_text_commands_differ_only_by_x(&before, &line, dx);
+        let reconstructed = line
+            .iter()
+            .map(|command| {
+                let DrawCommand::Text { text, .. } = command else {
+                    unreachable!()
+                };
+                text.as_ref()
+            })
+            .collect::<String>();
+        assert_eq!(reconstructed, "A B");
+        let DrawCommand::Text {
+            position: before_space,
+            ..
+        } = &before[1]
+        else {
+            unreachable!()
+        };
+        let DrawCommand::Text {
+            position: after_space,
+            ..
+        } = &line[1]
+        else {
+            unreachable!()
+        };
+        assert!((after_space.x.raw() - before_space.x.raw() - dx).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deflate_centering_keeps_nonzero_tangent_rotations() {
+        use crate::render::layout::draw_command::DrawCommand;
+
+        let mut line = deflate_source(&["A", "B"]);
+        for (command, rotation) in line.iter_mut().zip([17.5, -8.25]) {
+            let DrawCommand::Text {
+                rotation_degrees, ..
+            } = command
+            else {
+                unreachable!()
+            };
+            *rotation_degrees = rotation;
+        }
+        let before = line.clone();
+        let dx = super::center_deflate_line_commands(&mut line, 10.0, 20.0, 40.0, 80.0)
+            .expect("centering preserves finite rotations");
+        assert_text_commands_differ_only_by_x(&before, &line, dx);
+        assert!(line.iter().any(|command| matches!(
+            command,
+            DrawCommand::Text { rotation_degrees, .. } if rotation_degrees.abs() > f32::EPSILON
+        )));
+    }
+
+    #[test]
+    fn deflate_invalid_outline_union_or_shift_preserves_input_for_fallback() {
+        let invalid_rect = crate::render::geometry::PtRect::from_xywh(
+            Pt::new(f32::NAN),
+            Pt::ZERO,
+            Pt::new(1.0),
+            Pt::new(1.0),
+        );
+        assert!(super::union_deflate_outline_x([]).is_none());
+        assert!(super::union_deflate_outline_x([invalid_rect]).is_none());
+
+        let mut line = deflate_source(&["A"]);
+        let before = line.clone();
+        assert!(
+            super::center_deflate_line_commands(&mut line, f32::NAN, 1.0, 50.0, 100.0,).is_none()
+        );
+        assert_text_commands_differ_only_by_x(&before, &line, 0.0);
+        assert!(
+            super::center_deflate_line_commands(&mut line, 1_000.0, 1_010.0, 50.0, 100.0,)
+                .is_none()
+        );
+        assert_text_commands_differ_only_by_x(&before, &line, 0.0);
+    }
+
+    #[test]
+    fn unsupported_deflate_body_keeps_the_ordinary_fallback_available() {
+        use crate::render::layout::draw_command::DrawCommand;
+        use std::rc::Rc;
+
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let fill = deflate_gradient();
+        let origin = PtOffset::default();
+        let size = PtSize::new(Pt::new(100.0), Pt::new(90.0));
+        let warp = deflate_warp(Some("val 24159"));
+        let build = |source: &[DrawCommand], size, warp: &crate::model::PresetTextWarp| {
+            super::build_text_deflate_inflate_deflate_commands(
+                source,
+                origin,
+                size,
+                warp,
+                Some(&fill),
+                None,
+                &measurer,
+            )
+        };
+
+        assert!(build(&deflate_source(&["one", "two"]), size, &warp).is_none());
+        assert!(build(&deflate_source(&["one", "   ", "three"]), size, &warp).is_none());
+        assert!(build(&deflate_source(&["one", "مرحبا", "three"]), size, &warp).is_none());
+        assert!(build(
+            &deflate_source(&["A".repeat(10_000).as_str(), "two", "three"]),
+            size,
+            &warp
+        )
+        .is_none());
+        assert!(build(
+            &deflate_source(&["one", "two", "three"]),
+            PtSize::new(Pt::new(f32::NAN), Pt::new(90.0)),
+            &warp
+        )
+        .is_none());
+        assert!(build(
+            &deflate_source(&["one", "two", "three"]),
+            PtSize::new(Pt::new(f32::MAX), Pt::new(f32::MAX)),
+            &warp
+        )
+        .is_none());
+        assert!(build(
+            &deflate_source(&["one", "two", "three"]),
+            size,
+            &deflate_warp(Some("val 0"))
+        )
+        .is_none());
+
+        let mut non_text = deflate_source(&["one", "two", "three"]);
+        non_text.push(DrawCommand::LinkAnnotation {
+            rect: crate::render::geometry::PtRect::default(),
+            url: Rc::from("https://example.test"),
+        });
+        assert!(build(&non_text, size, &warp).is_none());
+        let mut negative_spacing = deflate_source(&["one", "two", "three"]);
+        let DrawCommand::Text { char_spacing, .. } = &mut negative_spacing[0] else {
+            unreachable!()
+        };
+        *char_spacing = Pt::new(-1.0);
+        assert!(build(&negative_spacing, size, &warp).is_none());
+        assert!(super::build_text_deflate_inflate_deflate_commands(
+            &deflate_source(&["one", "two", "three"]),
+            origin,
+            size,
+            &warp,
+            None,
+            None,
+            &measurer,
+        )
+        .is_none());
     }
 
     #[test]
