@@ -79,17 +79,6 @@ pub(super) fn resolve_paragraph_defaults(
         }
     }
 
-    // A paragraph mark's run properties (`w:pPr/w:rPr`) are direct
-    // formatting for the paragraph and therefore sit above the paragraph
-    // style/document defaults.  They are especially important for legacy
-    // complex fields (for example MACROBUTTON placeholders) that have no
-    // result run from which to recover character formatting.
-    if let Some(mark) = &para.mark_run_properties {
-        let mut merged_mark = mark.clone();
-        crate::render::resolve::properties::merge_run_properties(&mut merged_mark, &run_defaults);
-        run_defaults = merged_mark;
-    }
-
     // Merge doc defaults as lowest-priority fallback (unless deferred for table cascade).
     if !defer_doc_defaults {
         merge_paragraph_properties(&mut para_props, &resolved.doc_defaults_paragraph);
@@ -337,8 +326,14 @@ pub(super) fn paragraph_style_from_props(
     let (indent_left, indent_right, indent_first_line) =
         resolve_indentation(props.indentation, character_width);
 
-    // §17.3.1.33: when autoSpacing is true, use 14pt instead of explicit value.
-    let space_before = if props.spacing.and_then(|s| s.before_auto_spacing) == Some(true) {
+    let before_auto_spacing = props.spacing.and_then(|s| s.before_auto_spacing) == Some(true);
+    let after_auto_spacing = props.spacing.and_then(|s| s.after_auto_spacing) == Some(true);
+
+    // §17.3.1.33: the automatic value is consumer-defined. The existing 14pt
+    // fallback remains the scalar used for ordinary boundaries; the auto flags
+    // below let the stacker apply Word's narrower same-list contextual rule
+    // without changing unrelated paragraph spacing globally.
+    let space_before = if before_auto_spacing {
         Pt::new(14.0)
     } else {
         props
@@ -347,7 +342,7 @@ pub(super) fn paragraph_style_from_props(
             .map(Pt::from)
             .unwrap_or(Pt::ZERO)
     };
-    let space_after = if props.spacing.and_then(|s| s.after_auto_spacing) == Some(true) {
+    let space_after = if after_auto_spacing {
         Pt::new(14.0)
     } else {
         props
@@ -386,6 +381,20 @@ pub(super) fn paragraph_style_from_props(
         alignment: props.alignment.unwrap_or(model::Alignment::Start),
         space_before,
         space_after,
+        before_auto_spacing,
+        after_auto_spacing,
+        // Word writes numId=0 as the "not numbered" sentinel. It must survive
+        // the property cascade long enough to clear inherited numbering, but
+        // at the model → layout seam it is no longer a list identity.
+        list_spacing_context: props
+            .numbering
+            .filter(|numbering| numbering.num_id != 0)
+            .map(
+                |numbering| crate::render::layout::paragraph::ListSpacingContext {
+                    num_id: model::NumId::new(numbering.num_id),
+                    level: numbering.level,
+                },
+            ),
         indent_left,
         indent_right,
         indent_first_line,
@@ -406,6 +415,8 @@ pub(super) fn paragraph_style_from_props(
         widow_control: props.widow_control.unwrap_or(true),
         // §17.3.1.45: absent means space-delimited words move intact.
         word_wrap: props.word_wrap.unwrap_or(false),
+        // §17.3.1.21: unlike most paragraph toggles, omission means on.
+        overflow_punct: props.overflow_punct.unwrap_or(true),
         contextual_spacing: props.contextual_spacing.unwrap_or(false),
         style_id: None, // set by caller when available
         page_floats: Vec::new(),
@@ -939,6 +950,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            do_not_wrap_text_with_punct: false,
             character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
@@ -1015,6 +1027,104 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_style_preserves_auto_spacing_and_list_identity() {
+        let props = ParagraphProperties {
+            spacing: Some(model::ParagraphSpacing {
+                before: Some(Dimension::<Twips>::new(100)),
+                after: Some(Dimension::<Twips>::new(100)),
+                before_auto_spacing: Some(true),
+                after_auto_spacing: Some(false),
+                line: None,
+            }),
+            numbering: Some(model::NumberingReference {
+                num_id: 7,
+                level: 2,
+            }),
+            ..Default::default()
+        };
+
+        let style = paragraph_style_from_props(
+            &props,
+            Pt::new(12.0),
+            Pt::new(36.0),
+            crate::render::layout::ShapeAutoFit::NONE,
+            crate::render::resolve::locale::Locale::English,
+            None,
+        );
+
+        assert_eq!(style.space_before, Pt::new(14.0));
+        assert_eq!(style.space_after, Pt::new(5.0));
+        assert!(style.before_auto_spacing);
+        assert!(
+            !style.after_auto_spacing,
+            "explicit false survives the cascade"
+        );
+        let list = style.list_spacing_context.expect("effective numPr");
+        assert_eq!(list.num_id, model::NumId::new(7));
+        assert_eq!(list.level, 2);
+    }
+
+    #[test]
+    fn numbering_zero_sentinel_is_not_a_list_spacing_context() {
+        let props = ParagraphProperties {
+            spacing: Some(model::ParagraphSpacing {
+                before_auto_spacing: Some(true),
+                after_auto_spacing: Some(true),
+                ..Default::default()
+            }),
+            numbering: Some(model::NumberingReference {
+                num_id: 0,
+                level: 0,
+            }),
+            ..Default::default()
+        };
+
+        let style = paragraph_style_from_props(
+            &props,
+            Pt::new(12.0),
+            Pt::new(36.0),
+            crate::render::layout::ShapeAutoFit::NONE,
+            crate::render::resolve::locale::Locale::English,
+            None,
+        );
+
+        assert!(style.before_auto_spacing);
+        assert!(style.after_auto_spacing);
+        assert_eq!(style.space_before, Pt::new(14.0));
+        assert_eq!(style.space_after, Pt::new(14.0));
+        assert!(
+            style.list_spacing_context.is_none(),
+            "numId=0 clears inherited numbering and is not a list identity"
+        );
+    }
+
+    #[test]
+    fn overflow_punctuation_defaults_true_only_at_layout_seam() {
+        let absent = paragraph_style_from_props(
+            &ParagraphProperties::default(),
+            Pt::new(12.0),
+            Pt::new(36.0),
+            crate::render::layout::ShapeAutoFit::NONE,
+            crate::render::resolve::locale::Locale::English,
+            None,
+        );
+        assert!(absent.overflow_punct);
+
+        let explicit_off = paragraph_style_from_props(
+            &ParagraphProperties {
+                overflow_punct: Some(false),
+                ..Default::default()
+            },
+            Pt::new(12.0),
+            Pt::new(36.0),
+            crate::render::layout::ShapeAutoFit::NONE,
+            crate::render::resolve::locale::Locale::English,
+            None,
+        );
+        assert!(!explicit_off.overflow_punct);
+    }
+
+    #[test]
     fn shape_font_ref_base_color_and_family_apply_as_defaults() {
         // §20.1.4.1.17: a shape's fontRef supplies the base text color / family
         // used when the run/style specify none.
@@ -1033,6 +1143,29 @@ mod tests {
         let (family, _, _, _, _) =
             resolve_paragraph_defaults(&para, &resolved, false, None, Some("Foo Sans"));
         assert_eq!(family, "Foo Sans");
+    }
+
+    #[test]
+    fn paragraph_mark_properties_are_not_visible_run_defaults() {
+        let mut resolved = empty_resolved();
+        resolved.doc_defaults_run = model::RunProperties {
+            font_size: Some(Dimension::new(22)),
+            bold: Some(false),
+            ..Default::default()
+        };
+        let mut para = bare_para();
+        para.mark_run_properties = Some(model::RunProperties {
+            font_size: Some(Dimension::new(40)),
+            bold: Some(true),
+            ..Default::default()
+        });
+
+        let (_, size, _, _, run_defaults) =
+            resolve_paragraph_defaults(&para, &resolved, false, None, None);
+
+        assert_eq!(size, Pt::new(11.0));
+        assert_eq!(run_defaults.font_size, Some(Dimension::new(22)));
+        assert_eq!(run_defaults.bold, Some(false));
     }
 
     fn border_with_style(style: BorderStyle) -> Border {

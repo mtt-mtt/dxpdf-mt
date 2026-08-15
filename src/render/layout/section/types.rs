@@ -333,8 +333,6 @@ pub struct ContinuationState {
     pub bottom: Pt,
     /// Floats from the shared physical page that still affect following text.
     pub page_floats: Vec<ActiveFloat>,
-    /// Paragraph anchor used by paragraph-relative floating objects.
-    pub last_para_start_y: Pt,
 }
 
 #[cfg(test)]

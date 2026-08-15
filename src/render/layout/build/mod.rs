@@ -54,9 +54,15 @@ impl BuildContext<'_> {
 pub struct BuildState {
     /// Page configuration for the current section.
     pub page_config: crate::render::layout::page::PageConfig,
-    /// Active section's explicit line-grid pitch. Only `docGrid type="lines"`
-    /// is enabled; ambiguous/default grid modes remain unchanged.
+    /// Active section's explicit line-grid pitch. `lines`, `linesAndChars`,
+    /// and `snapToChars` define a vertical pitch; ambiguous/default grid modes
+    /// remain unchanged.
     pub doc_grid_line_pitch: Option<Pt>,
+    /// Whether the current section's document grid defines horizontal
+    /// character cells (`linesAndChars` or `snapToChars`). Kept separate from
+    /// `doc_grid_line_pitch`: `lines` is vertical-only and must not activate
+    /// `doNotWrapTextWithPunct`.
+    pub character_grid_active: bool,
     /// §17.11.12: footnote display numbering plus the ordered record of which
     /// notes each paragraph referenced. Advanced by `collect_fragments` and
     /// drained per paragraph — see
@@ -113,13 +119,7 @@ pub fn build_section_blocks(
     ctx: &BuildContext,
     state: &mut BuildState,
 ) -> BuiltSection {
-    state.doc_grid_line_pitch = section
-        .properties
-        .doc_grid
-        .filter(|grid| grid.grid_type == Some(model::DocGridType::Lines))
-        .and_then(|grid| grid.line_pitch)
-        .map(Pt::from)
-        .filter(|pitch| *pitch > Pt::ZERO);
+    set_section_document_grid(state, &section.properties);
     let mut pending_dropcap: Option<crate::render::layout::paragraph::DropCapInfo> = None;
     let blocks: Vec<LayoutBlock> = section
         .blocks
@@ -136,6 +136,48 @@ pub fn build_section_blocks(
         .collect();
 
     BuiltSection { blocks }
+}
+
+/// Set both vertical-line and horizontal-character grid state for a section.
+/// Header/footer clearance and deferred header/footer rendering call this too,
+/// so neither phase inherits the previous section's grid.
+pub(crate) fn set_section_document_grid(
+    state: &mut BuildState,
+    properties: &model::SectionProperties,
+) {
+    state.character_grid_active = properties.doc_grid.is_some_and(|grid| {
+        matches!(
+            grid.grid_type,
+            Some(model::DocGridType::LinesAndChars | model::DocGridType::SnapToChars)
+        )
+    });
+    state.doc_grid_line_pitch = properties
+        .doc_grid
+        .filter(|grid| {
+            matches!(
+                grid.grid_type,
+                Some(
+                    model::DocGridType::Lines
+                        | model::DocGridType::LinesAndChars
+                        | model::DocGridType::SnapToChars
+                )
+            )
+        })
+        .and_then(|grid| grid.line_pitch)
+        .map(Pt::from)
+        .filter(|pitch| *pitch > Pt::ZERO);
+}
+
+/// Apply §17.15.3.29 after the paragraph-property cascade has resolved.
+/// The compatibility switch has no effect for a line-only document grid.
+pub(super) fn apply_overflow_punctuation_compat(
+    style: &mut crate::render::layout::paragraph::ParagraphStyle,
+    ctx: &BuildContext<'_>,
+    state: &BuildState,
+) {
+    if ctx.resolved.do_not_wrap_text_with_punct && state.character_grid_active {
+        style.overflow_punct = false;
+    }
 }
 
 /// §17.11.2: build the document's endnote content, rendered once at the end of
@@ -231,7 +273,7 @@ fn build_non_story_content(
                 // they must still drain — otherwise a reference inside one
                 // would be attributed to the next body paragraph.
                 let _ = state.footnotes.take_pending();
-                let style = paragraph_style_from_props(
+                let mut style = paragraph_style_from_props(
                     &props,
                     state.shape_auto_fit.scale_font(paragraph_font_size),
                     Pt::from(ctx.resolved.default_tab_stop),
@@ -243,6 +285,7 @@ fn build_non_story_content(
                     // decided in one place, for every path.
                     convert::paragraph_outline(p, &props, state),
                 );
+                apply_overflow_punctuation_compat(&mut style, ctx, state);
 
                 // Check for VML absolute positioning in Pict inlines.
                 if absolute_position.is_none() {
@@ -307,15 +350,15 @@ fn build_non_story_content(
                 // (otherwise the shape displaces text it should flank).
                 let has_floating_anchor = has_float_images || !paragraph_shapes.is_empty();
                 if frags.is_empty() && block_i + 1 < block_count && !has_floating_anchor {
-                    let (family, mut size, ..) =
+                    let (family, size, _, _, run_defaults) =
                         resolve_paragraph_defaults(p, ctx.resolved, false, None, None);
-                    if let Some(ref mrp) = p.mark_run_properties {
-                        if let Some(fs) = mrp.font_size {
-                            size = Pt::from(fs);
-                        }
-                    }
+                    let (family, size) =
+                        block::paragraph_mark_font(p, ctx.resolved, &run_defaults, family, size);
                     let line_height = ctx.measurer.default_line_height(&family, size);
-                    frags.push(Fragment::LineBreak { line_height });
+                    frags.push(Fragment::LineBreak {
+                        line_height,
+                        text_height: line_height,
+                    });
                 }
 
                 layout_blocks.push(LayoutBlock::Paragraph {
@@ -384,6 +427,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            do_not_wrap_text_with_punct: false,
             character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
@@ -466,6 +510,117 @@ mod tests {
         let blocks = vec![Block::SectionBreak(Box::default()), empty_para()];
         let hf = build_header_footer_content(&blocks, &ctx, &mut state);
         assert_eq!(hf.blocks.len(), 1, "only the paragraph survives");
+    }
+
+    #[test]
+    fn section_document_grid_state_distinguishes_explicit_types_and_resets() {
+        let mut state = BuildState::default();
+        for (label, doc_grid, expected_pitch, expected_character_grid) in [
+            ("no docGrid", None, None, false),
+            (
+                "omitted type",
+                Some(model::DocGrid {
+                    grid_type: None,
+                    line_pitch: Some(Dimension::new(312)),
+                    char_space: None,
+                }),
+                None,
+                false,
+            ),
+            (
+                "explicit default",
+                Some(model::DocGrid {
+                    grid_type: Some(model::DocGridType::Default),
+                    line_pitch: Some(Dimension::new(312)),
+                    char_space: None,
+                }),
+                None,
+                false,
+            ),
+            (
+                "lines",
+                Some(model::DocGrid {
+                    grid_type: Some(model::DocGridType::Lines),
+                    line_pitch: Some(Dimension::new(312)),
+                    char_space: None,
+                }),
+                Some(15.6),
+                false,
+            ),
+            (
+                "linesAndChars",
+                Some(model::DocGrid {
+                    grid_type: Some(model::DocGridType::LinesAndChars),
+                    line_pitch: Some(Dimension::new(312)),
+                    char_space: None,
+                }),
+                Some(15.6),
+                true,
+            ),
+            (
+                "snapToChars",
+                Some(model::DocGrid {
+                    grid_type: Some(model::DocGridType::SnapToChars),
+                    line_pitch: Some(Dimension::new(312)),
+                    char_space: None,
+                }),
+                Some(15.6),
+                true,
+            ),
+            (
+                "non-positive linesAndChars pitch",
+                Some(model::DocGrid {
+                    grid_type: Some(model::DocGridType::LinesAndChars),
+                    line_pitch: Some(Dimension::new(0)),
+                    char_space: None,
+                }),
+                None,
+                true,
+            ),
+            ("reset after active grid", None, None, false),
+        ] {
+            let properties = model::SectionProperties {
+                doc_grid,
+                ..Default::default()
+            };
+            set_section_document_grid(&mut state, &properties);
+            assert_eq!(
+                state.doc_grid_line_pitch.map(|pitch| pitch.raw()),
+                expected_pitch,
+                "{label}"
+            );
+            assert_eq!(
+                state.character_grid_active, expected_character_grid,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_suppresses_overflow_only_with_character_grid_including_headers() {
+        let mut resolved = empty_resolved();
+        resolved.do_not_wrap_text_with_punct = true;
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+
+        let mut style = ParagraphStyle::default();
+        let mut state = BuildState::default();
+        apply_overflow_punctuation_compat(&mut style, &ctx, &state);
+        assert!(style.overflow_punct, "compat alone has no effect");
+
+        state.character_grid_active = true;
+        apply_overflow_punctuation_compat(&mut style, &ctx, &state);
+        assert!(!style.overflow_punct);
+
+        let hf = build_header_footer_content(&[empty_para()], &ctx, &mut state);
+        let LayoutBlock::Paragraph { style, .. } = &hf.blocks[0] else {
+            panic!("expected header paragraph")
+        };
+        assert!(!style.overflow_punct, "header path applies the same gate");
     }
 }
 

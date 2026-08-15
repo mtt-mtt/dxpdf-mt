@@ -62,6 +62,44 @@ pub(crate) fn measure_leading_table_group_height(
     )
 }
 
+/// Measure a complete, non-paginated table without emitting draw commands.
+///
+/// This is intentionally the same height formula as [`layout_table`].  It is
+/// used by the body-level `keepNext` admission predictor for a table that
+/// bridges two body blocks; it does not build or alter paginator row groups.
+pub(crate) fn measure_complete_table_height(
+    rows: &[TableRowInput],
+    col_widths: &[Pt],
+    cell_spacing: Pt,
+    default_line_height: Pt,
+    borders: Option<&TableBorderConfig>,
+    measure_text: super::paragraph::MeasureTextFn<'_>,
+    suppress_first_row_top: bool,
+) -> Option<Pt> {
+    if rows.is_empty() || col_widths.is_empty() {
+        return None;
+    }
+
+    let measured = measure_table_rows(
+        rows,
+        col_widths,
+        cell_spacing,
+        default_line_height,
+        borders,
+        measure_text,
+        suppress_first_row_top,
+    );
+    let rows_height: Pt = measured
+        .rows
+        .iter()
+        .map(|row| row.height + row.border_gap_below)
+        .sum();
+
+    // §17.4.44: every row owns its leading spacing; only the trailing table
+    // spacing remains after summing the measured rows (matching layout_table).
+    Some(rows_height + cell_spacing)
+}
+
 /// Lay out a table: compute column widths, lay out cells, emit borders.
 ///
 /// §17.4.38: `suppress_first_row_top` suppresses the top border of the first row
@@ -825,6 +863,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -904,6 +943,56 @@ mod tests {
             .filter(|c| matches!(c, DrawCommand::Text { .. }))
             .count();
         assert_eq!(text_count, 1);
+    }
+
+    #[test]
+    fn complete_height_measurement_matches_monolithic_layout() {
+        let rows = vec![TableRowInput {
+            cells: vec![simple_cell("measured")],
+            height_rule: None,
+            is_header: None,
+            cant_split: None,
+            grid_before: 0,
+            border_overrides: None,
+        }];
+        let col_widths = vec![Pt::new(200.0)];
+        let border = TableBorderLine {
+            width: Pt::new(2.0),
+            color: RgbColor::BLACK,
+            style: TableBorderStyle::Single,
+        };
+        let borders = TableBorderConfig {
+            top: Some(border),
+            bottom: Some(border),
+            left: None,
+            right: None,
+            inside_h: None,
+            inside_v: None,
+        };
+        let cell_spacing = Pt::new(3.0);
+
+        let laid_out = layout_table(
+            &rows,
+            &col_widths,
+            cell_spacing,
+            Pt::new(14.0),
+            Some(&borders),
+            None,
+            false,
+        );
+        let measured = measure_complete_table_height(
+            &rows,
+            &col_widths,
+            cell_spacing,
+            Pt::new(14.0),
+            Some(&borders),
+            None,
+            false,
+        )
+        .expect("non-empty table has a complete height");
+
+        assert_eq!(measured, laid_out.size.height);
+        assert!(measured > Pt::new(14.0) + cell_spacing);
     }
 
     #[test]
@@ -994,7 +1083,61 @@ mod tests {
     }
 
     #[test]
-    fn min_row_height_respected() {
+    fn at_least_row_height_adds_row_wide_vertical_cell_margins() {
+        let mut top_cell = simple_cell("top");
+        top_cell.margins = PtEdgeInsets::new(Pt::new(3.0), Pt::ZERO, Pt::ZERO, Pt::ZERO);
+        let mut bottom_cell = simple_cell("bottom");
+        bottom_cell.margins = PtEdgeInsets::new(Pt::ZERO, Pt::ZERO, Pt::new(4.0), Pt::ZERO);
+        let rows = vec![TableRowInput {
+            cells: vec![top_cell, bottom_cell],
+            height_rule: Some(RowHeightRule::AtLeast(Pt::new(40.0))),
+            is_header: None,
+            cant_split: None,
+            grid_before: 0,
+            border_overrides: None,
+        }];
+        let result = layout_table(
+            &rows,
+            &[Pt::new(100.0), Pt::new(100.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            result.size.height.raw(),
+            47.0,
+            "40pt content minimum plus row-wide 3pt top and 4pt bottom margins"
+        );
+    }
+
+    #[test]
+    fn at_least_row_height_adds_margins_after_taller_natural_content() {
+        let mut row = tall_row(3);
+        row.cells[0].margins = PtEdgeInsets::new(Pt::new(3.0), Pt::ZERO, Pt::new(4.0), Pt::ZERO);
+        row.height_rule = Some(RowHeightRule::AtLeast(Pt::new(40.0)));
+
+        let result = layout_table(
+            &[row],
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            result.size.height.raw(),
+            49.0,
+            "42pt natural content plus 3pt top and 4pt bottom margins"
+        );
+    }
+
+    #[test]
+    fn at_least_row_height_with_zero_margins_stays_declared_height() {
         let rows = vec![TableRowInput {
             cells: vec![simple_cell("x")],
             height_rule: Some(RowHeightRule::AtLeast(Pt::new(40.0))),
@@ -2034,6 +2177,39 @@ mod tests {
     }
 
     #[test]
+    fn at_least_row_margins_count_against_the_pagination_budget() {
+        let mut row = tall_row(1);
+        row.cells[0].margins = PtEdgeInsets::new(Pt::new(3.0), Pt::ZERO, Pt::new(4.0), Pt::ZERO);
+        row.height_rule = Some(RowHeightRule::AtLeast(Pt::new(40.0)));
+        row.cant_split = Some(true);
+
+        let slices = layout_table_paginated(
+            &[row],
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(45.0),
+                page_height: Pt::new(100.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert_eq!(
+            slices.len(),
+            2,
+            "the corrected 47pt row must not fit a 45pt first-page budget"
+        );
+        assert!(
+            slices[0].commands.is_empty(),
+            "the unsplittable row moves whole"
+        );
+        assert_eq!(slices[1].size.height.raw(), 47.0);
+    }
+
+    #[test]
     fn splittable_row_spans_three_or_more_pages() {
         // Row with 15 lines (≈210pt at 14pt line height).
         // Page 1 has 50pt → ~3 lines fit.
@@ -2540,13 +2716,40 @@ mod tests {
         assert!(!slices[1].commands.is_empty());
     }
 
-    // ── In-cell paragraph splitting semantics (§17.3.1.14/.15/.44) ───────
+    // ── In-cell paragraph splitting semantics (§17.4.1/.3.1.14/.15) ──────
 
     #[test]
-    fn widow_control_keeps_two_cell_lines_on_each_side_of_a_split() {
-        // §17.3.1.44: a 6-line cell paragraph where 5 lines would fit must not
-        // strand a single-line widow — the split leaves 4 on page 1 and 2 on
-        // page 2 (not 5 + 1).
+    fn table_row_split_allows_two_line_paragraph_to_divide_one_one() {
+        // Word applies row-splitting semantics here rather than the body
+        // widow/orphan 2/2 gate: one line may remain on each page.
+        let rows = vec![one_cell_row(vec![styled_para(
+            2,
+            ParagraphStyle::default(),
+        )])];
+        let slices = layout_table_paginated(
+            &rows,
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(14.0),
+                page_height: Pt::new(200.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slice_line_count(&slices[0]), 1);
+        assert_eq!(slice_line_count(&slices[1]), 1);
+    }
+
+    #[test]
+    fn body_widow_control_does_not_limit_an_interior_table_row_cut() {
+        // A 6-line cell paragraph where 5 lines fit splits 5/1 even though its
+        // resolved paragraph style has widow control enabled. The same style
+        // in body pagination still uses the ordinary 2/2 gate.
         let rows = vec![one_cell_row(vec![styled_para(
             6,
             ParagraphStyle::default(),
@@ -2565,15 +2768,15 @@ mod tests {
             },
         );
         assert_eq!(slices.len(), 2);
-        assert_eq!(slice_line_count(&slices[0]), 4, "orphan side keeps >= 2");
-        assert_eq!(slice_line_count(&slices[1]), 2, "widow side keeps >= 2");
+        assert_eq!(slice_line_count(&slices[0]), 5);
+        assert_eq!(slice_line_count(&slices[1]), 1);
     }
 
     #[test]
-    fn without_widow_control_a_cell_paragraph_may_strand_one_line() {
-        // Same geometry, widow control off (§17.3.1.44 disabled) ⇒ the cell
-        // splits as far as it fits: 5 lines on page 1, 1 on page 2. This is the
-        // behaviour the widow-control test above suppresses.
+    fn explicit_widow_off_matches_default_table_row_split_semantics() {
+        // Explicit widowControl=off and the default widow-on style produce the
+        // same table-row cut. This pins that only the table-row context owns
+        // the exception; parsing the paragraph property remains unchanged.
         let style = ParagraphStyle {
             widow_control: false,
             ..Default::default()
@@ -2631,13 +2834,16 @@ mod tests {
 
     #[test]
     fn cell_splits_at_paragraph_boundary_when_neither_paragraph_can_split() {
-        // Two 3-line paragraphs: neither can split under widow control (a
-        // 3-line paragraph has no ≥2/≥2 cut). With 4 lines of room the cell
-        // must break at the *paragraph boundary* — 3 lines (para A) on page 1,
-        // 3 (para B) on page 2 — not mid-paragraph.
+        // Two keepLines paragraphs cannot split internally. With 4 lines of
+        // room the cell must therefore break at the paragraph boundary — 3
+        // lines (para A) on page 1, 3 (para B) on page 2.
+        let keep_lines = ParagraphStyle {
+            keep_lines: true,
+            ..Default::default()
+        };
         let rows = vec![one_cell_row(vec![
-            styled_para(3, ParagraphStyle::default()),
-            styled_para(3, ParagraphStyle::default()),
+            styled_para(3, keep_lines.clone()),
+            styled_para(3, keep_lines),
         ])];
         let slices = layout_table_paginated(
             &rows,
@@ -2660,15 +2866,20 @@ mod tests {
     #[test]
     fn keep_next_forbids_splitting_a_cell_at_that_paragraph_boundary() {
         // §17.3.1.15: para A is keepNext, so the cell may not break between A
-        // and B. Neither 3-line paragraph can split internally (widow control),
-        // so — unlike the boundary test above — the whole cell moves to page 2.
+        // and B. Both 3-line paragraphs are keepLines and cannot split
+        // internally, so the whole cell moves to page 2.
         let keep_next = ParagraphStyle {
             keep_next: true,
+            keep_lines: true,
+            ..Default::default()
+        };
+        let keep_lines = ParagraphStyle {
+            keep_lines: true,
             ..Default::default()
         };
         let rows = vec![one_cell_row(vec![
             styled_para(3, keep_next),
-            styled_para(3, ParagraphStyle::default()),
+            styled_para(3, keep_lines),
         ])];
         let slices = layout_table_paginated(
             &rows,
@@ -2693,10 +2904,10 @@ mod tests {
     }
 
     #[test]
-    fn cell_paragraph_split_across_three_pages_never_widows() {
-        // §17.3.1.44 must hold at *every* break, not just the first. An 11-line
-        // cell paragraph over pages that each hold 5 lines splits 5/4/2 — never
-        // the 5/5/1 a naive re-split would produce.
+    fn table_row_continuation_may_end_with_a_single_line_slice() {
+        // An 11-line cell paragraph over pages that each hold 5 lines splits
+        // 5/5/1. Re-splitting the continuation retains the table-row exception
+        // instead of reintroducing the body widow/orphan rule.
         let rows = vec![one_cell_row(vec![styled_para(
             11,
             ParagraphStyle::default(),
@@ -2714,17 +2925,9 @@ mod tests {
                 suppress_first_row_top: false,
             },
         );
-        assert!(
-            slices.len() >= 3,
-            "expected >= 3 slices, got {}",
-            slices.len()
-        );
         let counts: Vec<usize> = slices.iter().map(slice_line_count).collect();
         assert_eq!(counts.iter().sum::<usize>(), 11, "every line emitted once");
-        assert!(
-            counts.iter().all(|&c| c >= 2),
-            "no single-line widow/orphan segment: {counts:?}"
-        );
+        assert_eq!(counts, vec![5, 5, 1]);
     }
 
     /// §17.4.44: the bottom-edge gap belongs to the table, not to the page it

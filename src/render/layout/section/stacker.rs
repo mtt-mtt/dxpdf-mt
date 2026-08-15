@@ -87,6 +87,8 @@ pub fn stack_blocks(
     let mut cursor_y = Pt::ZERO;
     let mut prev_space_after = Pt::ZERO;
     let mut prev_style_id: Option<crate::model::StyleId> = None;
+    let mut prev_after_auto_spacing = false;
+    let mut prev_list_spacing_context = None;
     let mut page_floats: Vec<float::ActiveFloat> = Vec::new();
     // §17.4.1 row-split model: one entry per fitted line, plus a flag that a
     // block was encountered which makes the whole cell unsafe to bisect
@@ -108,15 +110,12 @@ pub fn stack_blocks(
                 let mut effective_style = style.clone_for_layout();
 
                 // Spacing collapse.
-                if effective_style.contextual_spacing
-                    && effective_style.style_id.is_some()
-                    && effective_style.style_id == prev_style_id
-                {
-                    cursor_y -= prev_space_after + effective_style.space_before;
-                } else {
-                    let collapse = prev_space_after.min(effective_style.space_before);
-                    cursor_y -= collapse;
-                }
+                cursor_y -= effective_style.spacing_overlap_with_previous(
+                    prev_space_after,
+                    prev_style_id.as_ref(),
+                    prev_after_auto_spacing,
+                    prev_list_spacing_context,
+                );
 
                 // Register floating images.
                 let content_top = cursor_y + effective_style.space_before;
@@ -395,6 +394,8 @@ pub fn stack_blocks(
 
                 prev_space_after = effective_style.space_after;
                 prev_style_id = effective_style.style_id.clone();
+                prev_after_auto_spacing = effective_style.after_auto_spacing;
+                prev_list_spacing_context = effective_style.list_spacing_context;
             }
             LayoutBlock::Table {
                 rows,
@@ -438,6 +439,8 @@ pub fn stack_blocks(
                 cursor_y += table.size.height;
                 prev_space_after = Pt::ZERO;
                 prev_style_id = None;
+                prev_after_auto_spacing = false;
+                prev_list_spacing_context = None;
             }
         }
     }
@@ -503,6 +506,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -550,6 +554,20 @@ mod tests {
             space_before: Pt::new(space_before),
             space_after: Pt::new(space_after),
             style_id: style_id.map(crate::model::StyleId::new),
+            ..Default::default()
+        }
+    }
+
+    fn auto_list_style(num_id: i64, level: u8) -> ParagraphStyle {
+        ParagraphStyle {
+            space_before: Pt::new(14.0),
+            space_after: Pt::new(14.0),
+            before_auto_spacing: true,
+            after_auto_spacing: true,
+            list_spacing_context: Some(crate::render::layout::paragraph::ListSpacingContext {
+                num_id: crate::model::NumId::new(num_id),
+                level,
+            }),
             ..Default::default()
         }
     }
@@ -706,6 +724,38 @@ mod tests {
             "ordinary collapse, expected {expected}, got {}",
             stack(&blocks).height.raw()
         );
+    }
+
+    #[test]
+    fn automatic_spacing_is_suppressed_between_peer_items_in_one_list() {
+        let blocks = vec![
+            text_para(auto_list_style(1, 0)),
+            text_para(auto_list_style(1, 0)),
+        ];
+        // The outer before/after spacing remains; only the boundary between
+        // the two peer list items disappears.
+        let expected = 14.0 + LINE + LINE + 14.0;
+        assert_eq!(stack(&blocks).height, Pt::new(expected));
+    }
+
+    #[test]
+    fn automatic_spacing_does_not_cross_list_or_level_boundaries() {
+        for second in [auto_list_style(2, 0), auto_list_style(1, 1)] {
+            let blocks = vec![text_para(auto_list_style(1, 0)), text_para(second)];
+            // Ordinary collapse removes min(14, 14), leaving one 14pt gap.
+            let expected = 14.0 + LINE + 14.0 + LINE + 14.0;
+            assert_eq!(stack(&blocks).height, Pt::new(expected));
+        }
+    }
+
+    #[test]
+    fn automatic_spacing_needs_both_facing_auto_flags() {
+        let first = auto_list_style(1, 0);
+        let mut second = auto_list_style(1, 0);
+        second.before_auto_spacing = false;
+        let blocks = vec![text_para(first), text_para(second)];
+        let expected = 14.0 + LINE + 14.0 + LINE + 14.0;
+        assert_eq!(stack(&blocks).height, Pt::new(expected));
     }
 
     // ── §17.4.1 CellLine cut model ───────────────────────────────────────

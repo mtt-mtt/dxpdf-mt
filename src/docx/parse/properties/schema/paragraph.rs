@@ -89,6 +89,8 @@ pub(crate) struct PPrXml {
     bidi: Vec<OnOff>,
     #[serde(rename = "wordWrap", default)]
     word_wrap: Vec<OnOff>,
+    #[serde(rename = "overflowPunct", default)]
+    overflow_punct: Vec<OnOff>,
     #[serde(rename = "snapToGrid", default)]
     snap_to_grid: Vec<OnOff>,
     #[serde(rename = "autoSpaceDE", default)]
@@ -333,6 +335,7 @@ impl PPrXml {
             contextual_spacing: last_toggle(self.contextual_spacing),
             bidi: last_toggle(self.bidi),
             word_wrap: last_toggle(self.word_wrap),
+            overflow_punct: last_toggle(self.overflow_punct),
             snap_to_grid: last_toggle(self.snap_to_grid),
             outline_level: self
                 .outline_lvl
@@ -500,6 +503,29 @@ mod tests {
     }
 
     #[test]
+    fn overflow_punctuation_preserves_absent_on_off_and_last_wins() {
+        assert_eq!(parse(r#"<pPr/>"#).properties.overflow_punct, None);
+        assert_eq!(
+            parse(r#"<pPr><overflowPunct/></pPr>"#)
+                .properties
+                .overflow_punct,
+            Some(true)
+        );
+        assert_eq!(
+            parse(r#"<pPr><overflowPunct val="0"/></pPr>"#)
+                .properties
+                .overflow_punct,
+            Some(false)
+        );
+        assert_eq!(
+            parse(r#"<pPr><overflowPunct val="1"/><overflowPunct val="off"/></pPr>"#)
+                .properties
+                .overflow_punct,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn borders_shading_and_tabs() {
         let r = parse(
             r#"<pPr>
@@ -560,11 +586,11 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_toggles() {
+    fn all_paragraph_toggles() {
         let r = parse(
             r#"<pPr>
                 <keepNext/><keepLines/><widowControl/><pageBreakBefore/>
-                <suppressAutoHyphens/><contextualSpacing/><bidi/><wordWrap/>
+                <suppressAutoHyphens/><contextualSpacing/><bidi/><wordWrap/><overflowPunct/>
                 <autoSpaceDE/><autoSpaceDN/>
             </pPr>"#,
         );
@@ -577,6 +603,7 @@ mod tests {
         assert_eq!(p.contextual_spacing, Some(true));
         assert_eq!(p.bidi, Some(true));
         assert_eq!(p.word_wrap, Some(true));
+        assert_eq!(p.overflow_punct, Some(true));
         assert_eq!(p.auto_space_de, Some(true));
         assert_eq!(p.auto_space_dn, Some(true));
     }

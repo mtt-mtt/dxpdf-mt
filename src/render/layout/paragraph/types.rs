@@ -8,6 +8,18 @@ use crate::render::dimension::Pt;
 use crate::render::geometry::PtSize;
 use crate::render::resolve::color::RgbColor;
 
+/// The list identity Word uses when resolving automatic spacing between
+/// adjacent list items.
+///
+/// `num_id` distinguishes separate numbering instances that happen to share
+/// an abstract definition, while `level` keeps a nested item boundary from
+/// being treated as two peers in one list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListSpacingContext {
+    pub num_id: crate::model::NumId,
+    pub level: u8,
+}
+
 /// §17.3.1.38: a resolved tab stop for layout.
 #[derive(Clone, Debug)]
 pub struct TabStopDef {
@@ -25,6 +37,15 @@ pub struct ParagraphStyle {
     pub alignment: Alignment,
     pub space_before: Pt,
     pub space_after: Pt,
+    /// §17.3.1.33: `beforeAutospacing` survived the style cascade.
+    ///
+    /// Kept separately from `space_before` because the resolved point value
+    /// alone cannot express Word's contextual handling of adjacent list items.
+    pub before_auto_spacing: bool,
+    /// §17.3.1.33: `afterAutospacing` survived the style cascade.
+    pub after_auto_spacing: bool,
+    /// Effective §17.9 numbering identity, when this paragraph is a list item.
+    pub list_spacing_context: Option<ListSpacingContext>,
     pub indent_left: Pt,
     pub indent_right: Pt,
     pub indent_first_line: Pt,
@@ -76,6 +97,9 @@ pub struct ParagraphStyle {
     /// to break between characters when it exceeds the line extent. The OOXML
     /// default is false; East Asian line-break opportunities are independent.
     pub word_wrap: bool,
+    /// §17.3.1.21: allow the final eligible punctuation scalar to extend
+    /// one character beyond the paragraph text extent.
+    pub overflow_punct: bool,
     /// §17.3.1.9: suppress spacing between paragraphs of the same style.
     pub contextual_spacing: bool,
     /// Style ID for contextual spacing comparison.
@@ -134,6 +158,38 @@ pub struct DropCapInfo {
 }
 
 impl ParagraphStyle {
+    /// Amount by which the two paragraphs' spacing boxes overlap.
+    ///
+    /// OOXML leaves automatic spacing consumer-defined. Word reference renders
+    /// show one stable contextual rule: adjacent peer items in the same
+    /// numbering instance suppress the automatic after/before gap completely.
+    /// Requiring both auto flags and the exact `(numId, ilvl)` identity keeps
+    /// ordinary paragraphs, list boundaries, and nested-level transitions on
+    /// the existing §17.3.1.33 `min(after, before)` collapse path.
+    pub(crate) fn spacing_overlap_with_previous(
+        &self,
+        previous_space_after: Pt,
+        previous_style_id: Option<&crate::model::StyleId>,
+        previous_after_auto_spacing: bool,
+        previous_list_spacing_context: Option<ListSpacingContext>,
+    ) -> Pt {
+        let contextual_spacing = self.contextual_spacing
+            && self
+                .style_id
+                .as_ref()
+                .is_some_and(|style_id| Some(style_id) == previous_style_id);
+        let same_auto_spaced_list = self.before_auto_spacing
+            && previous_after_auto_spacing
+            && self.list_spacing_context.is_some()
+            && self.list_spacing_context == previous_list_spacing_context;
+
+        if contextual_spacing || same_auto_spaced_list {
+            previous_space_after + self.space_before
+        } else {
+            previous_space_after.min(self.space_before)
+        }
+    }
+
     /// Clone the style for layout, leaving `page_floats` empty.
     ///
     /// The caller always replaces `page_floats` with computed effective floats,
@@ -143,6 +199,9 @@ impl ParagraphStyle {
             alignment: self.alignment,
             space_before: self.space_before,
             space_after: self.space_after,
+            before_auto_spacing: self.before_auto_spacing,
+            after_auto_spacing: self.after_auto_spacing,
+            list_spacing_context: self.list_spacing_context,
             indent_left: self.indent_left,
             indent_right: self.indent_right,
             indent_first_line: self.indent_first_line,
@@ -159,6 +218,7 @@ impl ParagraphStyle {
             keep_lines: self.keep_lines,
             widow_control: self.widow_control,
             word_wrap: self.word_wrap,
+            overflow_punct: self.overflow_punct,
             contextual_spacing: self.contextual_spacing,
             style_id: self.style_id.clone(),
             // Caller will replace these — skip cloning the vec.
@@ -176,6 +236,9 @@ impl Default for ParagraphStyle {
             alignment: Alignment::Start,
             space_before: Pt::ZERO,
             space_after: Pt::ZERO,
+            before_auto_spacing: false,
+            after_auto_spacing: false,
+            list_spacing_context: None,
             indent_left: Pt::ZERO,
             indent_right: Pt::ZERO,
             indent_first_line: Pt::ZERO,
@@ -194,6 +257,8 @@ impl Default for ParagraphStyle {
             // §17.3.1.44: Word enables widow/orphan control by default.
             widow_control: true,
             word_wrap: false,
+            // §17.3.1.21: omission is equivalent to true.
+            overflow_punct: true,
             contextual_spacing: false,
             style_id: None,
             page_floats: Vec::new(),

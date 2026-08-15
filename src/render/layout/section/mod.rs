@@ -174,6 +174,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -209,6 +210,7 @@ mod tests {
         LayoutBlock::Paragraph {
             fragments: vec![Fragment::LineBreak {
                 line_height: Pt::new(height),
+                text_height: Pt::new(height),
             }],
             style: ParagraphStyle::default(),
             page_break_before: false,
@@ -2712,6 +2714,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn peer_list_auto_spacing_uses_the_same_rule_in_page_layout() {
+        let style = ParagraphStyle {
+            space_before: Pt::new(14.0),
+            space_after: Pt::new(14.0),
+            before_auto_spacing: true,
+            after_auto_spacing: true,
+            list_spacing_context: Some(crate::render::layout::paragraph::ListSpacingContext {
+                num_id: crate::model::NumId::new(1),
+                level: 0,
+            }),
+            ..Default::default()
+        };
+        let blocks: Vec<_> = (0..3)
+            .map(|index| LayoutBlock::Paragraph {
+                fragments: vec![text_frag(&format!("item{index}"), 30.0, 14.0)],
+                style: style.clone(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![],
+                floating_shapes: vec![],
+            })
+            .collect();
+
+        let pages = layout_section(
+            &blocks,
+            &small_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(
+            pages.len(),
+            1,
+            "three peer items fit only when page layout suppresses their two auto gaps"
+        );
+    }
+
     // ── §17.4.58 — floating-table page overflow ────────────────────────
     //
     // A floating table (`<w:tbl>` with `<w:tblpPr>`) that is taller than
@@ -3102,6 +3144,7 @@ mod tests {
                                     text_frag(&format!("row0-{i}"), 30.0, 14.0),
                                     Fragment::LineBreak {
                                         line_height: Pt::new(14.0),
+                                        text_height: Pt::new(14.0),
                                     },
                                 ]
                             })

@@ -125,6 +125,33 @@ fn has_structural_terminal_section_mark(
         )
 }
 
+/// Whether a leading section consists only of an ordinary structural section
+/// mark and therefore owns no physical page.
+///
+/// This is deliberately narrower than
+/// [`has_structural_terminal_section_mark`]. An explicit odd/even break carries
+/// physical parity intent, while continuous and next-column breaks can share a
+/// flow region. Non-leading empty sections can also be intentional blank pages.
+/// `had_blocks_before_suppression` distinguishes a section whose structural
+/// paragraph mark was removed from a section that was empty for some unrelated
+/// reason in the model/build pipeline.
+fn leading_structural_section_owns_no_page(
+    section_index: usize,
+    section_type: Option<crate::model::SectionType>,
+    has_next_section: bool,
+    had_blocks_before_suppression: bool,
+    blocks_are_empty_after_suppression: bool,
+) -> bool {
+    section_index == 0
+        && has_next_section
+        && had_blocks_before_suppression
+        && blocks_are_empty_after_suppression
+        && matches!(
+            section_type,
+            None | Some(crate::model::SectionType::NextPage)
+        )
+}
+
 /// Tunable knobs for the paint phase.
 ///
 /// Constructed via [`RenderOptions::default`] and the `with_*` builder setters,
@@ -167,7 +194,8 @@ impl Default for RenderOptions {
 
 use crate::model::Block;
 use crate::render::layout::build::{
-    build_document_endnotes, build_section_blocks, default_line_height, BuildContext, BuildState,
+    build_document_endnotes, build_section_blocks, default_line_height, set_section_document_grid,
+    BuildContext, BuildState,
 };
 use crate::render::layout::draw_command::LayoutedPage;
 use crate::render::layout::header_footer::{
@@ -292,6 +320,8 @@ pub fn layout_document(
         footers: &'a crate::render::resolve::header_footer::HeaderFooterSet<Vec<Block>>,
         title_pg: bool,
         logical_page_base: usize,
+        doc_grid_line_pitch: Option<dimension::Pt>,
+        character_grid_active: bool,
     }
     let mut section_hf: Vec<SectionHfInfo> = Vec::new();
     // §17.6.12: logical PAGE numbering accumulates across sections,
@@ -320,6 +350,7 @@ pub fn layout_document(
     for (section_idx, section) in resolved.sections.iter().enumerate() {
         let config = PageConfig::from_section(&section.properties);
         state.page_config = config.clone();
+        set_section_document_grid(&mut state, &section.properties);
 
         // §17.6.22/§17.6.23: an odd/even section break may require one
         // physical blank page before the new section. Do this before taking
@@ -383,8 +414,26 @@ pub fn layout_document(
         let has_next_section = section_idx + 1 < resolved.sections.len();
         let ends_with_hard_section_break =
             has_structural_terminal_section_mark(section.properties.section_type, has_next_section);
+        let had_blocks_before_suppression = !built.blocks.is_empty();
         if ends_with_hard_section_break {
             layout::section::suppress_plain_terminal_section_mark(&mut built.blocks);
+        }
+        if leading_structural_section_owns_no_page(
+            section_idx,
+            section.properties.section_type,
+            has_next_section,
+            had_blocks_before_suppression,
+            built.blocks.is_empty(),
+        ) {
+            log::debug!(
+                target: "dxpdf::pagination",
+                "section-boundary cause=LeadingStructuralSectionSuppressed section={} type={:?} pages_before={} logical_next={}",
+                section_idx,
+                section.properties.section_type,
+                all_pages.len(),
+                next_logical,
+            );
+            continue;
         }
         let measure_fn = |text: &str,
                           font: &layout::fragment::FontProps|
@@ -435,6 +484,8 @@ pub fn layout_document(
             footers: &section.footers,
             title_pg: section.properties.title_page.unwrap_or(false),
             logical_page_base,
+            doc_grid_line_pitch: state.doc_grid_line_pitch,
+            character_grid_active: state.character_grid_active,
         });
     }
 
@@ -446,6 +497,8 @@ pub fn layout_document(
     let total_pages = all_pages.len();
     for info in &section_hf {
         state.page_config = info.config.clone();
+        state.doc_grid_line_pitch = info.doc_grid_line_pitch;
+        state.character_grid_active = info.character_grid_active;
         render_headers_footers(
             &mut all_pages[info.page_range.clone()],
             &info.config,
@@ -753,6 +806,44 @@ mod tests {
     }
 
     #[test]
+    fn only_a_leading_ordinary_structural_section_owns_no_page() {
+        for section_type in [None, Some(SectionType::NextPage)] {
+            assert!(leading_structural_section_owns_no_page(
+                0,
+                section_type,
+                true,
+                true,
+                true,
+            ));
+        }
+
+        for section_type in [
+            Some(SectionType::OddPage),
+            Some(SectionType::EvenPage),
+            Some(SectionType::Continuous),
+            Some(SectionType::NextColumn),
+        ] {
+            assert!(
+                !leading_structural_section_owns_no_page(0, section_type, true, true, true,),
+                "{section_type:?} carries layout intent and must not be folded"
+            );
+        }
+
+        assert!(!leading_structural_section_owns_no_page(
+            1, None, true, true, true,
+        ));
+        assert!(!leading_structural_section_owns_no_page(
+            0, None, false, true, true,
+        ));
+        assert!(!leading_structural_section_owns_no_page(
+            0, None, true, false, true,
+        ));
+        assert!(!leading_structural_section_owns_no_page(
+            0, None, true, true, false,
+        ));
+    }
+
+    #[test]
     fn render_options_with_image_dpi_overrides() {
         assert_eq!(
             RenderOptions::default().with_image_dpi(300.0).image_dpi(),
@@ -794,6 +885,50 @@ mod tests {
         assert_eq!(resolved.sections.len(), 1);
         assert_eq!(pages.len(), 1);
         assert!(pages[0].commands.is_empty());
+    }
+
+    #[test]
+    fn leading_structural_section_uses_no_physical_page() {
+        let mut doc = empty_doc();
+        let outgoing_footer = RelId::new("outgoing-footer");
+        let body_footer = RelId::new("body-footer");
+        doc.footers
+            .insert(outgoing_footer.clone(), vec![para("OUTGOING FOOTER")]);
+        doc.footers
+            .insert(body_footer.clone(), vec![para("BODY FOOTER")]);
+
+        let mut leading_section = SectionProperties {
+            section_type: Some(SectionType::NextPage),
+            ..Default::default()
+        };
+        leading_section.footer_refs.default = Some(outgoing_footer);
+        doc.final_section.footer_refs.default = Some(body_footer);
+        doc.body = vec![
+            para(""),
+            Block::SectionBreak(Box::new(leading_section)),
+            para("BODY"),
+        ];
+
+        let (resolved, pages) = resolve_and_layout(doc);
+
+        assert_eq!(resolved.sections.len(), 2);
+        assert_eq!(
+            pages.len(),
+            1,
+            "the leading structural section owns no sheet"
+        );
+        let text = pages[0]
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                layout::draw_command::DrawCommand::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text.matches("BODY").count(), 2, "rendered text: {text:?}");
+        assert!(text.contains("FOOTER"), "rendered text: {text:?}");
+        assert!(!text.contains("OUTGOING"), "rendered text: {text:?}");
     }
 
     #[test]

@@ -127,16 +127,18 @@ pub(super) fn find_row_cut(input: &RowCutInput<'_>) -> Option<SplitCut> {
 }
 
 /// For a single cell, choose the largest legal prefix of lines that fits in
-/// `available`, honoring the cell paragraphs' §17.3.1.14 keepLines,
-/// §17.3.1.44 widow/orphan control, and §17.3.1.15 keepNext — the same policy
-/// body across-page splitting applies. Returns the `CellCut` and the first-half
+/// `available`, honoring the cell paragraphs' §17.3.1.14 keepLines and
+/// §17.3.1.15 keepNext constraints. Word does not apply the body paragraph's
+/// §17.3.1.44 widow/orphan 2/2 gate while splitting an otherwise splittable
+/// table row: a two-line paragraph may divide 1/1, and a longer paragraph may
+/// leave one line on either side. Returns the `CellCut` and the first-half
 /// height this cell needs: the retained content plus the cell's top and bottom
 /// margins, so the cut edge gets the natural padding Word preserves (variant 2
 /// of the OOXML split-edge options; §17.4.40 re-applied at the cut edge).
 ///
 /// Returns `None` when the cell exposes no legal cut point within `available`
-/// (empty/one-line, image/shape-only, keepLines, or every fitting cut would
-/// strand a widow) — the caller then keeps the cell whole on the first half.
+/// (empty/one-line, image/shape-only, keepLines, or no fitting paragraph
+/// boundary) — the caller then keeps the cell whole on the first half.
 fn cut_for_cell(
     entry: &CellLayoutEntry,
     margin_top: Pt,
@@ -194,10 +196,11 @@ fn cut_for_cell(
 /// spec-legal split point. A cut "after line L" keeps `lines[0..=L]` and flows
 /// the rest to the continuation.
 ///
-/// Legality (§17.3.1.14 / §17.3.1.44 / §17.3.1.15):
+/// Legality (§17.4.1 with §17.3.1.14 / §17.3.1.15):
 /// - **interior** (L and L+1 share a paragraph): illegal if the paragraph is
-///   internally atomic (keepLines / bordered / shaded / drop cap); otherwise,
-///   under widow control, both sides must keep `>= 2` of the paragraph's lines.
+///   internally atomic (keepLines / bordered / shaded / drop cap). Otherwise
+///   it is legal even when body widow/orphan control would leave a 1-line side;
+///   Word treats table-row splitting as the narrower governing context.
 /// - **boundary** (L and L+1 are different paragraphs): legal unless the earlier
 ///   paragraph is keepNext (bound to the block that follows).
 ///
@@ -217,17 +220,7 @@ fn largest_legal_cut(lines: &[CellLine], budget: Pt) -> Option<Pt> {
             break;
         }
         let legal = if a.para == b.para {
-            if a.interior_atomic {
-                false
-            } else if a.widow_control {
-                let first = lines.iter().position(|x| x.para == a.para).unwrap_or(l);
-                let last = lines.iter().rposition(|x| x.para == a.para).unwrap_or(l);
-                let head = l + 1 - first; // this paragraph's lines kept
-                let tail = last - l; // this paragraph's lines continued
-                head >= 2 && tail >= 2
-            } else {
-                true
-            }
+            !a.interior_atomic
         } else {
             !a.keep_next
         };
@@ -272,7 +265,7 @@ pub(super) fn split_row_at(mr: &MeasuredRow, cut: &SplitCut) -> SplitRow {
             partition_commands(&entry.layout.commands, cc.content_cut_y, cc.shift);
         // Partition the cut model too, rebasing the continuation's line tops by
         // the same shift, so a further split of the continuation (mod.rs's
-        // iterative loop) re-evaluates §17.3.1.44 widow control against the
+        // iterative loop) re-evaluates table-row cut legality against the
         // lines that actually remain.
         let (first_lines, second_lines) =
             partition_lines(&entry.layout.lines, cc.line_cut_y, cc.shift);
@@ -453,6 +446,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -524,7 +518,7 @@ mod tests {
     /// That loop re-splits the continuation half until it fits, so it only
     /// terminates if every accepted cut strictly shrinks the row. Here that
     /// property is asserted directly, across a grid of line counts, available
-    /// heights straddling the line-height and widow-control boundaries, and
+    /// heights straddling the line-height cut boundaries, and
     /// cell margins large enough to swallow the budget.
     ///
     /// If this ever fails, `layout_table_paginated` hangs — the same class of
@@ -642,6 +636,86 @@ mod tests {
         assert_eq!(largest_legal_cut(&one, Pt::new(100.0)), None);
     }
 
+    fn cut_line(
+        top: f32,
+        para: usize,
+        interior_atomic: bool,
+        widow_control: bool,
+        keep_next: bool,
+    ) -> CellLine {
+        CellLine {
+            top_y: Pt::new(top),
+            para,
+            interior_atomic,
+            widow_control,
+            keep_next,
+        }
+    }
+
+    #[test]
+    fn table_row_cut_allows_two_line_paragraph_to_split_one_one() {
+        let lines = vec![
+            cut_line(0.0, 0, false, true, false),
+            cut_line(14.0, 0, false, true, false),
+        ];
+
+        assert_eq!(
+            largest_legal_cut(&lines, Pt::new(14.0)),
+            Some(Pt::new(14.0)),
+            "body widow control does not prohibit a 1/1 cut inside a splittable table row"
+        );
+    }
+
+    #[test]
+    fn table_row_cut_allows_three_line_paragraph_to_leave_one_line_on_either_side() {
+        let lines = vec![
+            cut_line(0.0, 0, false, true, false),
+            cut_line(14.0, 0, false, true, false),
+            cut_line(28.0, 0, false, true, false),
+        ];
+
+        assert_eq!(
+            largest_legal_cut(&lines, Pt::new(14.0)),
+            Some(Pt::new(14.0)),
+            "one line may remain on the first side"
+        );
+        assert_eq!(
+            largest_legal_cut(&lines, Pt::new(28.0)),
+            Some(Pt::new(28.0)),
+            "one line may remain on the continuation side"
+        );
+    }
+
+    #[test]
+    fn table_row_cut_allows_four_line_paragraph_to_split_three_one() {
+        let lines = vec![
+            cut_line(0.0, 0, false, true, false),
+            cut_line(14.0, 0, false, true, false),
+            cut_line(28.0, 0, false, true, false),
+            cut_line(42.0, 0, false, true, false),
+        ];
+
+        assert_eq!(
+            largest_legal_cut(&lines, Pt::new(42.0)),
+            Some(Pt::new(42.0))
+        );
+    }
+
+    #[test]
+    fn table_row_cut_still_honors_interior_atomic_and_keep_next() {
+        let atomic = vec![
+            cut_line(0.0, 0, true, true, false),
+            cut_line(14.0, 0, true, true, false),
+        ];
+        assert_eq!(largest_legal_cut(&atomic, Pt::new(14.0)), None);
+
+        let keep_next_boundary = vec![
+            cut_line(0.0, 0, false, true, true),
+            cut_line(14.0, 1, false, true, false),
+        ];
+        assert_eq!(largest_legal_cut(&keep_next_boundary, Pt::new(14.0)), None);
+    }
+
     /// End-to-end bound: a 40-line row on a page that fits two lines produces
     /// 20 slices and halts. Pins that the loop consumes lines rather than
     /// merely shrinking by an epsilon.
@@ -757,8 +831,8 @@ mod tests {
     }
 
     /// The continuation's line *model* is rebased by the same shift as its
-    /// commands, so a further split re-evaluates §17.3.1.44 widow control
-    /// against the lines that actually remain rather than stale offsets.
+    /// commands, so a further table-row split evaluates the lines that actually
+    /// remain rather than stale offsets.
     #[test]
     fn continuation_line_model_is_rebased_with_the_commands() {
         let rows = vec![row_n_lines(6, 0.0)];

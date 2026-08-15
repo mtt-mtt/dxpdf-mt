@@ -17,6 +17,7 @@ use crate::render::geometry::PtOffset;
 /// When there are no floats a single call to `fit_lines_with_first` is used.
 pub(super) fn compute_line_placements(
     fragments: &[Fragment],
+    hanging_tail_widths: &[Pt],
     style: &ParagraphStyle,
     params: &LineLayoutParams,
 ) -> Vec<LinePlacement> {
@@ -41,11 +42,13 @@ pub(super) fn compute_line_placements(
         } else {
             content_width
         };
-        return super::super::line::fit_lines_with_first(
+        return super::super::line::fit_lines_with_first_and_hanging(
             fragments,
             first_line_width,
             remaining_width,
             ptab_geometry,
+            hanging_tail_widths,
+            style.overflow_punct,
         )
         .into_iter()
         .map(|line| LinePlacement {
@@ -102,11 +105,13 @@ pub(super) fn compute_line_placements(
             float_right: fr,
             ..ptab_geometry
         };
-        let fitted = super::super::line::fit_lines_with_first(
+        let fitted = super::super::line::fit_lines_with_first_and_hanging(
             remaining,
             line_width,
             line_width,
             line_geometry,
+            hanging_tail_widths.get(frag_idx..).unwrap_or(&[]),
+            style.overflow_punct,
         );
         let fitted_line = if let Some(first) = fitted.into_iter().next() {
             super::super::line::FittedLine {
@@ -117,6 +122,7 @@ pub(super) fn compute_line_placements(
                 text_height: first.text_height,
                 ascent: first.ascent,
                 has_break: first.has_break,
+                hanging_punct_width: first.hanging_punct_width,
             }
         } else {
             break;
@@ -202,7 +208,7 @@ fn visible_line_width(fragments: &[Fragment], line: &super::super::line::FittedL
     let last_visible = (line.start..line.end)
         .rev()
         .find(|&idx| !matches!(fragments[idx], Fragment::Bookmark { .. }));
-    (line.start..line.end)
+    let visible: Pt = (line.start..line.end)
         .map(|idx| {
             if Some(idx) == last_visible {
                 fragments[idx].trimmed_width()
@@ -210,7 +216,8 @@ fn visible_line_width(fragments: &[Fragment], line: &super::super::line::FittedL
                 fragments[idx].width()
             }
         })
-        .sum()
+        .sum();
+    (visible - line.hanging_punct_width).max(Pt::ZERO)
 }
 
 fn justification_extra_after(
@@ -1324,8 +1331,8 @@ pub(super) fn resolve_line_height(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_next_tab_stop, inline_graphic_top, resolve_ptab, resolve_zone_anchor, Fragment,
-        PTabGeometry, PTabPlacement, ZoneAnchor,
+        compute_line_placements, find_next_tab_stop, inline_graphic_top, resolve_ptab,
+        resolve_zone_anchor, visible_line_width, Fragment, PTabGeometry, PTabPlacement, ZoneAnchor,
     };
     use crate::model;
     use crate::render::dimension::Pt;
@@ -1402,6 +1409,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -1420,6 +1428,57 @@ mod tests {
             text_offset: Pt::ZERO,
             is_footnote_ref: false,
         }
+    }
+
+    #[test]
+    fn visible_width_deducts_only_the_consumed_hanging_tail() {
+        let fragments = [text_fragment("中。", 110.0)];
+        let mut line = crate::render::layout::line::FittedLine {
+            start: 0,
+            end: 1,
+            width: Pt::new(110.0),
+            height: Pt::new(14.0),
+            text_height: Pt::new(14.0),
+            ascent: Pt::new(10.0),
+            has_break: false,
+            hanging_punct_width: Pt::new(10.0),
+        };
+
+        assert_eq!(visible_line_width(&fragments, &line), Pt::new(100.0));
+        line.hanging_punct_width = Pt::ZERO;
+        assert_eq!(visible_line_width(&fragments, &line), Pt::new(110.0));
+    }
+
+    #[test]
+    fn explicit_false_paragraph_style_blocks_the_hanging_exception() {
+        let fragments = [text_fragment("中", 100.0), text_fragment("。", 10.0)];
+        let tails = [Pt::ZERO, Pt::new(10.0)];
+        let params = super::super::LineLayoutParams {
+            content_width: Pt::new(100.0),
+            max_width: Pt::new(100.0),
+            first_line_adjustment: Pt::ZERO,
+            drop_cap_indent: Pt::ZERO,
+            drop_cap_lines: 0,
+            default_line_height: Pt::new(14.0),
+        };
+        let mut style = super::super::ParagraphStyle {
+            overflow_punct: false,
+            ..Default::default()
+        };
+
+        let disabled = compute_line_placements(&fragments, &tails, &style, &params);
+        assert_eq!(disabled.len(), 2);
+        assert!(
+            disabled
+                .iter()
+                .all(|placement| placement.line.hanging_punct_width == Pt::ZERO),
+            "an explicit false style must never consume the supplied tail width"
+        );
+
+        style.overflow_punct = true;
+        let enabled = compute_line_placements(&fragments, &tails, &style, &params);
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].line.hanging_punct_width, Pt::new(10.0));
     }
 
     #[test]

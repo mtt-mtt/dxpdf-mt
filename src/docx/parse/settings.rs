@@ -59,6 +59,8 @@ impl From<StCharacterSpacing> for CharacterSpacingControl {
 struct CompatXml {
     #[serde(rename = "adjustLineHeightInTable", default)]
     adjust_line_height_in_table: Option<OnOff>,
+    #[serde(rename = "doNotWrapTextWithPunct", default)]
+    do_not_wrap_text_with_punct: Option<OnOff>,
 }
 
 #[derive(Deserialize, Default)]
@@ -97,8 +99,13 @@ impl From<SettingsXml> for DocumentSettings {
         if let Some(control) = x.character_spacing_control {
             s.character_spacing_control = control.val.into();
         }
-        if let Some(OnOff(on)) = x.compat.and_then(|c| c.adjust_line_height_in_table) {
-            s.adjust_line_height_in_table = on;
+        if let Some(compat) = x.compat {
+            if let Some(OnOff(on)) = compat.adjust_line_height_in_table {
+                s.adjust_line_height_in_table = on;
+            }
+            if let Some(OnOff(on)) = compat.do_not_wrap_text_with_punct {
+                s.do_not_wrap_text_with_punct = on;
+            }
         }
         if let Some(r) = x.rsids {
             if let Some(root) = r.rsid_root {
@@ -133,6 +140,25 @@ mod tests {
 
         let omitted = parse_settings(br#"<settings><compat/></settings>"#).unwrap();
         assert!(!omitted.adjust_line_height_in_table);
+    }
+
+    #[test]
+    fn parses_do_not_wrap_text_with_punctuation_on_off_and_omitted() {
+        let both = parse_settings(
+            br#"<settings><compat><adjustLineHeightInTable/><doNotWrapTextWithPunct/></compat></settings>"#,
+        )
+        .unwrap();
+        assert!(both.adjust_line_height_in_table);
+        assert!(both.do_not_wrap_text_with_punct);
+
+        let disabled = parse_settings(
+            br#"<settings><compat><doNotWrapTextWithPunct val="false"/></compat></settings>"#,
+        )
+        .unwrap();
+        assert!(!disabled.do_not_wrap_text_with_punct);
+
+        let omitted = parse_settings(br#"<settings><compat/></settings>"#).unwrap();
+        assert!(!omitted.do_not_wrap_text_with_punct);
     }
 
     #[test]

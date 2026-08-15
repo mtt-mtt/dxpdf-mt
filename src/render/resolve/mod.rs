@@ -72,6 +72,9 @@ pub struct ResolvedDocument {
     /// §17.15.3.1: whether document-grid line pitch also applies inside table
     /// cells. Omitted compatibility settings resolve to `false`.
     pub adjust_line_height_in_table: bool,
+    /// §17.15.3.29: suppress hanging punctuation only in sections with an
+    /// active character grid. Omitted compatibility settings resolve false.
+    pub do_not_wrap_text_with_punct: bool,
     /// §17.15.1.18: document-wide full-width character compression policy.
     pub character_spacing_control: crate::model::CharacterSpacingControl,
 }
@@ -121,7 +124,7 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
     } = doc;
 
     let resolved_styles = styles::resolve_styles(&styles, theme.as_ref());
-    let resolved_numbering = numbering::resolve_numbering(&numbering);
+    let resolved_numbering = numbering::resolve_numbering(&numbering, &resolved_styles);
     let sections = sections::resolve_sections(body, final_section, &headers, &footers);
 
     ResolvedDocument {
@@ -144,6 +147,7 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
         even_and_odd_headers: settings.even_and_odd_headers,
         default_tab_stop: settings.default_tab_stop,
         adjust_line_height_in_table: settings.adjust_line_height_in_table,
+        do_not_wrap_text_with_punct: settings.do_not_wrap_text_with_punct,
         character_spacing_control: settings.character_spacing_control,
     }
 }
@@ -280,6 +284,7 @@ mod tests {
         doc.numbering.abstract_nums.insert(
             AbstractNumId::new(0),
             AbstractNumbering {
+                num_style_link: None,
                 levels: vec![NumberingLevelDefinition {
                     level: 0,
                     format: Some(NumberFormat::Decimal),
@@ -287,6 +292,7 @@ mod tests {
                     start: Some(1),
                     justification: None,
                     indentation: None,
+                    overflow_punct: None,
                     run_properties: None,
                     lvl_pic_bullet_id: None,
                     suffix: crate::model::LevelSuffix::default(),

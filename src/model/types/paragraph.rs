@@ -42,6 +42,10 @@ pub struct ParagraphProperties {
     pub bidi: Option<bool>,
     /// §17.3.1.45: allow line breaking between any characters for East Asian text.
     pub word_wrap: Option<bool>,
+    /// §17.3.1.21: allow one punctuation character to extend past the
+    /// paragraph text extents. Kept tri-state through the style cascade;
+    /// omission resolves to `true` only at the model-to-layout seam.
+    pub overflow_punct: Option<bool>,
     /// §17.3.1.34: snap paragraph lines to the section document grid.
     /// Missing means enabled when an applicable grid is present.
     pub snap_to_grid: Option<bool>,

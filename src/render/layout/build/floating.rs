@@ -1541,6 +1541,7 @@ pub(crate) fn build_shape_text_commands(
         shape_auto_fit: auto_fit,
         page_config: state.page_config.clone(),
         doc_grid_line_pitch: None,
+        character_grid_active: false,
         footnotes: Default::default(),
         endnote_counter: 0,
         list_counters: std::collections::HashMap::new(),
@@ -1939,6 +1940,7 @@ mod tests {
         BuildState {
             page_config: Default::default(),
             doc_grid_line_pitch: None,
+            character_grid_active: false,
             outline: Default::default(),
             shape_auto_fit: crate::render::layout::ShapeAutoFit::NONE,
             footnotes: Default::default(),
@@ -2065,6 +2067,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            do_not_wrap_text_with_punct: false,
             character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }

@@ -685,7 +685,32 @@ fn build_cell_blocks(
         }
     }
 
+    suppress_auto_spacing_at_cell_edges(&mut blocks);
     blocks
+}
+
+/// §17.3.1.33: automatic paragraph spacing in a table cell applies only at a
+/// boundary with a neighbouring paragraph. A cell edge is not such a boundary,
+/// so Word suppresses automatic spacing before the first paragraph and after
+/// the last paragraph in the cell.
+///
+/// Only the actual first/last layout block qualifies. In particular, do not
+/// search past a nested table for a paragraph: that would turn spacing on the
+/// other side of the nested table into cell-edge spacing. Keep the auto flags
+/// themselves so internal paragraph boundaries retain the ordinary automatic
+/// value and its contextual/list handling.
+fn suppress_auto_spacing_at_cell_edges(blocks: &mut [LayoutBlock]) {
+    if let Some(LayoutBlock::Paragraph { style, .. }) = blocks.first_mut() {
+        if style.before_auto_spacing {
+            style.space_before = Pt::ZERO;
+        }
+    }
+
+    if let Some(LayoutBlock::Paragraph { style, .. }) = blocks.last_mut() {
+        if style.after_auto_spacing {
+            style.space_after = Pt::ZERO;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -693,7 +718,129 @@ mod tests {
     use super::*;
     use crate::model::dimension::Dimension;
     use crate::model::geometry::PartialEdgeInsets;
+    use crate::render::layout::paragraph::ParagraphStyle;
     use crate::render::layout::table::{CellVAlign, TableCellInput};
+
+    fn paragraph_with_spacing(
+        before: f32,
+        after: f32,
+        before_auto: bool,
+        after_auto: bool,
+    ) -> LayoutBlock {
+        LayoutBlock::Paragraph {
+            fragments: vec![],
+            style: ParagraphStyle {
+                space_before: Pt::new(before),
+                space_after: Pt::new(after),
+                before_auto_spacing: before_auto,
+                after_auto_spacing: after_auto,
+                ..ParagraphStyle::default()
+            },
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        }
+    }
+
+    fn nested_table_block() -> LayoutBlock {
+        LayoutBlock::Table {
+            rows: vec![],
+            col_widths: vec![],
+            cell_spacing: Pt::ZERO,
+            border_config: None,
+            indent: Pt::ZERO,
+            alignment: None,
+            float_info: None,
+            style_id: None,
+        }
+    }
+
+    fn paragraph_style(block: &LayoutBlock) -> &ParagraphStyle {
+        let LayoutBlock::Paragraph { style, .. } = block else {
+            panic!("expected paragraph block")
+        };
+        style
+    }
+
+    #[test]
+    fn cell_auto_spacing_suppresses_only_the_outer_sides() {
+        let mut blocks = vec![
+            paragraph_with_spacing(14.0, 14.0, true, true),
+            paragraph_with_spacing(14.0, 14.0, true, true),
+            paragraph_with_spacing(14.0, 14.0, true, true),
+        ];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let first = paragraph_style(&blocks[0]);
+        let middle = paragraph_style(&blocks[1]);
+        let last = paragraph_style(&blocks[2]);
+        assert_eq!(
+            (first.space_before, first.space_after),
+            (Pt::ZERO, Pt::new(14.0))
+        );
+        assert_eq!(
+            (middle.space_before, middle.space_after),
+            (Pt::new(14.0), Pt::new(14.0)),
+            "internal automatic spacing remains intact"
+        );
+        assert_eq!(
+            (last.space_before, last.space_after),
+            (Pt::new(14.0), Pt::ZERO)
+        );
+        assert!(
+            [first, middle, last]
+                .into_iter()
+                .all(|style| style.before_auto_spacing && style.after_auto_spacing),
+            "edge suppression must preserve the auto flags"
+        );
+    }
+
+    #[test]
+    fn single_paragraph_cell_suppresses_both_auto_edges() {
+        let mut blocks = vec![paragraph_with_spacing(14.0, 14.0, true, true)];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let style = paragraph_style(&blocks[0]);
+        assert_eq!(
+            (style.space_before, style.space_after),
+            (Pt::ZERO, Pt::ZERO)
+        );
+        assert!(style.before_auto_spacing && style.after_auto_spacing);
+    }
+
+    #[test]
+    fn explicit_cell_edge_spacing_is_not_suppressed() {
+        let mut blocks = vec![paragraph_with_spacing(6.0, 8.0, false, false)];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let style = paragraph_style(&blocks[0]);
+        assert_eq!(
+            (style.space_before, style.space_after),
+            (Pt::new(6.0), Pt::new(8.0))
+        );
+    }
+
+    #[test]
+    fn nested_tables_stop_cell_edge_paragraph_search() {
+        let mut blocks = vec![
+            nested_table_block(),
+            paragraph_with_spacing(14.0, 14.0, true, true),
+            nested_table_block(),
+        ];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let style = paragraph_style(&blocks[1]);
+        assert_eq!(
+            (style.space_before, style.space_after),
+            (Pt::new(14.0), Pt::new(14.0)),
+            "a paragraph across a nested table is not at the cell edge"
+        );
+    }
 
     #[test]
     fn table_cell_margin_word_defaults_are_horizontal_108_twips() {

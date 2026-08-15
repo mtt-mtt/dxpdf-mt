@@ -11,9 +11,35 @@ use crate::render::dimension::Pt;
 use crate::render::layout::fragment::Fragment;
 
 use super::convert::{
-    pic_bullet_size, remap_legacy_font_chars, resolve_indentation, resolve_paragraph_defaults,
+    pic_bullet_size, populate_underline_metrics, remap_legacy_font_chars, resolve_indentation,
+    resolve_paragraph_defaults,
 };
 use super::{BuildContext, BuildState};
+
+/// Overlay the narrow subset of numbering-level paragraph properties that is
+/// carried by the resolved numbering model. Direct paragraph formatting wins;
+/// otherwise the level sits above paragraph/table styles and docDefaults.
+pub(super) fn apply_numbering_level_paragraph_properties(
+    para: &model::Paragraph,
+    merged_props: &mut ParagraphProperties,
+    ctx: &BuildContext,
+) {
+    if para.properties.overflow_punct.is_some() {
+        return;
+    }
+    let Some(numbering) = merged_props.numbering else {
+        return;
+    };
+    let value = ctx
+        .resolved
+        .numbering
+        .get(&model::NumId::new(numbering.num_id))
+        .and_then(|levels| levels.get(numbering.level as usize))
+        .and_then(|level| level.overflow_punct);
+    if let Some(value) = value {
+        merged_props.overflow_punct = Some(value);
+    }
+}
 
 /// Inject list label fragments into a paragraph if it has a numbering reference.
 ///
@@ -251,6 +277,8 @@ fn inject_text_label(
         .iter()
         .find_map(|rp| crate::render::resolve::fonts::effective_font(&rp.fonts))
         .unwrap_or("");
+    let legacy_family = cascade_family.eq_ignore_ascii_case("Symbol")
+        || cascade_family.eq_ignore_ascii_case("Wingdings");
     let (label_text, label_family) =
         remap_legacy_font_chars(&label_text, cascade_family, &default_family);
 
@@ -262,39 +290,105 @@ fn inject_text_label(
     if label_family != *label_font.family {
         label_font.family = Rc::from(label_family.as_str());
     }
-    // §17.3.2.40: populate underline metrics from font metrics now that
-    // the bool is settled — `populate_underline_metrics` (used by
-    // `build_fragments`) ran before label injection, so this fragment
-    // must populate its own metrics.
+    // The suffix tab/space retains the cascade's base font. Each emitted
+    // label span gets its own metrics below after script selection and glyph
+    // fallback have settled the actual family.
     populate_label_underline_metrics(&mut label_font, ctx.measurer);
 
-    let (w, m) = ctx.measurer.measure(&label_text, &label_font);
-    let h = m.height();
+    let effective_label_props = cascade.resolve();
+    let label_lang = cascade
+        .iter()
+        .chain(std::iter::once(&ctx.resolved.doc_defaults_run))
+        .find_map(|rp| rp.lang.as_ref());
+    let label_style = crate::render::layout::fragment::TextRunStyle {
+        color: label_color,
+        shading: None,
+        border: None,
+        baseline_offset: Pt::ZERO,
+    };
+    let measure_text = |text: &str, font: &crate::render::layout::fragment::FontProps| {
+        ctx.measurer.measure(text, font)
+    };
+    let mut label_fragments = Vec::new();
+    let emit_unsplit_label = |text: &str, fragments: &mut Vec<Fragment>| {
+        let (width, metrics) = ctx.measurer.measure(text, &label_font);
+        fragments.push(Fragment::Text {
+            text: Rc::from(text),
+            font: Rc::new(label_font.clone()),
+            color: label_color,
+            shading: None,
+            border: None,
+            width,
+            trimmed_width: width,
+            metrics,
+            hyperlink_url: None,
+            baseline_offset: Pt::ZERO,
+            text_offset: Pt::ZERO,
+            is_footnote_ref: false,
+        });
+    };
+    if legacy_family {
+        // PUA values that survive Symbol/Wingdings remapping have meaning
+        // only in that legacy font. Ordinary glyph fallback can reinterpret
+        // the same private scalar through an unrelated font (for example,
+        // U+F07F became a key-like glyph in Symbola). Keep the pre-P8 single
+        // fragment path for every legacy label, including fully mapped text,
+        // so both its chosen family and missing-glyph behaviour stay stable.
+        emit_unsplit_label(&label_text, &mut label_fragments);
+    } else {
+        crate::render::layout::fragment::emit_text_with_font_slots_and_glyph_fallback(
+            &label_text,
+            &effective_label_props.fonts,
+            label_lang,
+            ctx.resolved.theme.as_ref(),
+            &label_font,
+            &label_style,
+            None,
+            &measure_text,
+            ctx.measurer,
+            &mut label_fragments,
+        );
+    }
+    // `emit_text_words` intentionally drops empty strings, but the previous
+    // list-label path retained a zero-width Text fragment whose font metrics
+    // supplied the line box. Preserve that observable layout for empty
+    // `lvlText` values, including `suffix=Nothing` where there is no tab or
+    // space fragment to carry a height.
+    if label_fragments.is_empty() {
+        emit_unsplit_label("", &mut label_fragments);
+    }
+    // `build_fragments` populated underline metrics before list-label
+    // injection. Repeat it for every final family chosen above.
+    populate_underline_metrics(&mut label_fragments, ctx.measurer);
+
+    let label_width = label_fragments
+        .iter()
+        .fold(Pt::ZERO, |width, fragment| width + fragment.width());
+    let empty_label_height = ctx.measurer.measure("", &label_font).1.height();
+    let label_height = label_fragments
+        .iter()
+        .fold(empty_label_height, |height, fragment| {
+            height.max(fragment.height())
+        });
 
     let indent_character_width = auto_fit.scale_font(default_size);
     let hanging = extract_hanging(level_def, indent_character_width);
     // §17.9.7: lvlJc controls label justification within the hanging indent area.
     let jc = level_def.and_then(|l| l.justification);
     let text_offset = match jc {
-        Some(crate::model::Alignment::End) => -w,
-        Some(crate::model::Alignment::Center) => w * -0.5,
+        Some(crate::model::Alignment::End) => -label_width,
+        Some(crate::model::Alignment::Center) => label_width * -0.5,
         _ => Pt::ZERO,
     };
-    let label_width = w;
-    let label_frag = Fragment::Text {
-        text: Rc::from(label_text.as_str()),
-        font: Rc::new(label_font.clone()),
-        color: label_color,
-        shading: None,
-        border: None,
-        width: label_width,
-        trimmed_width: label_width,
-        metrics: m,
-        hyperlink_url: None,
-        baseline_offset: Pt::ZERO,
-        text_offset,
-        is_footnote_ref: false,
-    };
+    for fragment in &mut label_fragments {
+        if let Fragment::Text {
+            text_offset: offset,
+            ..
+        } = fragment
+        {
+            *offset = text_offset;
+        }
+    }
     // §17.9.29: the separator between the label and the body text depends on the
     // level's `suff`. Tab (default) advances to the body-text indent via a tab
     // stop; Space emits a single space; Nothing puts the text flush against the
@@ -303,18 +397,14 @@ fn inject_text_label(
     match level_def.map(|l| l.suffix).unwrap_or_default() {
         LevelSuffix::Tab => {
             let tab_fitting = (hanging - label_width).max(Pt::ZERO);
-            fragments.insert(
-                0,
-                Fragment::Tab {
-                    line_height: h,
-                    // §17.3.1.38: the label's own formatting is what a leader
-                    // on this separator is drawn in.
-                    font: Rc::new(label_font.clone()),
-                    color: label_color,
-                    fitting_width: Some(tab_fitting),
-                },
-            );
-            fragments.insert(0, label_frag);
+            label_fragments.push(Fragment::Tab {
+                line_height: label_height,
+                // §17.3.1.38: the label's own formatting is what a leader
+                // on this separator is drawn in.
+                font: Rc::new(label_font.clone()),
+                color: label_color,
+                fitting_width: Some(tab_fitting),
+            });
 
             // Implicit tab stop at numLvl.left so the tab lands at body text.
             if let Some(lvl_left) =
@@ -332,29 +422,24 @@ fn inject_text_label(
         }
         LevelSuffix::Space => {
             let (sw, sm) = ctx.measurer.measure(" ", &label_font);
-            fragments.insert(
-                0,
-                Fragment::Text {
-                    text: Rc::from(" "),
-                    font: Rc::new(label_font.clone()),
-                    color: label_color,
-                    shading: None,
-                    border: None,
-                    width: sw,
-                    trimmed_width: sw,
-                    metrics: sm,
-                    hyperlink_url: None,
-                    baseline_offset: Pt::ZERO,
-                    text_offset: Pt::ZERO,
-                    is_footnote_ref: false,
-                },
-            );
-            fragments.insert(0, label_frag);
+            label_fragments.push(Fragment::Text {
+                text: Rc::from(" "),
+                font: Rc::new(label_font.clone()),
+                color: label_color,
+                shading: None,
+                border: None,
+                width: sw,
+                trimmed_width: sw,
+                metrics: sm,
+                hyperlink_url: None,
+                baseline_offset: Pt::ZERO,
+                text_offset: Pt::ZERO,
+                is_footnote_ref: false,
+            });
         }
-        LevelSuffix::Nothing => {
-            fragments.insert(0, label_frag);
-        }
+        LevelSuffix::Nothing => {}
     }
+    fragments.splice(0..0, label_fragments);
 }
 
 /// Effective body-text start for a numbered paragraph.
@@ -542,6 +627,7 @@ mod tests {
             start: 1,
             run_properties: None,
             indentation: None,
+            overflow_punct: None,
             justification: None,
             lvl_pic_bullet_id: None,
             suffix: LevelSuffix::Tab,
@@ -574,6 +660,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            do_not_wrap_text_with_punct: false,
             character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
@@ -618,6 +705,57 @@ mod tests {
         match fragments.first() {
             Some(Fragment::Text { text, .. }) => text.to_string(),
             other => panic!("expected a label fragment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numbering_level_overflow_sits_between_direct_and_style_even_without_label_format() {
+        let mut level_off = level(NumberFormat::None, "");
+        level_off.overflow_punct = Some(false);
+        let resolved = resolved_with(vec![level_off]);
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+
+        let para = numbered_para();
+        let mut merged = props_at(0);
+        merged.overflow_punct = Some(true); // inherited/style value
+        apply_numbering_level_paragraph_properties(&para, &mut merged, &ctx);
+        assert_eq!(merged.overflow_punct, Some(false));
+
+        let mut direct = numbered_para();
+        direct.properties.overflow_punct = Some(true);
+        let mut merged = props_at(0);
+        merged.overflow_punct = Some(true);
+        apply_numbering_level_paragraph_properties(&direct, &mut merged, &ctx);
+        assert_eq!(merged.overflow_punct, Some(true), "direct value wins");
+    }
+
+    fn mixed_script_level(
+        justification: Option<Alignment>,
+        suffix: LevelSuffix,
+    ) -> ResolvedNumberingLevel {
+        ResolvedNumberingLevel {
+            justification,
+            suffix,
+            indentation: Some(Indentation {
+                start: Some(Dimension::new(2_880)),
+                first_line: Some(FirstLineIndent::Hanging(Dimension::new(1_440))),
+                ..Default::default()
+            }),
+            run_properties: Some(RunProperties {
+                fonts: FontSet {
+                    ascii: FontSlot::from_name("Times New Roman"),
+                    high_ansi: FontSlot::from_name("Times New Roman"),
+                    east_asian: FontSlot::from_name("Microsoft YaHei"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..level(NumberFormat::Decimal, "第%1章")
         }
     }
 
@@ -697,6 +835,202 @@ mod tests {
             };
             assert_eq!(got, expect, "{suffix:?}");
         }
+    }
+
+    #[test]
+    fn mixed_script_label_fragments_align_and_fit_as_one_unit() {
+        for (justification, factor) in [
+            (Some(Alignment::End), -1.0),
+            (Some(Alignment::Center), -0.5),
+        ] {
+            let resolved = resolved_with(vec![mixed_script_level(justification, LevelSuffix::Tab)]);
+            let (fragments, _) = inject(&resolved, &mut BuildState::default(), 0);
+            let tab_index = fragments
+                .iter()
+                .position(|fragment| matches!(fragment, Fragment::Tab { .. }))
+                .expect("mixed label retains its tab separator");
+            let label_fragments = &fragments[..tab_index];
+            assert!(
+                label_fragments.len() >= 3,
+                "Han and Latin portions must be emitted independently"
+            );
+            let rendered: String = label_fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    Fragment::Text { text, .. } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(rendered, "第1章");
+
+            let total_width = label_fragments
+                .iter()
+                .fold(Pt::ZERO, |width, fragment| width + fragment.width());
+            let expected_offset = total_width * factor;
+            for fragment in label_fragments {
+                let Fragment::Text { text_offset, .. } = fragment else {
+                    panic!("label contains a non-text fragment: {fragment:?}");
+                };
+                assert!(
+                    (text_offset.raw() - expected_offset.raw()).abs() < 1e-3,
+                    "every label span shares the whole-label justification offset"
+                );
+            }
+
+            let Fragment::Tab { fitting_width, .. } = &fragments[tab_index] else {
+                unreachable!();
+            };
+            let got = fitting_width.expect("label tab has a fitting width");
+            assert!(
+                (got.raw() - (72.0 - total_width.raw())).abs() < 1e-3,
+                "tab fitting subtracts the total mixed-label width"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_script_space_suffix_keeps_its_own_zero_offset() {
+        let resolved = resolved_with(vec![mixed_script_level(
+            Some(Alignment::End),
+            LevelSuffix::Space,
+        )]);
+        let (fragments, _) = inject(&resolved, &mut BuildState::default(), 0);
+        let (suffix, label_fragments) = fragments
+            .split_last()
+            .expect("mixed label and suffix are emitted");
+        let Fragment::Text {
+            text, text_offset, ..
+        } = suffix
+        else {
+            panic!("space suffix must be a text fragment: {suffix:?}");
+        };
+        assert_eq!(text.as_ref(), " ");
+        assert_eq!(*text_offset, Pt::ZERO);
+
+        let total_width = label_fragments
+            .iter()
+            .fold(Pt::ZERO, |width, fragment| width + fragment.width());
+        for fragment in label_fragments {
+            let Fragment::Text { text_offset, .. } = fragment else {
+                panic!("label contains a non-text fragment: {fragment:?}");
+            };
+            assert!((text_offset.raw() + total_width.raw()).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn an_empty_label_keeps_the_font_metrics_height_for_its_tab() {
+        let resolved = resolved_with(vec![level(NumberFormat::Bullet, "")]);
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+        let mut fragments = Vec::new();
+        let mut props = props_at(0);
+        inject_list_label(
+            &numbered_para(),
+            &mut fragments,
+            &mut props,
+            &ctx,
+            &mut BuildState::default(),
+        );
+
+        let Fragment::Text {
+            text,
+            width,
+            metrics,
+            ..
+        } = fragments
+            .first()
+            .expect("empty label retains a text fragment")
+        else {
+            panic!("empty label should retain its text fragment: {fragments:?}");
+        };
+        assert!(text.is_empty());
+        assert_eq!(*width, Pt::ZERO);
+
+        let Fragment::Tab {
+            line_height, font, ..
+        } = fragments.get(1).expect("empty label retains its tab")
+        else {
+            panic!("empty label should be followed by its tab: {fragments:?}");
+        };
+        let expected = measurer.measure("", font).1.height();
+        assert!(expected > Pt::ZERO);
+        assert!((metrics.height().raw() - expected.raw()).abs() < 1e-3);
+        assert!((line_height.raw() - expected.raw()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn legacy_symbol_remap_keeps_priority_over_script_slot_selection() {
+        let resolved = resolved_with(vec![ResolvedNumberingLevel {
+            run_properties: Some(RunProperties {
+                fonts: FontSet {
+                    ascii: FontSlot::from_name("Symbol"),
+                    east_asian: FontSlot::from_name("Microsoft YaHei"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            suffix: LevelSuffix::Nothing,
+            ..level(NumberFormat::Bullet, "\u{F0B7}")
+        }]);
+        let (fragments, _) = inject(&resolved, &mut BuildState::default(), 0);
+        let Fragment::Text { text, font, .. } =
+            fragments.first().expect("mapped Symbol bullet is emitted")
+        else {
+            panic!("expected a text bullet: {fragments:?}");
+        };
+        assert_eq!(text.as_ref(), "\u{2022}");
+        assert_ne!(font.family.as_ref(), "Symbol");
+    }
+
+    #[test]
+    fn unmapped_legacy_pua_keeps_its_family_without_glyph_fallback() {
+        let resolved = resolved_with(vec![ResolvedNumberingLevel {
+            run_properties: Some(RunProperties {
+                fonts: FontSet {
+                    ascii: FontSlot::from_name("Wingdings"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            suffix: LevelSuffix::Nothing,
+            ..level(NumberFormat::Bullet, "\u{F07F}")
+        }]);
+        let (fragments, _) = inject(&resolved, &mut BuildState::default(), 0);
+        assert_eq!(fragments.len(), 1);
+        let Fragment::Text { text, font, .. } = &fragments[0] else {
+            panic!("expected a text bullet: {fragments:?}");
+        };
+        assert_eq!(text.as_ref(), "\u{F07F}");
+        assert_eq!(font.family.as_ref(), "Wingdings");
+    }
+
+    #[test]
+    fn nonlegacy_symbol_label_still_uses_glyph_fallback() {
+        let resolved = resolved_with(vec![ResolvedNumberingLevel {
+            run_properties: Some(RunProperties {
+                fonts: FontSet {
+                    ascii: FontSlot::from_name("Arial"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            suffix: LevelSuffix::Nothing,
+            ..level(NumberFormat::Bullet, "\u{2610}")
+        }]);
+        let (fragments, _) = inject(&resolved, &mut BuildState::default(), 0);
+        let Fragment::Text { text, font, .. } = fragments
+            .first()
+            .expect("non-legacy symbol bullet is emitted")
+        else {
+            panic!("expected a text bullet: {fragments:?}");
+        };
+        assert_eq!(text.as_ref(), "\u{2610}");
+        assert_ne!(font.family.as_ref(), "Arial");
     }
 
     /// §17.9.29: only the `Tab` suffix installs the implicit tab stop at the

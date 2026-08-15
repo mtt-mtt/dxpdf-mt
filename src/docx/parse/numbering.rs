@@ -7,7 +7,7 @@ use crate::docx::error::Result;
 use crate::docx::model::{
     AbstractNumId, AbstractNumbering, Alignment, Indentation, LevelOverride, LevelSuffix, NumId,
     NumPicBullet, NumPicBulletId, NumberFormat, NumberingDefinitions, NumberingInstance,
-    NumberingLevelDefinition, RunProperties,
+    NumberingLevelDefinition, RunProperties, StyleId,
 };
 use crate::docx::parse::primitives::st_enums::{StJc, StNumberFormat};
 use crate::docx::parse::primitives::OnOff;
@@ -47,6 +47,8 @@ enum NumberingChildXml {
 struct AbstractNumXml {
     #[serde(rename = "@abstractNumId")]
     abstract_num_id: i64,
+    #[serde(rename = "numStyleLink", default)]
+    num_style_link: Option<ValString>,
     #[serde(rename = "lvl", default)]
     levels: Vec<LvlXml>,
 }
@@ -151,6 +153,7 @@ impl From<NumberingXml> for NumberingDefinitions {
                     defs.abstract_nums.insert(
                         id,
                         AbstractNumbering {
+                            num_style_link: a.num_style_link.map(|link| StyleId::new(link.val)),
                             levels: a.levels.into_iter().map(Into::into).collect(),
                         },
                     );
@@ -173,7 +176,8 @@ impl From<NumberingXml> for NumberingDefinitions {
 
 impl From<LvlXml> for NumberingLevelDefinition {
     fn from(x: LvlXml) -> Self {
-        let (indentation, run_properties) = extract_level_properties(x.p_pr, x.r_pr);
+        let (indentation, overflow_punct, run_properties) =
+            extract_level_properties(x.p_pr, x.r_pr);
         Self {
             level: x.ilvl,
             format: x.num_fmt.map(|v| NumberFormat::from(v.val)),
@@ -181,6 +185,7 @@ impl From<LvlXml> for NumberingLevelDefinition {
             start: x.start.map(|v| v.val),
             justification: x.lvl_jc.map(|v| Alignment::from(v.val)),
             indentation,
+            overflow_punct,
             run_properties,
             lvl_pic_bullet_id: x.lvl_pic_bullet_id.map(|v| NumPicBulletId::new(v.val)),
             suffix: x.suff.map(|v| LevelSuffix::from(v.val)).unwrap_or_default(),
@@ -192,10 +197,14 @@ impl From<LvlXml> for NumberingLevelDefinition {
 fn extract_level_properties(
     p_pr: Option<PPrXml>,
     r_pr: Option<RPrXml>,
-) -> (Option<Indentation>, Option<RunProperties>) {
-    let indentation = p_pr.and_then(|p| p.split().properties.indentation);
+) -> (Option<Indentation>, Option<bool>, Option<RunProperties>) {
+    let paragraph = p_pr.map(|p| p.split().properties).unwrap_or_default();
     let run_properties = r_pr.map(|r| r.split().0);
-    (indentation, run_properties)
+    (
+        paragraph.indentation,
+        paragraph.overflow_punct,
+        run_properties,
+    )
 }
 
 fn convert_num(n: NumXml) -> NumberingInstance {
@@ -263,6 +272,23 @@ mod tests {
     }
 
     #[test]
+    fn abstract_numbering_preserves_num_style_link() {
+        let xml = br#"
+          <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:abstractNum w:abstractNumId="22">
+              <w:numStyleLink w:val="LinkedNumberingStyle"/>
+            </w:abstractNum>
+          </w:numbering>"#;
+        let defs = parse_numbering(xml).unwrap();
+        let abstract_num = &defs.abstract_nums[&AbstractNumId::new(22)];
+        assert_eq!(
+            abstract_num.num_style_link,
+            Some(StyleId::new("LinkedNumberingStyle"))
+        );
+        assert!(abstract_num.levels.is_empty());
+    }
+
+    #[test]
     fn num_without_abstract_ref_defaults_to_zero() {
         // `<w:num>` with no `<w:abstractNumId>` binds to abstract 0 (with a warn).
         let xml = br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:num w:numId="7"/></w:numbering>"#;
@@ -317,6 +343,22 @@ mod tests {
         let lvl = &parse_numbering(xml).unwrap().abstract_nums[&AbstractNumId::new(1)].levels[0];
         assert_eq!(lvl.suffix, LevelSuffix::Tab);
         assert!(!lvl.is_legal);
+    }
+
+    #[test]
+    fn numbering_level_preserves_overflow_punctuation_tristate() {
+        let xml = br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:abstractNum w:abstractNumId="1">
+              <w:lvl w:ilvl="0"><w:pPr><w:overflowPunct w:val="0"/></w:pPr></w:lvl>
+              <w:lvl w:ilvl="1"><w:pPr><w:overflowPunct/></w:pPr></w:lvl>
+              <w:lvl w:ilvl="2"/>
+            </w:abstractNum>
+          </w:numbering>"#;
+        let defs = parse_numbering(xml).unwrap();
+        let levels = &defs.abstract_nums[&AbstractNumId::new(1)].levels;
+        assert_eq!(levels[0].overflow_punct, Some(false));
+        assert_eq!(levels[1].overflow_punct, Some(true));
+        assert_eq!(levels[2].overflow_punct, None);
     }
 
     #[test]

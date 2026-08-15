@@ -21,6 +21,10 @@ pub struct FittedLine {
     pub ascent: Pt,
     /// Whether this line ends with an explicit line break.
     pub has_break: bool,
+    /// Width of the one trailing punctuation scalar that was actually allowed
+    /// past the text extent. The glyph remains part of `width` for painting;
+    /// alignment and justification subtract this consumed exception.
+    pub hanging_punct_width: Pt,
 }
 
 /// Break fragments into lines that fit within `max_width`.
@@ -56,6 +60,29 @@ pub fn fit_lines_with_first(
     first_line_width: Pt,
     remaining_width: Pt,
     ptab_geometry: crate::render::layout::paragraph::PTabGeometry,
+) -> Vec<FittedLine> {
+    fit_lines_with_first_and_hanging(
+        fragments,
+        first_line_width,
+        remaining_width,
+        ptab_geometry,
+        &[],
+        false,
+    )
+}
+
+/// Internal fitter entry point for §17.3.1.21 hanging punctuation.
+/// `hanging_tail_widths` is parallel to `fragments`; each non-zero entry is the
+/// precisely measured marginal width of that text fragment's final eligible
+/// Unicode scalar. Public wrappers pass an empty slice so their behaviour is
+/// unchanged.
+pub(crate) fn fit_lines_with_first_and_hanging(
+    fragments: &[Fragment],
+    first_line_width: Pt,
+    remaining_width: Pt,
+    ptab_geometry: crate::render::layout::paragraph::PTabGeometry,
+    hanging_tail_widths: &[Pt],
+    allow_overflow_punctuation: bool,
 ) -> Vec<FittedLine> {
     if fragments.is_empty() {
         return Vec::new();
@@ -98,16 +125,27 @@ pub fn fit_lines_with_first(
     let mut line_text_height = Pt::ZERO;
     let mut line_ascent = Pt::ZERO;
     let mut last_break_point = None; // index after which we can break
+                                     // Snapshot the exception actually consumed after each accepted fragment.
+                                     // If overflow later rolls back to an earlier legal break, the snapshot at
+                                     // that exact boundary is authoritative.
+    let mut hanging_after = vec![Pt::ZERO; fragments.len() + 1];
+    let mut line_hanging_punct_width = Pt::ZERO;
 
     let mut i = 0;
     while i < fragments.len() {
         let frag = &fragments[i];
 
         // Explicit line break — emit current line including the break fragment.
-        // LineBreak height already includes leading (from default_line_height).
+        // A text-wrapping LineBreak carries a separately measured text-height
+        // base so an empty visual line includes the run font's real leading.
+        // Page/column breaks keep their existing fragment-height behaviour.
         if frag.is_line_break() {
             line_height = line_height.max(frag.height());
-            line_text_height = line_text_height.max(frag.height());
+            let break_text_height = match frag {
+                Fragment::LineBreak { text_height, .. } => *text_height,
+                _ => frag.height(),
+            };
+            line_text_height = line_text_height.max(break_text_height);
             lines.push(FittedLine {
                 start: line_start,
                 end: i + 1,
@@ -116,6 +154,7 @@ pub fn fit_lines_with_first(
                 text_height: line_text_height,
                 ascent: line_ascent,
                 has_break: true,
+                hanging_punct_width: line_hanging_punct_width,
             });
             line_start = i + 1;
             line_width = Pt::ZERO;
@@ -127,6 +166,7 @@ pub fn fit_lines_with_first(
             line_text_height = Pt::ZERO;
             line_ascent = Pt::ZERO;
             last_break_point = None;
+            line_hanging_punct_width = Pt::ZERO;
             i += 1;
             continue;
         }
@@ -175,6 +215,7 @@ pub fn fit_lines_with_first(
                             text_height: m.text_height,
                             ascent: m.ascent,
                             has_break: false,
+                            hanging_punct_width: hanging_after[i],
                         });
                         line_start = i;
                         line_width = Pt::ZERO;
@@ -186,6 +227,7 @@ pub fn fit_lines_with_first(
                         line_text_height = Pt::ZERO;
                         line_ascent = Pt::ZERO;
                         last_break_point = None;
+                        line_hanging_punct_width = Pt::ZERO;
                         // Re-evaluate this tab against the fresh line.
                         continue;
                     }
@@ -203,6 +245,10 @@ pub fn fit_lines_with_first(
             {
                 line_trimmed_width
             }
+            // Bookmarks are zero-width structural markers. In particular,
+            // they must not reintroduce a preceding trailing-space suffix
+            // into the extent used for fitting.
+            Fragment::Bookmark { .. } => line_trimmed_width,
             Fragment::Text { .. } => line_width + frag.trimmed_width(),
             _ => new_width,
         };
@@ -219,6 +265,7 @@ pub fn fit_lines_with_first(
             {
                 pen_trimmed_x
             }
+            Fragment::Bookmark { .. } => pen_trimmed_x,
             Fragment::Text { .. } => pen_x + frag.trimmed_width(),
             _ => new_pen_x,
         };
@@ -238,11 +285,25 @@ pub fn fit_lines_with_first(
         // Check if adding this fragment overflows. Once a margin-relative tab
         // has placed content, the line's real right edge is the margin, and
         // the pen — not the accumulated width sum — says where we are.
-        let overflows = if margin_span_active {
-            new_trimmed_pen_x > ptab_geometry.max_width
+        let (raw_extent, extent_limit) = if margin_span_active {
+            (new_trimmed_pen_x, ptab_geometry.max_width)
         } else {
-            check_width > current_max
+            (check_width, current_max)
         };
+        let tail_width = if allow_overflow_punctuation {
+            trailing_hanging_tail_width(fragments, hanging_tail_widths, line_start, i + 1)
+        } else {
+            Pt::ZERO
+        };
+        let consumed_hanging = if tail_width > Pt::ZERO
+            && raw_extent > extent_limit
+            && raw_extent - tail_width <= extent_limit
+        {
+            tail_width
+        } else {
+            Pt::ZERO
+        };
+        let overflows = raw_extent > extent_limit && consumed_hanging == Pt::ZERO;
         if overflows && line_start < i {
             // Overflow — break at last break point, or before this fragment.
             let break_at = last_break_point.unwrap_or(i);
@@ -255,6 +316,7 @@ pub fn fit_lines_with_first(
                 text_height: m.text_height,
                 ascent: m.ascent,
                 has_break: false,
+                hanging_punct_width: hanging_after[break_at],
             });
             line_start = break_at;
             line_width = Pt::ZERO;
@@ -266,6 +328,7 @@ pub fn fit_lines_with_first(
             line_text_height = Pt::ZERO;
             line_ascent = Pt::ZERO;
             last_break_point = None;
+            line_hanging_punct_width = Pt::ZERO;
             // Refit every fragment after the chosen break point. When the
             // last legal break is earlier than `i`, merely re-evaluating the
             // current fragment skips the intervening fragments from width and
@@ -292,8 +355,11 @@ pub fn fit_lines_with_first(
                 line_text_height = line_text_height.max(metrics.line_height());
                 line_ascent = line_ascent.max(metrics.ascent);
             }
-            Fragment::Image { .. } | Fragment::InlineGraphic { .. } => {}
             // Inline graphics, like images, don't contribute to text_height.
+            Fragment::Image { .. } | Fragment::InlineGraphic { .. } => {}
+            Fragment::LineBreak { text_height, .. } => {
+                line_text_height = line_text_height.max(*text_height);
+            }
             _ => {
                 line_text_height = line_text_height.max(frag.height());
             }
@@ -313,6 +379,9 @@ pub fn fit_lines_with_first(
             last_break_point = Some(i + 1);
         }
 
+        line_hanging_punct_width = consumed_hanging;
+        hanging_after[i + 1] = consumed_hanging;
+
         i += 1;
     }
 
@@ -326,10 +395,40 @@ pub fn fit_lines_with_first(
             text_height: line_text_height,
             ascent: line_ascent,
             has_break: false,
+            hanging_punct_width: line_hanging_punct_width,
         });
     }
 
     lines
+}
+
+/// Find the last substantive visible fragment in a candidate line. Trimmable
+/// trailing whitespace and zero-width bookmarks do not displace punctuation;
+/// every other fragment does. The parallel table contains at most one scalar's
+/// marginal width per text fragment.
+fn trailing_hanging_tail_width(
+    fragments: &[Fragment],
+    hanging_tail_widths: &[Pt],
+    start: usize,
+    end: usize,
+) -> Pt {
+    for idx in (start..end).rev() {
+        match &fragments[idx] {
+            Fragment::Bookmark { .. } => continue,
+            Fragment::Text { text, .. }
+                if text
+                    .chars()
+                    .all(crate::render::layout::fragment::is_trimmable_trailing_whitespace) =>
+            {
+                continue;
+            }
+            Fragment::Text { .. } => {
+                return hanging_tail_widths.get(idx).copied().unwrap_or(Pt::ZERO);
+            }
+            _ => return Pt::ZERO,
+        }
+    }
+    Pt::ZERO
 }
 
 /// Measurements for a range of fragments.
@@ -357,6 +456,9 @@ fn measure_range(fragments: &[Fragment], start: usize, end: usize) -> RangeMeasu
                 m.ascent = m.ascent.max(metrics.ascent);
             }
             Fragment::Image { .. } => {}
+            Fragment::LineBreak { text_height, .. } => {
+                m.text_height = m.text_height.max(*text_height);
+            }
             _ => {
                 m.text_height = m.text_height.max(frag.height());
             }
@@ -383,6 +485,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -414,6 +517,13 @@ mod tests {
         };
         *measured_trimmed_width = Pt::new(trimmed_width);
         fragment
+    }
+
+    fn manual_break(natural_height: f32, text_height: f32) -> Fragment {
+        Fragment::LineBreak {
+            line_height: Pt::new(natural_height),
+            text_height: Pt::new(text_height),
+        }
     }
 
     #[test]
@@ -492,6 +602,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -624,6 +735,7 @@ mod tests {
             text_frag("before", 30.0),
             Fragment::LineBreak {
                 line_height: Pt::new(14.0),
+                text_height: Pt::new(14.0),
             },
             text_frag("after", 25.0),
         ];
@@ -634,6 +746,56 @@ mod tests {
         assert!(lines[0].has_break);
         assert_eq!(lines[1].start, 2);
         assert_eq!(lines[1].end, 3); // "after"
+    }
+
+    #[test]
+    fn leading_and_consecutive_breaks_use_their_measured_text_line_boxes() {
+        let frags = vec![
+            manual_break(11.0, 14.5),
+            manual_break(13.0, 16.25),
+            text_frag("after", 25.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(100.0));
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].height, Pt::new(11.0));
+        assert_eq!(lines[0].text_height, Pt::new(14.5));
+        assert_eq!(lines[1].height, Pt::new(13.0));
+        assert_eq!(lines[1].text_height, Pt::new(16.25));
+        assert_eq!(lines[2].text_height, Pt::new(14.0));
+    }
+
+    #[test]
+    fn ordinary_single_break_does_not_inflate_same_font_text_line() {
+        let frags = vec![
+            text_frag("before", 30.0),
+            manual_break(12.0, 14.0),
+            text_frag("after", 25.0),
+        ];
+        let lines = fit_lines(&frags, Pt::new(100.0));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].height, Pt::new(14.0));
+        assert_eq!(lines[0].text_height, Pt::new(14.0));
+        assert_eq!(lines[1].height, Pt::new(14.0));
+        assert_eq!(lines[1].text_height, Pt::new(14.0));
+    }
+
+    #[test]
+    fn page_and_column_break_metrics_are_unchanged() {
+        let frags = vec![
+            Fragment::PageBreak {
+                line_height: Pt::new(9.0),
+            },
+            Fragment::ColumnBreak,
+        ];
+        let lines = fit_lines(&frags, Pt::new(100.0));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].height, Pt::new(9.0));
+        assert_eq!(lines[0].text_height, Pt::new(9.0));
+        assert_eq!(lines[1].height, Pt::ZERO);
+        assert_eq!(lines[1].text_height, Pt::ZERO);
     }
 
     #[test]
@@ -659,6 +821,7 @@ mod tests {
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,
                 }),
@@ -687,6 +850,7 @@ mod tests {
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,
                 }),
@@ -715,6 +879,7 @@ mod tests {
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,
                 }),
@@ -787,5 +952,152 @@ mod tests {
             lines[1].end, 3,
             "'b ' + 'c' both fit on the full second line"
         );
+    }
+
+    fn fit_hanging(fragments: &[Fragment], tails: &[Pt], max_width: f32) -> Vec<FittedLine> {
+        let max_width = Pt::new(max_width);
+        fit_lines_with_first_and_hanging(
+            fragments,
+            max_width,
+            max_width,
+            crate::render::layout::paragraph::PTabGeometry {
+                max_width,
+                indent_left: Pt::ZERO,
+                indent_first_line: Pt::ZERO,
+                content_width: max_width,
+                float_left: Pt::ZERO,
+                float_right: Pt::ZERO,
+            },
+            tails,
+            true,
+        )
+    }
+
+    #[test]
+    fn one_final_punctuation_scalar_may_extend_past_extent() {
+        let fragments = vec![text_frag("中", 100.0), text_frag("。", 10.0)];
+        let lines = fit_hanging(&fragments, &[Pt::ZERO, Pt::new(10.0)], 100.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hanging_punct_width, Pt::new(10.0));
+
+        let disabled = fit_lines(&fragments, Pt::new(100.0));
+        assert_eq!(disabled.len(), 2, "without the exception punctuation wraps");
+    }
+
+    #[test]
+    fn only_the_last_of_two_punctuation_scalars_can_hang() {
+        let fragments = vec![
+            text_frag("中", 100.0),
+            text_frag("！", 10.0),
+            text_frag("！", 10.0),
+        ];
+        let lines = fit_hanging(&fragments, &[Pt::ZERO, Pt::new(10.0), Pt::new(10.0)], 100.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].end, 2);
+        assert_eq!(lines[0].hanging_punct_width, Pt::new(10.0));
+        assert_eq!(lines[1].hanging_punct_width, Pt::ZERO);
+    }
+
+    #[test]
+    fn trailing_spaces_and_bookmark_preserve_but_image_clears_candidate() {
+        let whitespace_only = vec![
+            text_frag("中", 100.0),
+            text_frag_with_trimmed_width("   ", 15.0, 0.0),
+            Fragment::Bookmark { name: "end".into() },
+        ];
+        assert_eq!(
+            fit_lines(&whitespace_only, Pt::new(100.0)).len(),
+            1,
+            "a bookmark must not reintroduce the ignored trailing-space suffix"
+        );
+
+        let spaces = vec![
+            text_frag("中", 100.0),
+            text_frag("。", 10.0),
+            text_frag_with_trimmed_width("   ", 15.0, 0.0),
+            Fragment::Bookmark { name: "end".into() },
+        ];
+        let lines = fit_hanging(
+            &spaces,
+            &[Pt::ZERO, Pt::new(10.0), Pt::ZERO, Pt::ZERO],
+            100.0,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hanging_punct_width, Pt::new(10.0));
+
+        let image = vec![
+            text_frag("中。", 90.0),
+            Fragment::Image {
+                size: crate::render::geometry::PtSize::new(Pt::new(10.0), Pt::new(10.0)),
+                rel_id: "rId1".into(),
+                image_data: None,
+                src_rect: None,
+            },
+        ];
+        let lines = fit_hanging(&image, &[Pt::new(10.0), Pt::ZERO], 100.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hanging_punct_width, Pt::ZERO);
+    }
+
+    #[test]
+    fn hard_break_resets_hanging_candidate_for_next_line() {
+        let fragments = vec![
+            text_frag("中", 100.0),
+            text_frag("。", 10.0),
+            Fragment::LineBreak {
+                line_height: Pt::new(14.0),
+                text_height: Pt::new(14.0),
+            },
+            text_frag("下一行", 80.0),
+        ];
+        let lines = fit_hanging(
+            &fragments,
+            &[Pt::ZERO, Pt::new(10.0), Pt::ZERO, Pt::ZERO],
+            100.0,
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].hanging_punct_width, Pt::new(10.0));
+        assert_eq!(lines[1].hanging_punct_width, Pt::ZERO);
+    }
+
+    #[test]
+    fn rollback_to_earlier_break_keeps_that_ranges_consumed_tail() {
+        let fragments = vec![
+            text_frag("A ", 50.0),
+            text_frag("中", 50.0),
+            text_frag("。", 10.0),
+            text_frag("B", 20.0),
+        ];
+        let lines = fit_hanging(
+            &fragments,
+            &[Pt::ZERO, Pt::ZERO, Pt::new(10.0), Pt::ZERO],
+            100.0,
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].end, 3);
+        assert_eq!(lines[0].hanging_punct_width, Pt::new(10.0));
+    }
+
+    #[test]
+    fn margin_relative_ptab_uses_the_same_hanging_exception() {
+        let font = match text_frag("x", 1.0) {
+            Fragment::Text { font, .. } => font,
+            _ => unreachable!(),
+        };
+        let fragments = vec![
+            Fragment::PTab {
+                align: crate::model::PTabAlignment::Left,
+                relative_to: crate::model::PTabRelativeTo::Margin,
+                leader: crate::model::TabLeader::None,
+                line_height: Pt::new(14.0),
+                font,
+                color: RgbColor::BLACK,
+            },
+            text_frag("中", 100.0),
+            text_frag("。", 10.0),
+        ];
+        let lines = fit_hanging(&fragments, &[Pt::ZERO, Pt::ZERO, Pt::new(10.0)], 100.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hanging_punct_width, Pt::new(10.0));
     }
 }

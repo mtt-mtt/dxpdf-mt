@@ -13,6 +13,9 @@ pub struct DocumentSettings {
     /// §17.15.3.1: apply the active section's document-grid line pitch to
     /// paragraphs inside table cells as well as body paragraphs.
     pub adjust_line_height_in_table: bool,
+    /// §17.15.3.29: when a section defines a character grid, forbid the
+    /// extra grid cell that hanging punctuation would otherwise occupy.
+    pub do_not_wrap_text_with_punct: bool,
     /// §17.15.1.18: document-wide compression of whitespace carried by
     /// full-width punctuation (and, for the third mode, Japanese kana).
     pub character_spacing_control: CharacterSpacingControl,
@@ -32,6 +35,7 @@ impl Default for DocumentSettings {
             default_tab_stop: Dimension::new(720),
             even_and_odd_headers: false,
             adjust_line_height_in_table: false,
+            do_not_wrap_text_with_punct: false,
             character_spacing_control: CharacterSpacingControl::DoNotCompress,
             rsid_root: None,
             rsids: Vec::new(),
@@ -66,6 +70,7 @@ mod tests {
         let s = DocumentSettings::default();
         assert!(!s.even_and_odd_headers);
         assert!(!s.adjust_line_height_in_table);
+        assert!(!s.do_not_wrap_text_with_punct);
         assert_eq!(
             s.character_spacing_control,
             CharacterSpacingControl::DoNotCompress

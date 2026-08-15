@@ -119,6 +119,23 @@ head stay on the current page and the terminal paragraph continues on the next
 page. A chain terminating in a table (whose leading row group falls outside the
 measured group) keeps the conservative whole-move.
 
+A non-floating table can also *bridge* a body chain when the first block in the
+first cell of its last row is a paragraph whose resolved `keepNext` is on. This
+is deliberately a sentinel, not an "any cell" search: it models the terminal
+paragraph mark Word uses without promoting unrelated cell content. Admission
+measures the complete bridge table with the same row-height pass as normal
+layout, then continues into following body blocks. If the authored chain is
+longer than a page, only its largest prefix of complete paragraph/table
+segments is considered; no paragraph or table is cut by the predictor.
+
+The bridge predictor is body-only and conservative. Floating tables, active
+page floats, multiple columns, explicit page/column boundaries, and bridge
+tables containing footnotes, nested tables, or anchored objects fall back to
+the established paragraph/table paginator. It neither changes row grouping nor
+interprets `lastRenderedPageBreak`. A prefix moved to a fresh page records its
+exclusive block end so a paragraph after an included table cannot be mistaken
+for a new chain and move the same content a second time.
+
 ### Which segment owns what (§17.3.1.24, §17.3.1.33)
 
 When a paragraph splits, `SegmentEdges` (`paragraph/borders.rs`) decides per
@@ -155,6 +172,15 @@ The suppression above applies only to the paragraph mark that owns an
 **outgoing hard section break**. The final `w:sectPr` is a direct child of
 `w:body`, so trailing body paragraphs before it are real document content and
 are never removed as a structural section mark.
+
+At the document boundary there is one still narrower case: when the first
+outgoing ordinary `nextPage` section becomes empty only because that structural
+terminal mark was suppressed, it owns no physical sheet. The following real
+section therefore starts on physical page 1 and uses its own page-number and
+header/footer settings. This rule applies only to section 0 with a following
+section. It does not change the one-page contract for a truly empty document,
+does not remove non-leading blank sections, and never folds explicit
+`oddPage`, `evenPage`, `continuous`, or `nextColumn` section intent.
 
 When document-level `evenAndOddHeaders` is enabled, an ordinary `nextPage`
 section that explicitly restarts `w:pgNumType/@start` also preserves physical

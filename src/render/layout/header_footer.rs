@@ -514,6 +514,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::ZERO,
             text_scale: 1.0,
+            east_asian_language: None,
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,
         };

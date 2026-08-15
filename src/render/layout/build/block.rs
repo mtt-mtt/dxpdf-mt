@@ -39,7 +39,7 @@ fn should_apply_document_grid(
 /// cascade; applying only its size while retaining the style's family makes
 /// missing-font substitutions use the wrong line box and compresses forms by
 /// several points for every spacer paragraph.
-fn paragraph_mark_font(
+pub(super) fn paragraph_mark_font(
     paragraph: &Paragraph,
     resolved: &crate::render::resolve::ResolvedDocument,
     run_defaults: &model::RunProperties,
@@ -146,7 +146,10 @@ pub(super) fn build_paragraph_block(
         );
         let (family, size) = paragraph_mark_font(p, ctx.resolved, &run_defaults, family, size);
         let line_height = ctx.measurer.default_line_height(&family, size);
-        fragments.push(Fragment::LineBreak { line_height });
+        fragments.push(Fragment::LineBreak {
+            line_height,
+            text_height: line_height,
+        });
     }
 
     // Word suppresses Hyperlink character style (blue/underline) for ToC
@@ -247,6 +250,7 @@ pub(super) fn build_paragraph_block(
         super::convert::paragraph_locale(p, ctx.resolved),
         outline,
     );
+    super::apply_overflow_punctuation_compat(&mut style, ctx, state);
     // §17.6.5 / §17.3.1.33: Exact spacing and snapToGrid=false override the
     // document grid. Auto and AtLeast do not: Word combines Auto with the grid
     // multiplier and AtLeast with the grid-backed natural line box. This is
@@ -407,6 +411,7 @@ fn build_note_blocks(
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,
                 });
@@ -436,7 +441,7 @@ fn build_note_blocks(
                     },
                 );
             }
-            let style = paragraph_style_from_props(
+            let mut style = paragraph_style_from_props(
                 &merged_props,
                 state.shape_auto_fit.scale_font(paragraph_font_size),
                 Pt::from(ctx.resolved.default_tab_stop),
@@ -447,6 +452,7 @@ fn build_note_blocks(
                 // heading decision in one place for every path.
                 super::convert::paragraph_outline(p, &merged_props, state),
             );
+            super::apply_overflow_punctuation_compat(&mut style, ctx, state);
             results.push((display_num.to_string(), frags, style));
         }
     }
@@ -517,6 +523,8 @@ pub(super) fn build_fragments(
         merge_paragraph_properties(&mut merged_props, &ctx.resolved.doc_defaults_paragraph);
     }
 
+    super::list_label::apply_numbering_level_paragraph_properties(para, &mut merged_props, ctx);
+
     // §17.7.2: table style run properties override Normal.
     if let Some(ts) = table_style {
         if let Some(fs) = ts.run.font_size {
@@ -554,6 +562,7 @@ pub(super) fn build_fragments(
         default_color,
         resolved_styles: Some(&ctx.resolved.styles),
         paragraph_run_defaults: Some(&run_defaults),
+        paragraph_mark_properties: para.mark_run_properties.as_ref(),
         theme: ctx.resolved.theme.as_ref(),
         measurer: Some(ctx.measurer),
         auto_fit: state.shape_auto_fit,
@@ -602,6 +611,7 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            do_not_wrap_text_with_punct: false,
             character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
@@ -679,7 +689,7 @@ mod tests {
                 panic!("expected a paragraph block");
             };
             assert!(
-                matches!(fragments.as_slice(), [Fragment::LineBreak { line_height }] if line_height.raw() > 0.0),
+                matches!(fragments.as_slice(), [Fragment::LineBreak { line_height, .. }] if line_height.raw() > 0.0),
                 "exactly one LineBreak with a real height"
             );
         });
@@ -900,6 +910,7 @@ mod tests {
         assert!(!should_apply_document_grid(false, false, &exact, true));
         assert!(!should_apply_document_grid(true, false, &auto, true));
         assert!(should_apply_document_grid(true, true, &auto, true));
+        assert!(!should_apply_document_grid(false, false, &auto, false));
         assert!(!should_apply_document_grid(true, true, &auto, false));
     }
 }
@@ -911,6 +922,7 @@ fn table_page_breaks_are_removed_without_removing_line_breaks() {
         },
         Fragment::LineBreak {
             line_height: Pt::new(12.0),
+            text_height: Pt::new(12.0),
         },
         Fragment::PageBreak {
             line_height: Pt::new(12.0),

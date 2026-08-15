@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use super::formatting::{Alignment, NumberFormat};
-use super::identifiers::{AbstractNumId, NumId, NumPicBulletId};
+use super::identifiers::{AbstractNumId, NumId, NumPicBulletId, StyleId};
 use super::paragraph::Indentation;
 use super::run_properties::RunProperties;
 use super::vml::Pict;
@@ -31,6 +31,9 @@ pub struct NumPicBullet {
 /// An abstract numbering definition.
 #[derive(Clone, Debug)]
 pub struct AbstractNumbering {
+    /// `w:numStyleLink`: numbering style whose `w:numPr/w:numId` supplies the
+    /// underlying abstract numbering levels.
+    pub num_style_link: Option<StyleId>,
     pub levels: Vec<NumberingLevelDefinition>,
 }
 
@@ -57,6 +60,9 @@ pub struct NumberingLevelDefinition {
     /// §17.9.7: justification of the numbering symbol (uses ST_Jc).
     pub justification: Option<Alignment>,
     pub indentation: Option<Indentation>,
+    /// §17.9.23 / §17.3.1.21: paragraph-level punctuation overflow
+    /// contributed by this numbering level's `w:pPr`.
+    pub overflow_punct: Option<bool>,
     pub run_properties: Option<RunProperties>,
     /// §17.9.10: reference to a picture bullet definition.
     pub lvl_pic_bullet_id: Option<NumPicBulletId>,

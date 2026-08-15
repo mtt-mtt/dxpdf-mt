@@ -6,11 +6,11 @@ use super::super::fragment::Fragment;
 use super::super::header_footer::{HeaderFooterClearance, PageBodyBounds};
 use super::super::page::PageConfig;
 use super::super::paragraph::{
-    layout_paragraph, place_paragraph, ParagraphBorderStyle, ParagraphStyle,
+    layout_paragraph, place_paragraph, ListSpacingContext, ParagraphBorderStyle, ParagraphStyle,
 };
 use super::super::table::{
-    layout_table, layout_table_paginated_with_page_heights, measure_leading_table_group_height,
-    TablePaginationHeights, TableSlice,
+    layout_table, layout_table_paginated_with_page_heights, measure_complete_table_height,
+    measure_leading_table_group_height, TablePaginationHeights, TableSlice,
 };
 use super::super::BoxConstraints;
 use super::floating_table::{
@@ -80,6 +80,11 @@ struct PageLayoutState<'doc> {
     prev_space_after: Pt,
     /// §17.3.1.9: style_id of the previous paragraph for contextual spacing.
     prev_style_id: Option<StyleId>,
+    /// §17.3.1.33: whether the previous paragraph's after spacing was automatic.
+    prev_after_auto_spacing: bool,
+    /// Effective numbering identity of the previous paragraph, for Word's
+    /// contextual automatic spacing between peer list items.
+    prev_list_spacing_context: Option<ListSpacingContext>,
     /// §17.3.1.24: borders of the previous paragraph for border grouping.
     prev_borders: Option<ParagraphBorderStyle>,
     /// Active floats on the current page (text wraps around these).
@@ -90,8 +95,6 @@ struct PageLayoutState<'doc> {
     abs_floats_dirty: bool,
     /// Index of the first block on the current page (for forward scanning).
     page_start_block: usize,
-    /// §17.4.58: y-start of the most recent paragraph (floating-table anchor).
-    last_para_start_y: Pt,
     /// §17.4.38: style_id of the previous table for adjacent border collapse.
     prev_table_style_id: Option<StyleId>,
     /// §17.3.3.1: an inline page break at the end of a paragraph defers the
@@ -113,7 +116,6 @@ enum PageBreakCause {
     ParagraphOverflow,
     BreakParagraphAfterTableOverflow,
     ExplicitColumnBreak,
-    FloatingTableAnchorOverflow,
     FloatingTableCollision,
     FloatingTableContinuation,
     TableContinuation,
@@ -126,73 +128,61 @@ impl<'doc> PageLayoutState<'doc> {
         bounds: PageBodyBounds,
         logical_page_base: usize,
     ) -> Self {
-        let (
-            current_page,
-            cursor_y,
-            page_top,
-            current_col,
-            column_top,
-            bottom,
-            page_floats,
-            last_para_start_y,
-        ) = match continuation {
-            Some(c) => {
-                let same_columns = c.columns.len() == config.columns.len()
-                    && c.columns.iter().zip(&config.columns).all(|(left, right)| {
-                        left.x_offset == right.x_offset && left.width == right.width
-                    });
-                let same_flow_geometry = c.page_size == config.page_size
-                    && c.page_top == bounds.top
-                    && c.body_bottom == bounds.bottom
-                    && same_columns;
+        let (current_page, cursor_y, page_top, current_col, column_top, bottom, page_floats) =
+            match continuation {
+                Some(c) => {
+                    let same_columns = c.columns.len() == config.columns.len()
+                        && c.columns.iter().zip(&config.columns).all(|(left, right)| {
+                            left.x_offset == right.x_offset && left.width == right.width
+                        });
+                    let same_flow_geometry = c.page_size == config.page_size
+                        && c.page_top == bounds.top
+                        && c.body_bottom == bounds.bottom
+                        && same_columns;
 
-                if same_flow_geometry {
-                    // Preserve the real column. Using cursor_y as column_top
-                    // makes a page-tail continuation look like a fresh,
-                    // full-height column and permits silent overflow.
-                    (
-                        c.page,
-                        c.cursor_y,
-                        c.page_top,
-                        c.current_col.min(config.num_columns().saturating_sub(1)),
-                        c.column_top,
-                        c.bottom.min(bounds.bottom),
-                        c.page_floats,
-                        c.last_para_start_y,
-                    )
-                } else {
-                    // Changed geometry starts a new flow region on the shared
-                    // physical page. It is not a full-height fresh column;
-                    // overflow must advance rather than paint below the body.
-                    // Full Word-style column balancing is handled separately.
-                    let region_top = c.cursor_y.max(bounds.top);
-                    (
-                        c.page,
-                        region_top,
-                        bounds.top,
-                        0,
-                        region_top,
-                        c.bottom.min(bounds.bottom),
-                        c.page_floats,
-                        c.last_para_start_y,
-                    )
+                    if same_flow_geometry {
+                        // Preserve the real column. Using cursor_y as column_top
+                        // makes a page-tail continuation look like a fresh,
+                        // full-height column and permits silent overflow.
+                        (
+                            c.page,
+                            c.cursor_y,
+                            c.page_top,
+                            c.current_col.min(config.num_columns().saturating_sub(1)),
+                            c.column_top,
+                            c.bottom.min(bounds.bottom),
+                            c.page_floats,
+                        )
+                    } else {
+                        // Changed geometry starts a new flow region on the shared
+                        // physical page. It is not a full-height fresh column;
+                        // overflow must advance rather than paint below the body.
+                        // Full Word-style column balancing is handled separately.
+                        let region_top = c.cursor_y.max(bounds.top);
+                        (
+                            c.page,
+                            region_top,
+                            bounds.top,
+                            0,
+                            region_top,
+                            c.bottom.min(bounds.bottom),
+                            c.page_floats,
+                        )
+                    }
                 }
-            }
-            None => (
-                LayoutedPage::new(config.page_size),
-                bounds.top,
-                bounds.top,
-                0,
-                bounds.top,
-                bounds.bottom,
-                Vec::new(),
-                bounds.top,
-            ),
-        };
+                None => (
+                    LayoutedPage::new(config.page_size),
+                    bounds.top,
+                    bounds.top,
+                    0,
+                    bounds.top,
+                    bounds.bottom,
+                    Vec::new(),
+                ),
+            };
         PageLayoutState {
             pages: Vec::new(),
             column_top,
-            last_para_start_y,
             current_page,
             cursor_y,
             page_index: 0,
@@ -204,6 +194,8 @@ impl<'doc> PageLayoutState<'doc> {
             first_on_section_page: true,
             prev_space_after: Pt::ZERO,
             prev_style_id: None,
+            prev_after_auto_spacing: false,
+            prev_list_spacing_context: None,
             prev_borders: None,
             page_floats,
             current_page_abs_floats: Vec::new(),
@@ -302,7 +294,6 @@ impl<'doc> PageLayoutState<'doc> {
                 column_top: self.column_top,
                 bottom: self.bottom,
                 page_floats: self.page_floats,
-                last_para_start_y: self.last_para_start_y,
             };
             SectionLayoutResult {
                 pages: self.pages,
@@ -471,12 +462,13 @@ struct PageReplayCheckpoint<'doc> {
     first_on_section_page: bool,
     prev_space_after: Pt,
     prev_style_id: Option<StyleId>,
+    prev_after_auto_spacing: bool,
+    prev_list_spacing_context: Option<ListSpacingContext>,
     prev_borders: Option<ParagraphBorderStyle>,
     page_floats: Vec<float::ActiveFloat>,
     current_page_abs_floats: Vec<float::ActiveFloat>,
     abs_floats_dirty: bool,
     page_start_block: usize,
-    last_para_start_y: Pt,
     prev_table_style_id: Option<StyleId>,
     pending_page_break: bool,
 }
@@ -495,12 +487,13 @@ impl<'doc> PageReplayCheckpoint<'doc> {
             first_on_section_page: state.first_on_section_page,
             prev_space_after: state.prev_space_after,
             prev_style_id: state.prev_style_id.clone(),
+            prev_after_auto_spacing: state.prev_after_auto_spacing,
+            prev_list_spacing_context: state.prev_list_spacing_context,
             prev_borders: state.prev_borders.clone(),
             page_floats: state.page_floats.clone(),
             current_page_abs_floats: state.current_page_abs_floats.clone(),
             abs_floats_dirty: state.abs_floats_dirty,
             page_start_block: state.page_start_block,
-            last_para_start_y: state.last_para_start_y,
             prev_table_style_id: state.prev_table_style_id.clone(),
             pending_page_break: state.pending_page_break,
         }
@@ -518,6 +511,8 @@ impl<'doc> PageReplayCheckpoint<'doc> {
         state.first_on_section_page = self.first_on_section_page;
         state.prev_space_after = self.prev_space_after;
         state.prev_style_id.clone_from(&self.prev_style_id);
+        state.prev_after_auto_spacing = self.prev_after_auto_spacing;
+        state.prev_list_spacing_context = self.prev_list_spacing_context;
         state.prev_borders.clone_from(&self.prev_borders);
         state.page_floats.clone_from(&self.page_floats);
         state
@@ -525,7 +520,6 @@ impl<'doc> PageReplayCheckpoint<'doc> {
             .clone_from(&self.current_page_abs_floats);
         state.abs_floats_dirty = self.abs_floats_dirty;
         state.page_start_block = self.page_start_block;
-        state.last_para_start_y = self.last_para_start_y;
         state
             .prev_table_style_id
             .clone_from(&self.prev_table_style_id);
@@ -773,6 +767,82 @@ fn paragraph_keep_next(block: &LayoutBlock) -> bool {
     matches!(block, LayoutBlock::Paragraph { style, .. } if style.keep_next)
 }
 
+/// Word exposes no table-level `keepNext` property.  At the body/table seam it
+/// uses the first paragraph in the first cell of the last row as the table's
+/// terminal paragraph mark.  Keep that deliberately narrow: another cell or a
+/// later block in the first cell must not promote the whole table into a body
+/// chain.
+fn table_keep_next_sentinel(block: &LayoutBlock) -> bool {
+    let LayoutBlock::Table {
+        rows,
+        float_info: None,
+        ..
+    } = block
+    else {
+        return false;
+    };
+
+    matches!(
+        rows.last()
+            .and_then(|row| row.cells.first())
+            .and_then(|cell| cell.blocks.first()),
+        Some(LayoutBlock::Paragraph { style, .. }) if style.keep_next
+    )
+}
+
+/// Full-table prediction is intentionally limited to content whose measured
+/// height is self-contained.  The ordinary table paginator remains the sole
+/// authority for footnotes, nested tables, and anchored objects.
+fn table_is_simple_keep_next_bridge(block: &LayoutBlock) -> bool {
+    let LayoutBlock::Table { rows, .. } = block else {
+        return false;
+    };
+
+    rows.iter().all(|row| {
+        row.cells.iter().all(|cell| {
+            cell.blocks.iter().all(|block| match block {
+                LayoutBlock::Paragraph {
+                    fragments,
+                    page_break_before,
+                    footnotes,
+                    floating_images,
+                    floating_shapes,
+                    ..
+                } => {
+                    !*page_break_before
+                        && footnotes.is_empty()
+                        && floating_images.is_empty()
+                        && floating_shapes.is_empty()
+                        && !fragments.iter().any(|fragment| {
+                            matches!(fragment, Fragment::PageBreak { .. } | Fragment::ColumnBreak)
+                        })
+                }
+                LayoutBlock::Table { .. } => false,
+            })
+        })
+    })
+}
+
+fn starts_hard_body_boundary(block: &LayoutBlock) -> bool {
+    match block {
+        LayoutBlock::Paragraph {
+            fragments,
+            page_break_before,
+            floating_images,
+            floating_shapes,
+            ..
+        } => {
+            *page_break_before
+                || !floating_images.is_empty()
+                || !floating_shapes.is_empty()
+                || fragments.iter().any(|fragment| {
+                    matches!(fragment, Fragment::PageBreak { .. } | Fragment::ColumnBreak)
+                })
+        }
+        LayoutBlock::Table { float_info, .. } => float_info.is_some(),
+    }
+}
+
 fn paragraph_has_inline_page_break(block: &LayoutBlock) -> bool {
     matches!(
         block,
@@ -829,24 +899,25 @@ fn keep_next_terminal_table(blocks: &[LayoutBlock], start: usize) -> Option<&Lay
     None
 }
 
-fn fresh_page_contextual_space_before(
+fn fresh_page_spacing_overlap(
     block: &LayoutBlock,
     previous_style_id: &Option<StyleId>,
+    previous_after_auto_spacing: bool,
+    previous_list_spacing_context: Option<ListSpacingContext>,
 ) -> Pt {
     let LayoutBlock::Paragraph { style, .. } = block else {
         return Pt::ZERO;
     };
     let effective = style.clone_for_layout();
-    if effective.contextual_spacing
-        && effective.style_id.is_some()
-        && effective.style_id.as_ref() == previous_style_id.as_ref()
-    {
-        effective.space_before
-    } else {
-        Pt::ZERO
-    }
+    effective.spacing_overlap_with_previous(
+        Pt::ZERO,
+        previous_style_id.as_ref(),
+        previous_after_auto_spacing,
+        previous_list_spacing_context,
+    )
 }
 
+#[derive(Clone, Copy, Debug)]
 struct KeepNextGroupMeasurement {
     body_height: Pt,
     footnote_height: Pt,
@@ -865,6 +936,185 @@ impl KeepNextGroupMeasurement {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TableAwareKeepNextPrefix {
+    group: KeepNextGroupMeasurement,
+    /// First body block not represented by this complete-segment prefix.
+    end_exclusive: usize,
+}
+
+fn measured_prefix_or_none(
+    has_bridge_table: bool,
+    group: KeepNextGroupMeasurement,
+    end_exclusive: usize,
+) -> Option<TableAwareKeepNextPrefix> {
+    has_bridge_table.then_some(TableAwareKeepNextPrefix {
+        group,
+        end_exclusive,
+    })
+}
+
+fn table_aware_prefix_already_admitted(block_idx: usize, admitted_through: usize) -> bool {
+    block_idx < admitted_through
+}
+
+/// Measure the largest complete body-block prefix, starting at `start`, that
+/// fits inside `max_height` and contains at least one table-level `keepNext`
+/// bridge.
+///
+/// Paragraphs and complete bridge tables are admission segments.  Once a
+/// bridge has been measured, a later oversized or unsupported segment ends the
+/// safe prefix instead of invalidating it; this is Word's practical fallback
+/// for a keepNext chain longer than one page.  Before the first bridge, every
+/// unsupported condition returns `None` so the established paragraph/table
+/// predictor remains authoritative.
+fn measure_table_aware_keep_next_prefix(
+    blocks: &[LayoutBlock],
+    start: usize,
+    constraints: &BoxConstraints,
+    default_line_height: Pt,
+    measure_text: super::super::paragraph::MeasureTextFn<'_>,
+    max_height: Pt,
+    initial_prev_table_style_id: Option<&StyleId>,
+    stop_exclusive: Option<usize>,
+) -> Option<TableAwareKeepNextPrefix> {
+    let first = blocks.get(start)?;
+    match first {
+        LayoutBlock::Paragraph { style, .. } if style.keep_next => {}
+        LayoutBlock::Table { .. }
+            if table_keep_next_sentinel(first) && blocks.get(start + 1).is_some() => {}
+        _ => return None,
+    }
+
+    let mut group = KeepNextGroupMeasurement {
+        body_height: Pt::ZERO,
+        footnote_height: Pt::ZERO,
+        has_footnotes: false,
+    };
+    let mut previous_space_after = Pt::ZERO;
+    let mut previous_style_id = None;
+    let mut previous_after_auto_spacing = false;
+    let mut previous_list_spacing_context = None;
+    let mut previous_table_style_id = initial_prev_table_style_id.cloned();
+    let mut has_bridge_table = false;
+    let mut index = start;
+
+    loop {
+        if stop_exclusive == Some(index) {
+            return measured_prefix_or_none(has_bridge_table, group, index);
+        }
+
+        let Some(block) = blocks.get(index) else {
+            return measured_prefix_or_none(has_bridge_table, group, index);
+        };
+        match block {
+            LayoutBlock::Paragraph {
+                fragments,
+                style,
+                page_break_before,
+                footnotes,
+                floating_images,
+                floating_shapes,
+            } => {
+                let hard_boundary = fragments.iter().any(|fragment| {
+                    matches!(fragment, Fragment::PageBreak { .. } | Fragment::ColumnBreak)
+                }) || (index > start && *page_break_before);
+                let unsupported_anchor = !floating_images.is_empty() || !floating_shapes.is_empty();
+                if hard_boundary || unsupported_anchor {
+                    return measured_prefix_or_none(has_bridge_table, group, index);
+                }
+
+                let effective = style.clone_for_layout();
+                let collapsed = effective.spacing_overlap_with_previous(
+                    previous_space_after,
+                    previous_style_id.as_ref(),
+                    previous_after_auto_spacing,
+                    previous_list_spacing_context,
+                );
+                let layout = layout_paragraph(
+                    fragments,
+                    constraints,
+                    &effective,
+                    default_line_height,
+                    measure_text,
+                );
+                let mut candidate = group;
+                candidate.body_height += layout.size.height - collapsed;
+                for note in footnotes {
+                    for (footnote_fragments, footnote_style) in &note.paragraphs {
+                        let footnote = layout_paragraph(
+                            footnote_fragments,
+                            &BoxConstraints::tight_width(constraints.max_width, Pt::INFINITY),
+                            footnote_style,
+                            default_line_height,
+                            measure_text,
+                        );
+                        candidate.footnote_height += footnote.size.height;
+                        candidate.has_footnotes = true;
+                    }
+                }
+                if candidate.total_height(false) > max_height {
+                    return measured_prefix_or_none(has_bridge_table, group, index);
+                }
+
+                group = candidate;
+                previous_space_after = effective.space_after;
+                previous_style_id = effective.style_id.clone();
+                previous_after_auto_spacing = effective.after_auto_spacing;
+                previous_list_spacing_context = effective.list_spacing_context;
+                previous_table_style_id = None;
+                index += 1;
+                if !effective.keep_next {
+                    return measured_prefix_or_none(has_bridge_table, group, index);
+                }
+            }
+            LayoutBlock::Table {
+                rows,
+                col_widths,
+                cell_spacing,
+                border_config,
+                style_id,
+                ..
+            } => {
+                let successor = blocks.get(index + 1);
+                if !table_keep_next_sentinel(block)
+                    || !table_is_simple_keep_next_bridge(block)
+                    || successor.is_none_or(starts_hard_body_boundary)
+                {
+                    return measured_prefix_or_none(has_bridge_table, group, index);
+                }
+
+                let suppress_top = style_id.is_some() && *style_id == previous_table_style_id;
+                let Some(table_height) = measure_complete_table_height(
+                    rows,
+                    col_widths,
+                    *cell_spacing,
+                    default_line_height,
+                    border_config.as_ref(),
+                    measure_text,
+                    suppress_top,
+                ) else {
+                    return measured_prefix_or_none(has_bridge_table, group, index);
+                };
+                let mut candidate = group;
+                candidate.body_height += table_height;
+                if candidate.total_height(false) > max_height {
+                    return measured_prefix_or_none(has_bridge_table, group, index);
+                }
+
+                group = candidate;
+                has_bridge_table = true;
+                previous_space_after = Pt::ZERO;
+                previous_style_id = None;
+                previous_after_auto_spacing = false;
+                previous_list_spacing_context = None;
+                previous_table_style_id = style_id.clone();
+                index += 1;
+            }
+        }
+    }
+}
+
 fn measure_keep_next_group(
     blocks: &[LayoutBlock],
     start: usize,
@@ -879,6 +1129,8 @@ fn measure_keep_next_group(
     };
     let mut previous_space_after = Pt::ZERO;
     let mut previous_style_id = None;
+    let mut previous_after_auto_spacing = false;
+    let mut previous_list_spacing_context = None;
     let mut index = start;
 
     while let Some(block) = blocks.get(index) {
@@ -896,14 +1148,12 @@ fn measure_keep_next_group(
                     return None;
                 }
                 let effective = style.clone_for_layout();
-                let collapsed = if effective.contextual_spacing
-                    && effective.style_id.is_some()
-                    && effective.style_id == previous_style_id
-                {
-                    previous_space_after + effective.space_before
-                } else {
-                    previous_space_after.min(effective.space_before)
-                };
+                let collapsed = effective.spacing_overlap_with_previous(
+                    previous_space_after,
+                    previous_style_id.as_ref(),
+                    previous_after_auto_spacing,
+                    previous_list_spacing_context,
+                );
                 let layout = layout_paragraph(
                     fragments,
                     constraints,
@@ -927,6 +1177,8 @@ fn measure_keep_next_group(
                 }
                 previous_space_after = effective.space_after;
                 previous_style_id = effective.style_id.clone();
+                previous_after_auto_spacing = effective.after_auto_spacing;
+                previous_list_spacing_context = effective.list_spacing_context;
                 if !effective.keep_next {
                     return Some(measurement);
                 }
@@ -1031,6 +1283,8 @@ fn terminal_keep_next_paragraph_splittable_here(
     let mut used = Pt::ZERO;
     let mut previous_space_after = Pt::ZERO;
     let mut previous_style_id = None;
+    let mut previous_after_auto_spacing = false;
+    let mut previous_list_spacing_context = None;
     let mut index = start;
 
     while let Some(block) = blocks.get(index) {
@@ -1055,14 +1309,12 @@ fn terminal_keep_next_paragraph_splittable_here(
         }
 
         let effective = style.clone_for_layout();
-        let collapsed = if effective.contextual_spacing
-            && effective.style_id.is_some()
-            && effective.style_id == previous_style_id
-        {
-            previous_space_after + effective.space_before
-        } else {
-            previous_space_after.min(effective.space_before)
-        };
+        let collapsed = effective.spacing_overlap_with_previous(
+            previous_space_after,
+            previous_style_id.as_ref(),
+            previous_after_auto_spacing,
+            previous_list_spacing_context,
+        );
         let placed = place_paragraph(
             fragments,
             constraints,
@@ -1078,6 +1330,8 @@ fn terminal_keep_next_paragraph_splittable_here(
             }
             previous_space_after = effective.space_after;
             previous_style_id = effective.style_id.clone();
+            previous_after_auto_spacing = effective.after_auto_spacing;
+            previous_list_spacing_context = effective.list_spacing_context;
             index += 1;
             continue;
         }
@@ -1743,6 +1997,10 @@ pub(crate) fn layout_section_with_clearance_result(
     let mut checkpoint_page_index = state.page_index;
     let mut replay_block_idx = 0;
     let mut block_idx = 0;
+    // End of a P7 prefix that was already moved as one admission unit.  A
+    // bridge table inside it must not run a second preflight and skip another
+    // page when its Table arm is reached.
+    let mut table_aware_admitted_through = 0usize;
 
     'blocks: while block_idx < blocks.len() {
         let block = &blocks[block_idx];
@@ -1779,7 +2037,78 @@ pub(crate) fn layout_section_with_clearance_result(
                     state.prev_space_after = Pt::ZERO;
                 }
 
+                let mut table_aware_keep_next_handled =
+                    table_aware_prefix_already_admitted(block_idx, table_aware_admitted_through);
                 if num_cols == 1
+                    && !table_aware_keep_next_handled
+                    && starts_keep_next_chain(blocks, block_idx)
+                    && state.page_floats.is_empty()
+                {
+                    let constraints = col_constraints(
+                        state.current_col,
+                        (state.bottom - state.page_top).max(Pt::ZERO),
+                    );
+                    let full_page_height = ctx.page_bounds(state.page_index + 1).height();
+                    let fresh_spacing_overlap = fresh_page_spacing_overlap(
+                        &blocks[block_idx],
+                        &state.prev_style_id,
+                        state.prev_after_auto_spacing,
+                        state.prev_list_spacing_context,
+                    );
+                    let fresh_prefix = measure_table_aware_keep_next_prefix(
+                        blocks,
+                        block_idx,
+                        &constraints,
+                        ctx.default_line_height,
+                        ctx.measure_text,
+                        full_page_height + fresh_spacing_overlap,
+                        None,
+                        None,
+                    );
+                    if let Some(fresh_prefix) = fresh_prefix {
+                        let current_prefix = measure_table_aware_keep_next_prefix(
+                            blocks,
+                            block_idx,
+                            &constraints,
+                            ctx.default_line_height,
+                            ctx.measure_text,
+                            Pt::INFINITY,
+                            state.prev_table_style_id.as_ref(),
+                            Some(fresh_prefix.end_exclusive),
+                        );
+                        if let Some(current_prefix) = current_prefix {
+                            table_aware_keep_next_handled = true;
+                            let current_group_top = state.cursor_y
+                                - style.spacing_overlap_with_previous(
+                                    state.prev_space_after,
+                                    state.prev_style_id.as_ref(),
+                                    state.prev_after_auto_spacing,
+                                    state.prev_list_spacing_context,
+                                );
+                            let current_group_height = current_prefix
+                                .group
+                                .total_height(!state.page_footnotes.is_empty());
+                            let fresh_group_height =
+                                fresh_prefix.group.total_height(false) - fresh_spacing_overlap;
+                            let should_move = fresh_group_height <= full_page_height
+                                && current_group_height > state.bottom - current_group_top;
+                            if should_move && !state.at_full_column_top() {
+                                log::debug!(
+                                    "[layout] table-aware keepNext prefix {}..{} moved to fresh page",
+                                    block_idx,
+                                    fresh_prefix.end_exclusive,
+                                );
+                                state.push_new_page(block_idx, &ctx, PageBreakCause::KeepNextChain);
+                                state.prev_space_after = Pt::ZERO;
+                                table_aware_admitted_through =
+                                    table_aware_admitted_through.max(fresh_prefix.end_exclusive);
+                            }
+                        }
+                    }
+                }
+
+                if num_cols == 1
+                    && !table_aware_keep_next_handled
                     && starts_keep_next_chain(blocks, block_idx)
                     && state.page_floats.is_empty()
                 {
@@ -1797,23 +2126,24 @@ pub(crate) fn layout_section_with_clearance_result(
                         let current_group_height =
                             group.total_height(!state.page_footnotes.is_empty());
                         let current_group_top = match &blocks[block_idx] {
-                            LayoutBlock::Paragraph { style, .. }
-                                if style.contextual_spacing
-                                    && style.style_id.is_some()
-                                    && style.style_id == state.prev_style_id =>
-                            {
-                                state.cursor_y - state.prev_space_after - style.space_before
-                            }
                             LayoutBlock::Paragraph { style, .. } => {
-                                state.cursor_y - state.prev_space_after.min(style.space_before)
+                                state.cursor_y
+                                    - style.spacing_overlap_with_previous(
+                                        state.prev_space_after,
+                                        state.prev_style_id.as_ref(),
+                                        state.prev_after_auto_spacing,
+                                        state.prev_list_spacing_context,
+                                    )
                             }
                             LayoutBlock::Table { .. } => state.cursor_y,
                         };
                         let full_page_height = ctx.page_bounds(state.page_index + 1).height();
                         let fresh_page_group_height = group.total_height(false)
-                            - fresh_page_contextual_space_before(
+                            - fresh_page_spacing_overlap(
                                 &blocks[block_idx],
                                 &state.prev_style_id,
+                                state.prev_after_auto_spacing,
+                                state.prev_list_spacing_context,
                             );
                         let current_available = state.bottom - current_group_top;
                         let should_move = match keep_next_terminal_table(blocks, block_idx) {
@@ -1922,15 +2252,12 @@ pub(crate) fn layout_section_with_clearance_result(
                     }
                 }
                 // §17.3.1.9: spacing collapse (must happen before float registration).
-                if effective_style.contextual_spacing
-                    && effective_style.style_id.is_some()
-                    && effective_style.style_id == state.prev_style_id
-                {
-                    state.cursor_y -= state.prev_space_after + effective_style.space_before;
-                } else {
-                    let collapse = state.prev_space_after.min(effective_style.space_before);
-                    state.cursor_y -= collapse;
-                }
+                state.cursor_y -= effective_style.spacing_overlap_with_previous(
+                    state.prev_space_after,
+                    state.prev_style_id.as_ref(),
+                    state.prev_after_auto_spacing,
+                    state.prev_list_spacing_context,
+                );
 
                 // Register floating images (both relative and absolute).
                 // §20.4.2.18: wrapTopAndBottom images are emitted immediately
@@ -1991,7 +2318,6 @@ pub(crate) fn layout_section_with_clearance_result(
                     effective_style.page_floats = state.page_floats.clone();
                 }
                 let mut para_start_y = state.cursor_y;
-                state.last_para_start_y = state.cursor_y;
                 // §17.4.56 (#86 relocation): true once any of this paragraph's
                 // content has been placed, so a later overflow relocates its
                 // absolute float instead of double-wrapping earlier text.
@@ -2328,6 +2654,8 @@ pub(crate) fn layout_section_with_clearance_result(
                 state.prev_borders = style.borders.clone();
                 state.prev_space_after = effective_style.space_after;
                 state.prev_style_id = effective_style.style_id.clone();
+                state.prev_after_auto_spacing = effective_style.after_auto_spacing;
+                state.prev_list_spacing_context = effective_style.list_spacing_context;
                 state.prev_table_style_id = None; // paragraph breaks adjacent table chain
 
                 // §20.4.2.3: emit non-wrapTopAndBottom floating images.
@@ -2441,26 +2769,16 @@ pub(crate) fn layout_section_with_clearance_result(
                         _ => table_x,
                     };
 
-                    // §17.4.58: anchor-page heuristic — if the cursor isn't
-                    // already at top of page and the table won't fit below
-                    // it, push the table to the next page before resolving
-                    // the anchor. This matches Word's "don't anchor on a
-                    // page that's already mostly full" behavior.
-                    if state.cursor_y + table.size.height > state.bottom
-                        && state.cursor_y > state.page_top
-                    {
-                        state.push_new_page(
-                            block_idx,
-                            &ctx,
-                            PageBreakCause::FloatingTableAnchorOverflow,
-                        );
-                        state.prev_space_after = Pt::ZERO;
-                    }
-
-                    // §17.4.58: resolve `tblpY` on the (possibly new)
-                    // current page, then §17.4.57 resolve collisions with
-                    // prior floats. On `Spillover`, push to next page and
-                    // re-resolve with the new (empty) float list.
+                    // §17.4.58: resolve `tblpY` on the current page, then
+                    // §17.4.57 resolve collisions with prior floats. Do not
+                    // pre-push from the monolithic table height: the paginator
+                    // below is the authority on whether a legal first row
+                    // group (or split-row fragment) fits at this anchor. When
+                    // none fits it emits an empty first slice, and the normal
+                    // continuation path advances exactly one page.
+                    //
+                    // On `Spillover`, push to next page and re-resolve with the
+                    // new (empty) float list.
                     //
                     // This loop terminates because `Spillover` requires a
                     // collision-induced shift and `push_new_page` clears
@@ -2471,9 +2789,12 @@ pub(crate) fn layout_section_with_clearance_result(
                     let float_y_start = loop {
                         let requested_y = if fi.y_offset > Pt::ZERO {
                             let anchor_y = match fi.vert_anchor {
-                                crate::model::TableAnchor::Text => {
-                                    state.last_para_start_y + fi.y_offset
-                                }
+                                // §17.4.58: a floating table's logical block
+                                // position is resolved against the next regular
+                                // paragraph. At this point that paragraph starts
+                                // at the current flow cursor, not at the start of
+                                // the preceding paragraph.
+                                crate::model::TableAnchor::Text => state.cursor_y + fi.y_offset,
                                 crate::model::TableAnchor::Margin => state.page_top + fi.y_offset,
                                 crate::model::TableAnchor::Page => fi.y_offset,
                             };
@@ -2622,10 +2943,70 @@ pub(crate) fn layout_section_with_clearance_result(
                     continue;
                 }
 
+                let mut moved_for_table_keep_next = false;
+                if num_cols == 1
+                    && !table_aware_prefix_already_admitted(block_idx, table_aware_admitted_through)
+                    && table_keep_next_sentinel(block)
+                    && state.page_floats.is_empty()
+                {
+                    let constraints = col_constraints(
+                        state.current_col,
+                        (state.bottom - state.page_top).max(Pt::ZERO),
+                    );
+                    let full_page_height = ctx.page_bounds(state.page_index + 1).height();
+                    let fresh_prefix = measure_table_aware_keep_next_prefix(
+                        blocks,
+                        block_idx,
+                        &constraints,
+                        ctx.default_line_height,
+                        ctx.measure_text,
+                        full_page_height,
+                        None,
+                        None,
+                    );
+                    if let Some(fresh_prefix) = fresh_prefix {
+                        let current_prefix = measure_table_aware_keep_next_prefix(
+                            blocks,
+                            block_idx,
+                            &constraints,
+                            ctx.default_line_height,
+                            ctx.measure_text,
+                            Pt::INFINITY,
+                            state.prev_table_style_id.as_ref(),
+                            Some(fresh_prefix.end_exclusive),
+                        );
+                        if let Some(current_prefix) = current_prefix {
+                            let current_group_height = current_prefix
+                                .group
+                                .total_height(!state.page_footnotes.is_empty());
+                            let fresh_group_height = fresh_prefix.group.total_height(false);
+                            let should_move = fresh_group_height <= full_page_height
+                                && current_group_height > state.bottom - state.cursor_y;
+                            if should_move && !state.at_full_column_top() {
+                                log::debug!(
+                                    "[layout] table bridge keepNext prefix {}..{} moved to fresh page",
+                                    block_idx,
+                                    fresh_prefix.end_exclusive,
+                                );
+                                state.push_new_page(block_idx, &ctx, PageBreakCause::KeepNextChain);
+                                state.prev_space_after = Pt::ZERO;
+                                moved_for_table_keep_next = true;
+                                table_aware_admitted_through =
+                                    table_aware_admitted_through.max(fresh_prefix.end_exclusive);
+                            }
+                        }
+                    }
+                }
+
                 // §17.4.38: consecutive non-floating tables with the same style
                 // are treated as one merged table — the second table's top border
                 // is suppressed so the shared edge is drawn once.
-                let suppress_top = style_id.is_some() && *style_id == state.prev_table_style_id;
+                // A P7 move breaks adjacency at the physical page boundary;
+                // fresh-page measurement and actual layout must both restore
+                // the second table's own top edge.
+                let suppress_top = !moved_for_table_keep_next
+                    && style_id.is_some()
+                    && *style_id == state.prev_table_style_id;
 
                 // Non-floating table: paginated row-level splitting.
                 // §17.4.49 / §17.4.1: split at row boundaries, repeat headers.
@@ -2682,6 +3063,8 @@ pub(crate) fn layout_section_with_clearance_result(
                 state.prev_borders = None; // table breaks border grouping
                 state.prev_space_after = Pt::ZERO;
                 state.prev_style_id = None;
+                state.prev_after_auto_spacing = false;
+                state.prev_list_spacing_context = None;
                 state.prev_table_style_id = style_id.clone();
             }
         }
@@ -2695,7 +3078,13 @@ pub(crate) fn layout_section_with_clearance_result(
 #[cfg(test)]
 mod keep_next_chain_tests {
     use super::*;
-    use crate::render::layout::paragraph::ParagraphStyle;
+    use crate::render::geometry::{PtEdgeInsets, PtSize};
+    use crate::render::layout::fragment::{FontProps, TextMetrics};
+    use crate::render::layout::page::ColumnGeometry;
+    use crate::render::layout::paragraph::{LineSpacingRule, ParagraphStyle};
+    use crate::render::layout::table::{CellVAlign, TableCellInput, TableRowInput};
+    use crate::render::resolve::color::RgbColor;
+    use std::rc::Rc;
 
     fn paragraph(keep_next: bool, page_break_before: bool) -> LayoutBlock {
         LayoutBlock::Paragraph {
@@ -2711,11 +3100,384 @@ mod keep_next_chain_tests {
         }
     }
 
+    fn line_paragraph(keep_next: bool, line_height: f32) -> LayoutBlock {
+        LayoutBlock::Paragraph {
+            fragments: vec![Fragment::LineBreak {
+                line_height: Pt::new(line_height),
+                text_height: Pt::new(line_height),
+            }],
+            style: ParagraphStyle {
+                keep_next,
+                ..Default::default()
+            },
+            page_break_before: false,
+            footnotes: Vec::new(),
+            floating_images: Vec::new(),
+            floating_shapes: Vec::new(),
+        }
+    }
+
+    fn text_paragraph(text: &str, keep_next: bool, line_height: f32) -> LayoutBlock {
+        LayoutBlock::Paragraph {
+            fragments: vec![Fragment::Text {
+                text: text.into(),
+                font: Rc::new(FontProps {
+                    family: Rc::from("Test"),
+                    size: Pt::new(12.0),
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    char_spacing: Pt::ZERO,
+                    text_scale: 1.0,
+                    east_asian_language: None,
+                    underline_position: Pt::ZERO,
+                    underline_thickness: Pt::ZERO,
+                }),
+                color: RgbColor::BLACK,
+                width: Pt::new(20.0),
+                trimmed_width: Pt::new(20.0),
+                metrics: TextMetrics {
+                    ascent: Pt::new(10.0),
+                    descent: Pt::new(4.0),
+                    leading: Pt::ZERO,
+                },
+                hyperlink_url: None,
+                shading: None,
+                border: None,
+                baseline_offset: Pt::ZERO,
+                text_offset: Pt::ZERO,
+                is_footnote_ref: false,
+            }],
+            style: ParagraphStyle {
+                keep_next,
+                line_spacing: LineSpacingRule::Exact(Pt::new(line_height)),
+                ..Default::default()
+            },
+            page_break_before: false,
+            footnotes: Vec::new(),
+            floating_images: Vec::new(),
+            floating_shapes: Vec::new(),
+        }
+    }
+
+    fn cell(blocks: Vec<LayoutBlock>) -> TableCellInput {
+        TableCellInput {
+            blocks,
+            margins: PtEdgeInsets::ZERO,
+            grid_span: 1,
+            shading: None,
+            cell_borders: None,
+            vertical_merge: None,
+            vertical_align: CellVAlign::Top,
+            text_direction: None,
+        }
+    }
+
+    fn row(cells: Vec<TableCellInput>) -> TableRowInput {
+        TableRowInput {
+            cells,
+            height_rule: None,
+            is_header: None,
+            cant_split: None,
+            grid_before: 0,
+            border_overrides: None,
+        }
+    }
+
+    fn table(rows: Vec<TableRowInput>) -> LayoutBlock {
+        LayoutBlock::Table {
+            rows,
+            col_widths: vec![Pt::new(100.0)],
+            cell_spacing: Pt::ZERO,
+            border_config: None,
+            indent: Pt::ZERO,
+            alignment: None,
+            float_info: None,
+            style_id: None,
+        }
+    }
+
+    fn text_bridge_table(text: &str, line_height: f32) -> LayoutBlock {
+        table(vec![row(vec![cell(vec![text_paragraph(
+            text,
+            true,
+            line_height,
+        )])])])
+    }
+
+    fn small_page_config() -> PageConfig {
+        PageConfig {
+            page_size: PtSize::new(Pt::new(200.0), Pt::new(100.0)),
+            margins: PtEdgeInsets::new(Pt::new(10.0), Pt::new(10.0), Pt::new(10.0), Pt::new(10.0)),
+            header_margin: Pt::new(5.0),
+            footer_margin: Pt::new(5.0),
+            columns: vec![ColumnGeometry {
+                x_offset: Pt::ZERO,
+                width: Pt::new(180.0),
+            }],
+        }
+    }
+
+    fn page_has_text(page: &LayoutedPage, expected: &str) -> bool {
+        page.commands.iter().any(|command| {
+            matches!(command, DrawCommand::Text { text, .. } if text.as_ref() == expected)
+        })
+    }
+
     #[test]
     fn page_break_before_starts_a_new_keep_next_chain() {
         let blocks = [paragraph(true, false), paragraph(true, true)];
 
         assert!(starts_keep_next_chain(&blocks, 1));
+    }
+
+    #[test]
+    fn table_sentinel_is_last_row_first_cell_first_block_only() {
+        let positive = table(vec![
+            row(vec![cell(vec![paragraph(false, false)])]),
+            row(vec![cell(vec![paragraph(true, false)])]),
+        ]);
+        assert!(table_keep_next_sentinel(&positive));
+
+        let second_cell_only = table(vec![row(vec![
+            cell(vec![paragraph(false, false)]),
+            cell(vec![paragraph(true, false)]),
+        ])]);
+        assert!(!table_keep_next_sentinel(&second_cell_only));
+
+        let later_block_only = table(vec![row(vec![cell(vec![
+            paragraph(false, false),
+            paragraph(true, false),
+        ])])]);
+        assert!(!table_keep_next_sentinel(&later_block_only));
+    }
+
+    #[test]
+    fn floating_table_never_exports_a_body_keep_next_sentinel() {
+        let mut floating = table(vec![row(vec![cell(vec![paragraph(true, false)])])]);
+        let LayoutBlock::Table { float_info, .. } = &mut floating else {
+            unreachable!();
+        };
+        *float_info = Some(crate::render::layout::section::TableFloatInfo {
+            right_gap: Pt::ZERO,
+            bottom_gap: Pt::ZERO,
+            x_align: None,
+            y_offset: Pt::ZERO,
+            vert_anchor: crate::model::TableAnchor::Text,
+            overlap: None,
+        });
+
+        assert!(!table_keep_next_sentinel(&floating));
+    }
+
+    #[test]
+    fn complex_table_content_falls_back_from_complete_bridge_measurement() {
+        let with_footnote = table(vec![row(vec![cell(vec![LayoutBlock::Paragraph {
+            fragments: Vec::new(),
+            style: ParagraphStyle {
+                keep_next: true,
+                ..Default::default()
+            },
+            page_break_before: false,
+            footnotes: vec![LayoutFootnote {
+                paragraphs: vec![(Vec::new(), ParagraphStyle::default())],
+            }],
+            floating_images: Vec::new(),
+            floating_shapes: Vec::new(),
+        }])])]);
+        assert!(!table_is_simple_keep_next_bridge(&with_footnote));
+
+        let nested = table(vec![row(vec![cell(vec![table(Vec::new())])])]);
+        assert!(!table_is_simple_keep_next_bridge(&nested));
+    }
+
+    #[test]
+    fn table_aware_prefix_measures_complete_bridge_and_terminal_paragraph() {
+        let blocks = vec![
+            line_paragraph(true, 10.0),
+            table(vec![row(vec![cell(vec![line_paragraph(true, 20.0)])])]),
+            line_paragraph(false, 12.0),
+        ];
+        let constraints = BoxConstraints::tight_width(Pt::new(100.0), Pt::INFINITY);
+        let prefix = measure_table_aware_keep_next_prefix(
+            &blocks,
+            0,
+            &constraints,
+            Pt::new(14.0),
+            None,
+            Pt::new(100.0),
+            None,
+            None,
+        )
+        .expect("a paragraph-table-paragraph bridge is measurable");
+
+        assert_eq!(prefix.end_exclusive, blocks.len());
+        assert_eq!(prefix.group.body_height, Pt::new(42.0));
+    }
+
+    #[test]
+    fn over_page_chain_may_end_at_a_complete_bridge_table() {
+        let blocks = vec![
+            table(vec![row(vec![cell(vec![line_paragraph(true, 14.0)])])]),
+            line_paragraph(false, 80.0),
+        ];
+        let constraints = BoxConstraints::tight_width(Pt::new(100.0), Pt::INFINITY);
+        let prefix = measure_table_aware_keep_next_prefix(
+            &blocks,
+            0,
+            &constraints,
+            Pt::new(14.0),
+            None,
+            Pt::new(20.0),
+            None,
+            None,
+        )
+        .expect("the complete first bridge is the safe maximal prefix");
+
+        assert_eq!(prefix.end_exclusive, 1);
+        assert_eq!(prefix.group.body_height, Pt::new(14.0));
+    }
+
+    #[test]
+    fn first_bridge_without_successor_or_that_exceeds_a_page_falls_back() {
+        let bridge = || table(vec![row(vec![cell(vec![line_paragraph(true, 14.0)])])]);
+        let constraints = BoxConstraints::tight_width(Pt::new(100.0), Pt::INFINITY);
+
+        assert!(measure_table_aware_keep_next_prefix(
+            &[bridge()],
+            0,
+            &constraints,
+            Pt::new(14.0),
+            None,
+            Pt::new(100.0),
+            None,
+            None,
+        )
+        .is_none());
+
+        assert!(measure_table_aware_keep_next_prefix(
+            &[bridge(), line_paragraph(false, 10.0)],
+            0,
+            &constraints,
+            Pt::new(14.0),
+            None,
+            Pt::new(5.0),
+            None,
+            None,
+        )
+        .is_none());
+
+        let mut hard_successor = line_paragraph(false, 10.0);
+        let LayoutBlock::Paragraph {
+            page_break_before, ..
+        } = &mut hard_successor
+        else {
+            unreachable!();
+        };
+        *page_break_before = true;
+        assert!(measure_table_aware_keep_next_prefix(
+            &[bridge(), hard_successor],
+            0,
+            &constraints,
+            Pt::new(14.0),
+            None,
+            Pt::new(100.0),
+            None,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn admitted_prefix_suppresses_every_contained_block_preflight() {
+        // A paragraph immediately after a bridge table looks like a new chain
+        // to `starts_keep_next_chain` (the previous block is not a paragraph).
+        // The admitted interval, not the block kind, is what prevents that
+        // paragraph and later bridge tables from moving the same prefix twice.
+        let admitted_through = 9;
+        for block_idx in 4..admitted_through {
+            assert!(table_aware_prefix_already_admitted(
+                block_idx,
+                admitted_through
+            ));
+        }
+        assert!(!table_aware_prefix_already_admitted(
+            admitted_through,
+            admitted_through
+        ));
+    }
+
+    #[test]
+    fn paragraph_bridge_terminal_prefix_moves_together_to_fresh_page() {
+        let blocks = vec![
+            text_paragraph("filler", false, 50.0),
+            text_paragraph("head", true, 14.0),
+            text_bridge_table("bridge", 14.0),
+            text_paragraph("terminal", false, 14.0),
+        ];
+        let pages = layout_section(
+            &blocks,
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        for expected in ["head", "bridge", "terminal"] {
+            assert!(!page_has_text(&pages[0], expected));
+            assert!(page_has_text(&pages[1], expected));
+        }
+    }
+
+    #[test]
+    fn bridge_table_can_start_body_admission() {
+        let blocks = vec![
+            text_paragraph("filler", false, 60.0),
+            text_bridge_table("bridge", 14.0),
+            text_paragraph("terminal", false, 14.0),
+        ];
+        let pages = layout_section(
+            &blocks,
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        for expected in ["bridge", "terminal"] {
+            assert!(!page_has_text(&pages[0], expected));
+            assert!(page_has_text(&pages[1], expected));
+        }
+    }
+
+    #[test]
+    fn admitted_long_prefix_does_not_move_again_after_its_first_table() {
+        let blocks = vec![
+            text_paragraph("filler", false, 50.0),
+            text_paragraph("head", true, 21.0),
+            text_bridge_table("bridge-a", 21.0),
+            text_paragraph("mid", true, 14.0),
+            text_bridge_table("bridge-b", 14.0),
+            text_paragraph("terminal", false, 14.0),
+        ];
+        let pages = layout_section(
+            &blocks,
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 3);
+        assert!(page_has_text(&pages[1], "mid"));
+        assert!(page_has_text(&pages[1], "bridge-b"));
+        assert!(!page_has_text(&pages[2], "mid"));
+        assert!(page_has_text(&pages[2], "terminal"));
     }
 }
 
@@ -2797,6 +3559,7 @@ mod paragraph_breakable_tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),

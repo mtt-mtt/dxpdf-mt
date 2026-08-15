@@ -239,7 +239,18 @@ pub(crate) fn place_paragraph<'a>(
     };
     // Per-line float adjustment: fit one line at a time, computing the available
     // width for each line based on its absolute y position on the page.
-    let line_placements = compute_line_placements(&effective, style, &params);
+    // §17.3.1.21: measure the marginal advance of exactly the final eligible
+    // Unicode scalar with the same callback and FontProps used to shape the
+    // fragment. This keeps fallback, kerning, character spacing, text scaling,
+    // and punctuation compression identical to ordinary measurement.
+    let hanging_tail_widths = if style.overflow_punct {
+        measure_text
+            .map(|measure| measure_hanging_tail_widths(&effective, measure))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let line_placements = compute_line_placements(&effective, &hanging_tail_widths, style, &params);
 
     // §17.3.1.11: compute the drop cap baseline.
     // When frame_height is set (lineRule="exact"):
@@ -311,6 +322,39 @@ pub(crate) fn place_paragraph<'a>(
         drop_cap_baseline_y,
         line_heights,
     }
+}
+
+fn measure_hanging_tail_widths(
+    fragments: &[Fragment],
+    measure_text: &dyn Fn(&str, &super::fragment::FontProps) -> (Pt, super::fragment::TextMetrics),
+) -> Vec<Pt> {
+    fragments
+        .iter()
+        .map(|fragment| {
+            let Fragment::Text {
+                text,
+                font,
+                trimmed_width,
+                ..
+            } = fragment
+            else {
+                return Pt::ZERO;
+            };
+            let trimmed = text.trim_end_matches(super::fragment::is_trimmable_trailing_whitespace);
+            let Some((last_offset, last)) = trimmed.char_indices().next_back() else {
+                return Pt::ZERO;
+            };
+            let Some(language) = font.east_asian_language else {
+                return Pt::ZERO;
+            };
+            if !language.is_overflow_punctuation(last) {
+                return Pt::ZERO;
+            }
+
+            let prefix_width = measure_text(&trimmed[..last_offset], font).0;
+            (*trimmed_width - prefix_width).max(Pt::ZERO)
+        })
+        .collect()
 }
 
 impl PlacedParagraph<'_> {
@@ -558,7 +602,7 @@ pub fn layout_paragraph(
 mod tests {
     use super::*;
     use crate::model::{Alignment, PTabAlignment, PTabRelativeTo};
-    use crate::render::layout::fragment::{FontProps, LinkTarget, TextMetrics};
+    use crate::render::layout::fragment::{EastAsianLanguage, FontProps, LinkTarget, TextMetrics};
     use crate::render::resolve::color::RgbColor;
     use std::rc::Rc;
 
@@ -573,6 +617,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -591,6 +636,65 @@ mod tests {
             text_offset: Pt::ZERO,
             is_footnote_ref: false,
         }
+    }
+
+    fn manual_break(natural_height: f32, text_height: f32) -> Fragment {
+        Fragment::LineBreak {
+            line_height: Pt::new(natural_height),
+            text_height: Pt::new(text_height),
+        }
+    }
+
+    #[test]
+    fn hanging_tail_uses_the_same_measurer_and_effective_font_properties() {
+        let font = Rc::new(FontProps {
+            family: Rc::from("Test"),
+            size: Pt::new(12.0),
+            bold: false,
+            italic: false,
+            underline: false,
+            char_spacing: Pt::new(2.0),
+            text_scale: 0.75,
+            east_asian_language: Some(EastAsianLanguage::ChineseSimplified),
+            underline_position: Pt::ZERO,
+            underline_thickness: Pt::ZERO,
+        });
+        let metrics = TextMetrics {
+            ascent: Pt::new(10.0),
+            descent: Pt::new(4.0),
+            leading: Pt::ZERO,
+        };
+        let measure = |text: &str, props: &FontProps| {
+            assert_eq!(props.char_spacing, Pt::new(2.0));
+            assert_eq!(props.text_scale, 0.75);
+            let glyph_width: f32 = text
+                .chars()
+                .map(|ch| if ch == '。' { 8.0 } else { 10.0 })
+                .sum();
+            let width = glyph_width * props.text_scale
+                + props.char_spacing.raw() * text.chars().count() as f32;
+            (Pt::new(width), metrics)
+        };
+        let full_width = measure("中。", &font).0;
+        let fragment = Fragment::Text {
+            text: "中。".into(),
+            font: Rc::clone(&font),
+            color: RgbColor::BLACK,
+            width: full_width,
+            trimmed_width: full_width,
+            metrics,
+            hyperlink_url: None,
+            shading: None,
+            border: None,
+            baseline_offset: Pt::ZERO,
+            text_offset: Pt::ZERO,
+            is_footnote_ref: false,
+        };
+
+        let widths = measure_hanging_tail_widths(&[fragment], &measure);
+        let prefix_width = measure("中", &font).0;
+        assert_eq!(widths, vec![full_width - prefix_width]);
+        assert_eq!(widths[0], Pt::new(8.0));
     }
 
     fn hyperlink_frag(text: &str, width: f32, url: &str) -> Fragment {
@@ -1139,6 +1243,7 @@ mod tests {
             text_frag("beta", 25.0),
             Fragment::LineBreak {
                 line_height: Pt::new(14.0),
+                text_height: Pt::new(14.0),
             },
             text_frag("gamma", 30.0),
         ];
@@ -1495,6 +1600,79 @@ mod tests {
 
         // Natural height is 14, at-least is 10 → should be 14
         assert_eq!(result.size.height.raw(), 14.0);
+    }
+
+    #[test]
+    fn auto_spacing_scales_measured_empty_manual_break_lines() {
+        let frags = vec![manual_break(11.0, 14.5), manual_break(11.0, 14.5)];
+        let style = ParagraphStyle {
+            line_spacing: LineSpacingRule::Auto(1.15),
+            ..Default::default()
+        };
+        let result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &style,
+            Pt::new(14.0),
+            None,
+        );
+
+        let expected = 2.0 * 14.5 * 1.15;
+        assert!((result.size.height.raw() - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn auto_spacing_keeps_an_ordinary_single_break_at_the_text_line_height() {
+        let frags = vec![
+            text_frag("before", 30.0),
+            manual_break(12.0, 14.0),
+            text_frag("after", 25.0),
+        ];
+        let style = ParagraphStyle {
+            line_spacing: LineSpacingRule::Auto(1.15),
+            ..Default::default()
+        };
+        let result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &style,
+            Pt::new(14.0),
+            None,
+        );
+
+        let expected = 2.0 * 14.0 * 1.15;
+        assert!((result.size.height.raw() - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn manual_break_text_metrics_do_not_change_exact_or_at_least_rules() {
+        let frags = vec![manual_break(11.0, 14.5), manual_break(11.0, 14.5)];
+        let exact = ParagraphStyle {
+            line_spacing: LineSpacingRule::Exact(Pt::new(18.0)),
+            ..Default::default()
+        };
+        let at_least = ParagraphStyle {
+            line_spacing: LineSpacingRule::AtLeast(Pt::new(12.0)),
+            ..Default::default()
+        };
+
+        let exact_result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &exact,
+            Pt::new(14.0),
+            None,
+        );
+        let at_least_result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &at_least,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(exact_result.size.height, Pt::new(36.0));
+        assert_eq!(at_least_result.size.height, Pt::new(24.0));
     }
 
     #[test]
@@ -2504,6 +2682,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::ZERO,
             text_scale: 1.0,
+            east_asian_language: None,
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,
         })

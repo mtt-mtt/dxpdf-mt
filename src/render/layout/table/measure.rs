@@ -241,6 +241,7 @@ pub(super) fn measure_table_rows(
     for (row_idx, row) in rows.iter().enumerate() {
         let mut entries = Vec::new();
         let mut max_height = Pt::ZERO;
+        let mut natural_content_height = Pt::ZERO;
         // §17.4.17: gridBefore — first cell offset.
         let mut grid_idx = row.grid_before as usize;
 
@@ -358,6 +359,7 @@ pub(super) fn measure_table_rows(
             let is_lone_restart =
                 cell.vertical_merge == Some(VerticalMergeState::Restart) && !continues_below;
             if cell.vertical_merge.is_none() || is_lone_restart {
+                natural_content_height = natural_content_height.max(layout.content_height);
                 max_height = max_height.max(layout.content_height + cell.margins.vertical());
             }
 
@@ -375,13 +377,25 @@ pub(super) fn measure_table_rows(
         // WPS pagination: a 38 pt exact row with the common 4 pt bottom cell
         // margin occupies 42 pt. Keeping the margin outside the exact content
         // budget also prevents the last line from colliding with the row edge.
+        let top_margin = row
+            .cells
+            .iter()
+            .map(|cell| cell.margins.top)
+            .fold(Pt::ZERO, Pt::max);
         let bottom_margin = row
             .cells
             .iter()
             .map(|cell| cell.margins.bottom)
             .fold(Pt::ZERO, Pt::max);
         match row.height_rule {
-            Some(RowHeightRule::AtLeast(min_h)) => max_height = max_height.max(min_h),
+            // §17.4.81: `atLeast` constrains the row's content box. Cell
+            // padding remains outside that minimum, so it must not disappear
+            // when `min_h` is taller than the natural content. Word takes the
+            // row-wide maximum on each edge; the two maxima may come from
+            // different cells.
+            Some(RowHeightRule::AtLeast(min_h)) => {
+                max_height = natural_content_height.max(min_h) + top_margin + bottom_margin;
+            }
             Some(RowHeightRule::Exact(h)) => max_height = h + bottom_margin,
             None => {}
         }
