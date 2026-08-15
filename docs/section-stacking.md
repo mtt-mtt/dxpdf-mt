@@ -113,10 +113,28 @@ page. Oversized groups fall through to in-line placement, so progress is always
 made and the pagination loop cannot hang.
 
 The peel applies to a splittable *leading* paragraph and to paragraph
-terminals. A chain whose leading paragraph is unsplittable but a later one is
-long, and a chain terminating in a table (whose leading row group falls outside
-the measured group), both keep the conservative whole-move — correct in every
-case, only less page-filling.
+terminals. When an unsplittable prefix (for example a one-line heading) fits
+together with a widow-legal head of the terminal paragraph, that prefix and
+head stay on the current page and the terminal paragraph continues on the next
+page. A chain terminating in a table (whose leading row group falls outside the
+measured group) keeps the conservative whole-move.
+
+A non-floating table can also *bridge* a body chain when the first block in the
+first cell of its last row is a paragraph whose resolved `keepNext` is on. This
+is deliberately a sentinel, not an "any cell" search: it models the terminal
+paragraph mark Word uses without promoting unrelated cell content. Admission
+measures the complete bridge table with the same row-height pass as normal
+layout, then continues into following body blocks. If the authored chain is
+longer than a page, only its largest prefix of complete paragraph/table
+segments is considered; no paragraph or table is cut by the predictor.
+
+The bridge predictor is body-only and conservative. Floating tables, active
+page floats, multiple columns, explicit page/column boundaries, and bridge
+tables containing footnotes, nested tables, or anchored objects fall back to
+the established paragraph/table paginator. It neither changes row grouping nor
+interprets `lastRenderedPageBreak`. A prefix moved to a fresh page records its
+exclusive block end so a paragraph after an included table cannot be mistaken
+for a new chain and move the same content a second time.
 
 ### Which segment owns what (§17.3.1.24, §17.3.1.33)
 
@@ -150,6 +168,45 @@ at the page tail. Its inline break terminates `keepNext` prediction and moves
 the following content forward once; the structural mark is not first moved to
 an otherwise empty page.
 
+The suppression above applies only to the paragraph mark that owns an
+**outgoing hard section break**. The final `w:sectPr` is a direct child of
+`w:body`, so trailing body paragraphs before it are real document content and
+are never removed as a structural section mark.
+
+At the document boundary there is one still narrower case: when the first
+outgoing ordinary `nextPage` section becomes empty only because that structural
+terminal mark was suppressed, it owns no physical sheet. The following real
+section therefore starts on physical page 1 and uses its own page-number and
+header/footer settings. This rule applies only to section 0 with a following
+section. It does not change the one-page contract for a truly empty document,
+does not remove non-leading blank sections, and never folds explicit
+`oddPage`, `evenPage`, `continuous`, or `nextColumn` section intent.
+
+When document-level `evenAndOddHeaders` is enabled, an ordinary `nextPage`
+section that explicitly restarts `w:pgNumType/@start` also preserves physical
+recto/verso parity. If the restarted logical number is odd but the next
+physical sheet is even (or vice versa), a genuinely blank separator is inserted
+before the section. This applies only after the first section and does not
+double-handle explicit `oddPage`/`evenPage`, continuous, or next-column starts.
+
+There is one narrower page-tail case. When a table is followed by one or more
+plain empty spacer paragraphs and then by a break-only paragraph, the spacers
+may consume the remaining body height. If that break paragraph has therefore
+already moved beyond the body bottom, the renderer first commits the full page
+and then applies the inline break. This preserves the deliberate blank page
+between the table and the following content instead of collapsing two page
+advances into one.
+
+### Pagination reason ledger
+
+Every committed page records a debug-only `PageBreakCause` through the
+`dxpdf::pagination` log target. Causes distinguish deferred inline breaks,
+`pageBreakBefore`, `keepNext` chains, paragraph overflow, the table-spacer case
+above, explicit column breaks, floating-table placement/continuation, and
+ordinary table continuation. The record also carries section/logical page,
+block and column indexes, the cursor and body bounds, and command/footnote/float
+counts. This ledger is diagnostic only: enabling it does not change layout.
+
 ### Footnotes
 
 `reserve_footnotes` (§17.11.23) measures each footnote on the current page,
@@ -157,6 +214,12 @@ subtracts its height — plus the separator gap for the first footnote on that
 page — from the available bottom, and queues it for rendering. Shared by both
 the atomic-placement and per-segment split paths, so a split paragraph reserves
 footnotes per segment.
+
+Table slices use the same page-level reservation and rendering path. Unlike a
+body paragraph, their note bodies are owned by the slice because table row
+measurement and splitting create new layout objects. The page queue therefore
+accepts both borrowed paragraph notes and owned table notes while preserving
+document order.
 
 ### Columns and clearance
 
@@ -168,6 +231,20 @@ re-fits against each column's own width.
 `layout_section_with_clearance` accepts per-page header/footer clearance, so
 pages with differently-sized headers get correct body bounds. See
 [Headers and Footers](headers-footers.md).
+
+### Continuous-section terminal state
+
+The document orchestrator uses `layout_section_with_clearance_result` when the
+following section is `continuous`. The outgoing stacker preserves the pending
+physical page together with its actual `cursor_y`, column index, column top,
+effective bottom, active floats, and source page/column geometry. The incoming
+section inherits that state exactly when both flow frames match.
+
+When page or column geometry changes, the incoming section starts a shorter
+flow region at the outgoing cursor. That region is deliberately not classified
+as a full-height fresh column: if no legal line fits, the normal column/page
+advance path runs instead of allowing text below the body boundary. Full Word
+column balancing for changed geometry is still a separate layout operation.
 
 ### Floating tables
 

@@ -248,11 +248,11 @@ not assumed). Worth revisiting only once a real document needs the sliver.
 The extent test itself, `DrawCommand::vertical_span`, is exhaustive over the
 variants. A `Text` command carries a baseline and a font size but not the
 ascent/descent it was measured with, so its band is `baseline ± font_size` —
-deliberately the same approximation `render::estimate_cursor_y` already makes,
-so the two cannot disagree about where a line ends. The three annotation
-variants report no band at all: they paint nothing of their own, so a clip must
-not drop a link whose rect hangs below the box while the text it annotates
-stays.
+deliberately conservative for clipping. Continuous-section placement no longer
+infers flow position from draw-command extents; the section stacker returns its
+actual terminal cursor and column state. The three annotation variants report
+no band at all: they paint nothing of their own, so a clip must not drop a link
+whose rect hangs below the box while the text it annotates stays.
 
 ### Auto-fit — §20.1.2.1.18 `a:normAutofit`
 
@@ -300,7 +300,9 @@ a fit. `noAutofit` (§20.1.2.1.16) is the explicit "do not".
 Wrapping mode determines how text flows around the image:
 
 - `wrapSquare` / `wrapTight` — text wraps on both sides (registered as `ActiveFloat`)
-- `wrapTopAndBottom` (§20.4.2.18) — image acts as a block spacer; cursor_y advances past it
+- `wrapTopAndBottom` (§20.4.2.18) — image registers a full-width vertical
+  exclusion band; lines above the band stay in place and the first overlapping
+  line resumes below it
 - `wrapNone` — no text wrapping, image overlays text (behind or in front based on `behindDoc`)
 
 ## Forward-Scan for Absolute Floats
@@ -323,7 +325,15 @@ Each `ActiveFloat` defines a rectangular constraint zone:
 ```
 page_x = image_x - dist_left
 width  = image_width + dist_left + dist_right
+page_y_start = image_y - dist_top
+page_y_end   = image_y + image_height + dist_bottom
 ```
+
+The wrap element overrides the matching `wp:anchor` distance per edge;
+structurally missing edges fall back to the anchor value, while an explicit
+zero remains an override. `wrapTight`/`wrapThrough` can override L/R and
+`wrapTopAndBottom` can override T/B. The image/shape drawing rectangle itself
+is never expanded or shifted by these values; only the text-clearance zone is.
 
 The `float_adjustments` function computes left/right indentation for each text line based on y-overlap with active floats.
 

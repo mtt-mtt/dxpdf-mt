@@ -106,6 +106,17 @@ impl Unit for Twips {
     const NAME: &'static str = "twip";
 }
 
+/// One hundredth of the current paragraph character width.
+///
+/// WordprocessingML uses this unit for `w:startChars`, `w:endChars`,
+/// `w:firstLineChars`, and `w:hangingChars` (§17.3.1.12).  It cannot be
+/// converted to an absolute distance until the paragraph font size is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HundredthChars;
+impl Unit for HundredthChars {
+    const NAME: &'static str = "ch/100";
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HalfPoints;
 impl Unit for HalfPoints {
@@ -169,6 +180,13 @@ impl Dimension<Twips> {
 
     pub fn to_points_f32(self) -> f32 {
         self.raw as f32 / 20.0
+    }
+}
+
+impl Dimension<HundredthChars> {
+    /// Return the authored character count (for example, `200` → `2.0ch`).
+    pub fn to_characters_f32(self) -> f32 {
+        self.raw as f32 / 100.0
     }
 }
 
@@ -244,6 +262,18 @@ mod tests {
         approx(Dimension::<HalfPoints>::new(24).to_points_f32(), 12.0);
         approx(Dimension::<Emu>::new(12_700).to_points_f32(), 1.0);
         approx(Dimension::<EighthPoints>::new(8).to_points_f32(), 1.0);
+    }
+
+    #[test]
+    fn hundredth_chars_preserve_fractional_and_negative_values() {
+        approx(
+            Dimension::<HundredthChars>::new(147).to_characters_f32(),
+            1.47,
+        );
+        approx(
+            Dimension::<HundredthChars>::new(-53).to_characters_f32(),
+            -0.53,
+        );
     }
 
     #[test]

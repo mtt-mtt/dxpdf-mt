@@ -13,7 +13,7 @@ use crate::render::resolve::conditional::{
 use crate::render::resolve::styles::ResolvedStyle;
 
 use super::block::build_paragraph_block;
-use crate::render::layout::fragment::split_oversized_fragments;
+use crate::render::layout::fragment::split_oversized_fragments_for_word_wrap;
 
 use super::convert::{
     convert_cell_border_override, convert_table_border_config, merge_table_borders,
@@ -55,6 +55,34 @@ fn row_height_rule(
         HeightRule::AtLeast => Some(RowHeightRule::AtLeast(Pt::from(h.value))),
         HeightRule::Auto => None,
     }
+}
+
+/// Resolve §17.4.43 table cell-margin defaults per side.
+///
+/// Direct `tblCellMar` wins over the associated table style. A structurally
+/// absent side inherits, while an explicit `w:w="0"` remains zero. If neither
+/// level specifies a side, Word's effective defaults are 0 twips top/bottom
+/// and 108 twips start/end (0.075in, displayed as 0.08in in the UI).
+fn resolve_table_cell_margins(
+    direct: Option<crate::model::geometry::PartialEdgeInsets<crate::model::dimension::Twips>>,
+    style: Option<crate::model::geometry::PartialEdgeInsets<crate::model::dimension::Twips>>,
+) -> crate::model::geometry::EdgeInsets<crate::model::dimension::Twips> {
+    use crate::model::dimension::Dimension;
+    use crate::model::geometry::{EdgeInsets, PartialEdgeInsets};
+
+    let format_default = EdgeInsets::new(
+        Dimension::new(0),
+        Dimension::new(108),
+        Dimension::new(0),
+        Dimension::new(108),
+    );
+    let cascaded = match (direct, style) {
+        (Some(direct), Some(style)) => direct.inherit_missing_from(style),
+        (Some(direct), None) => direct,
+        (None, Some(style)) => style,
+        (None, None) => PartialEdgeInsets::new(None, None, None, None),
+    };
+    cascaded.resolve_against(format_default)
 }
 
 /// §17.4.44: resolve `tblCellSpacing` to points.
@@ -105,6 +133,9 @@ pub(super) fn build_table(
     let grid_cols: Vec<Pt> = t.grid.iter().map(|g| Pt::from(g.width)).collect();
 
     // §17.7.6: table style for conditional formatting, borders, cell margins.
+    // §17.4.63: when `w:tblStyle` is absent or unresolved, no table style is
+    // applied. The stylesheet's `w:default="1"` table style is not an implicit
+    // substitute for a missing `w:tblStyle`.
     let raw_table_style = t
         .properties
         .style_id
@@ -115,48 +146,15 @@ pub(super) fn build_table(
     let style_cell_margins = raw_table_style
         .and_then(|s| s.table.as_ref())
         .and_then(|tp| tp.cell_margins);
-    // Per-edge merge: direct tblCellMar overrides style per-edge, with
-    // unspecified edges (value 0) falling back to the style's value.
-    // Word merges per-edge rather than replacing the entire set.
-    let default_cell_margins = match (t.properties.cell_margins, style_cell_margins) {
-        (Some(direct), Some(style)) => {
-            use crate::model::geometry::EdgeInsets;
-            Some(EdgeInsets {
-                top: if direct.top.raw() != 0 {
-                    direct.top
-                } else {
-                    style.top
-                },
-                bottom: if direct.bottom.raw() != 0 {
-                    direct.bottom
-                } else {
-                    style.bottom
-                },
-                left: if direct.left.raw() != 0 {
-                    direct.left
-                } else {
-                    style.left
-                },
-                right: if direct.right.raw() != 0 {
-                    direct.right
-                } else {
-                    style.right
-                },
-            })
-        }
-        (Some(direct), None) => Some(direct),
-        (None, Some(style)) => Some(style),
-        (None, None) => None,
-    };
+    let default_cell_margins =
+        resolve_table_cell_margins(t.properties.cell_margins, style_cell_margins);
 
     // §17.4.63: resolve table width from tblW.
     let is_auto_width = matches!(
         t.properties.width,
         None | Some(model::TableMeasure::Auto) | Some(model::TableMeasure::Nil)
     );
-    let cell_margins_h = default_cell_margins
-        .map(|m| Pt::from(m.left) + Pt::from(m.right))
-        .unwrap_or(Pt::ZERO);
+    let cell_margins_h = Pt::from(default_cell_margins.left) + Pt::from(default_cell_margins.right);
     // §17.4.63 / Word heuristic: a full-width left-aligned table extends
     // beyond the body content area by its cell margins so cell content
     // aligns with surrounding paragraph text. Centered/right-aligned tables
@@ -268,8 +266,7 @@ pub(super) fn build_table(
                     // Per-side cascade against the table default (see
                     // `build_table_cell` for the spec rationale): the horizontal
                     // padding contribution is the resolved left+right insets.
-                    let table_default =
-                        default_cell_margins.unwrap_or(crate::model::geometry::EdgeInsets::ZERO);
+                    let table_default = default_cell_margins;
                     let resolved_h = match cell.properties.margins {
                         Some(partial) => partial.resolve_against(table_default),
                         None => table_default,
@@ -380,9 +377,7 @@ pub(super) fn build_table(
     );
     let indent = match t.properties.indent {
         Some(model::TableMeasure::Twips(tw)) => Pt::from(tw),
-        _ if is_full_width && is_left_aligned => -default_cell_margins
-            .map(|m| Pt::from(m.left))
-            .unwrap_or(Pt::ZERO),
+        _ if is_full_width && is_left_aligned => -Pt::from(default_cell_margins.left),
         _ => Pt::ZERO,
     };
 
@@ -463,7 +458,7 @@ fn normalize_row_uniform_vertical_insets(cells: &mut [TableCellInput]) {
 fn build_table_cell(
     cell: &TableCell,
     table_style: Option<&ResolvedStyle>,
-    style_cell_margins: Option<crate::model::geometry::EdgeInsets<crate::model::dimension::Twips>>,
+    table_default_margins: crate::model::geometry::EdgeInsets<crate::model::dimension::Twips>,
     cond: &CellConditionalFormatting,
     inner_width: Pt,
     ctx: &BuildContext,
@@ -475,7 +470,7 @@ fn build_table_cell(
     // the remaining sides from `<w:tblCellMar>` rather than zeroing them out;
     // collapsing missing sides to 0 produces text that hugs the cell borders
     // instead of carrying the table's intended padding.
-    let table_default = style_cell_margins.unwrap_or(crate::model::geometry::EdgeInsets::ZERO);
+    let table_default = table_default_margins;
     let resolved_margins = match cell.properties.margins {
         Some(partial) => partial.resolve_against(table_default),
         None => table_default,
@@ -551,6 +546,14 @@ fn build_table_cell(
         })
         .unwrap_or(crate::render::layout::table::CellVAlign::Top);
 
+    // §17.4.70: direct cell text direction wins, followed by conditional
+    // table-style formatting. Omission keeps the normal section flow.
+    let text_direction = cell.properties.text_direction.or_else(|| {
+        cond.cell_properties
+            .as_ref()
+            .and_then(|tcp| tcp.text_direction)
+    });
+
     // Estimate border insets to compute effective content width for
     // character-level splitting of oversized fragments.
     let border_w = |ovr: &Option<CellBorderOverride>| -> Pt {
@@ -588,6 +591,7 @@ fn build_table_cell(
             }
         }),
         vertical_align: valign,
+        text_direction,
     }
 }
 
@@ -627,7 +631,9 @@ fn build_cell_blocks(
                     table_style,
                     Some(cond),
                 ) {
-                    // Split oversized text fragments for narrow cells.
+                    // §17.3.1.45: character-level breaking is opt-in for
+                    // space-delimited words. East Asian text is already split
+                    // at legal boundaries during fragment construction.
                     let lb = if let LayoutBlock::Paragraph {
                         fragments,
                         style,
@@ -641,9 +647,13 @@ fn build_cell_blocks(
                         let measure = |t: &str, f: &crate::render::layout::fragment::FontProps| {
                             ctx.measurer.measure(t, f)
                         };
-                        let fragments =
-                            split_oversized_fragments(&fragments, inner_width, Some(&measure))
-                                .unwrap_or(fragments);
+                        let fragments = split_oversized_fragments_for_word_wrap(
+                            &fragments,
+                            inner_width,
+                            Some(&measure),
+                            style.word_wrap,
+                        )
+                        .unwrap_or(fragments);
                         LayoutBlock::Paragraph {
                             fragments,
                             style,
@@ -675,13 +685,188 @@ fn build_cell_blocks(
         }
     }
 
+    suppress_auto_spacing_at_cell_edges(&mut blocks);
     blocks
+}
+
+/// §17.3.1.33: automatic paragraph spacing in a table cell applies only at a
+/// boundary with a neighbouring paragraph. A cell edge is not such a boundary,
+/// so Word suppresses automatic spacing before the first paragraph and after
+/// the last paragraph in the cell.
+///
+/// Only the actual first/last layout block qualifies. In particular, do not
+/// search past a nested table for a paragraph: that would turn spacing on the
+/// other side of the nested table into cell-edge spacing. Keep the auto flags
+/// themselves so internal paragraph boundaries retain the ordinary automatic
+/// value and its contextual/list handling.
+fn suppress_auto_spacing_at_cell_edges(blocks: &mut [LayoutBlock]) {
+    if let Some(LayoutBlock::Paragraph { style, .. }) = blocks.first_mut() {
+        if style.before_auto_spacing {
+            style.space_before = Pt::ZERO;
+        }
+    }
+
+    if let Some(LayoutBlock::Paragraph { style, .. }) = blocks.last_mut() {
+        if style.after_auto_spacing {
+            style.space_after = Pt::ZERO;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::dimension::Dimension;
+    use crate::model::geometry::PartialEdgeInsets;
+    use crate::render::layout::paragraph::ParagraphStyle;
     use crate::render::layout::table::{CellVAlign, TableCellInput};
+
+    fn paragraph_with_spacing(
+        before: f32,
+        after: f32,
+        before_auto: bool,
+        after_auto: bool,
+    ) -> LayoutBlock {
+        LayoutBlock::Paragraph {
+            fragments: vec![],
+            style: ParagraphStyle {
+                space_before: Pt::new(before),
+                space_after: Pt::new(after),
+                before_auto_spacing: before_auto,
+                after_auto_spacing: after_auto,
+                ..ParagraphStyle::default()
+            },
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        }
+    }
+
+    fn nested_table_block() -> LayoutBlock {
+        LayoutBlock::Table {
+            rows: vec![],
+            col_widths: vec![],
+            cell_spacing: Pt::ZERO,
+            border_config: None,
+            indent: Pt::ZERO,
+            alignment: None,
+            float_info: None,
+            style_id: None,
+        }
+    }
+
+    fn paragraph_style(block: &LayoutBlock) -> &ParagraphStyle {
+        let LayoutBlock::Paragraph { style, .. } = block else {
+            panic!("expected paragraph block")
+        };
+        style
+    }
+
+    #[test]
+    fn cell_auto_spacing_suppresses_only_the_outer_sides() {
+        let mut blocks = vec![
+            paragraph_with_spacing(14.0, 14.0, true, true),
+            paragraph_with_spacing(14.0, 14.0, true, true),
+            paragraph_with_spacing(14.0, 14.0, true, true),
+        ];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let first = paragraph_style(&blocks[0]);
+        let middle = paragraph_style(&blocks[1]);
+        let last = paragraph_style(&blocks[2]);
+        assert_eq!(
+            (first.space_before, first.space_after),
+            (Pt::ZERO, Pt::new(14.0))
+        );
+        assert_eq!(
+            (middle.space_before, middle.space_after),
+            (Pt::new(14.0), Pt::new(14.0)),
+            "internal automatic spacing remains intact"
+        );
+        assert_eq!(
+            (last.space_before, last.space_after),
+            (Pt::new(14.0), Pt::ZERO)
+        );
+        assert!(
+            [first, middle, last]
+                .into_iter()
+                .all(|style| style.before_auto_spacing && style.after_auto_spacing),
+            "edge suppression must preserve the auto flags"
+        );
+    }
+
+    #[test]
+    fn single_paragraph_cell_suppresses_both_auto_edges() {
+        let mut blocks = vec![paragraph_with_spacing(14.0, 14.0, true, true)];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let style = paragraph_style(&blocks[0]);
+        assert_eq!(
+            (style.space_before, style.space_after),
+            (Pt::ZERO, Pt::ZERO)
+        );
+        assert!(style.before_auto_spacing && style.after_auto_spacing);
+    }
+
+    #[test]
+    fn explicit_cell_edge_spacing_is_not_suppressed() {
+        let mut blocks = vec![paragraph_with_spacing(6.0, 8.0, false, false)];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let style = paragraph_style(&blocks[0]);
+        assert_eq!(
+            (style.space_before, style.space_after),
+            (Pt::new(6.0), Pt::new(8.0))
+        );
+    }
+
+    #[test]
+    fn nested_tables_stop_cell_edge_paragraph_search() {
+        let mut blocks = vec![
+            nested_table_block(),
+            paragraph_with_spacing(14.0, 14.0, true, true),
+            nested_table_block(),
+        ];
+
+        suppress_auto_spacing_at_cell_edges(&mut blocks);
+
+        let style = paragraph_style(&blocks[1]);
+        assert_eq!(
+            (style.space_before, style.space_after),
+            (Pt::new(14.0), Pt::new(14.0)),
+            "a paragraph across a nested table is not at the cell edge"
+        );
+    }
+
+    #[test]
+    fn table_cell_margin_word_defaults_are_horizontal_108_twips() {
+        let margins = resolve_table_cell_margins(None, None);
+        assert_eq!(margins.top.raw(), 0);
+        assert_eq!(margins.right.raw(), 108);
+        assert_eq!(margins.bottom.raw(), 0);
+        assert_eq!(margins.left.raw(), 108);
+    }
+
+    #[test]
+    fn direct_table_cell_margin_zero_overrides_style_per_side() {
+        let direct =
+            PartialEdgeInsets::new(None, Some(Dimension::new(0)), None, Some(Dimension::new(0)));
+        let style = PartialEdgeInsets::new(
+            Some(Dimension::new(40)),
+            Some(Dimension::new(115)),
+            Some(Dimension::new(60)),
+            Some(Dimension::new(115)),
+        );
+        let margins = resolve_table_cell_margins(Some(direct), Some(style));
+        assert_eq!(margins.top.raw(), 40, "missing direct side inherits");
+        assert_eq!(margins.right.raw(), 0, "explicit zero wins");
+        assert_eq!(margins.bottom.raw(), 60, "missing direct side inherits");
+        assert_eq!(margins.left.raw(), 0, "explicit zero wins");
+    }
 
     fn cell_with_margins(top: f32, right: f32, bottom: f32, left: f32) -> TableCellInput {
         TableCellInput {
@@ -697,6 +882,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 

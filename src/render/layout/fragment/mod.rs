@@ -19,10 +19,12 @@ mod segment;
 mod split;
 mod text;
 
+pub(crate) use collect::emit_text_with_font_slots_and_glyph_fallback;
 pub use collect::{
     collect_fragments, FieldContext, FootnoteTracker, FragmentCtx, RecordedFootnote,
 };
-pub use split::split_oversized_fragments;
+pub use split::{split_oversized_fragments, split_oversized_fragments_for_word_wrap};
+pub(crate) use text::TextRunStyle;
 
 // ── Superscript / subscript rendering constants ───────────────────────────────
 // §17.3.2.42: these ratios are "application-defined" per the spec; the values
@@ -48,6 +50,75 @@ pub(super) const SUBSCRIPT_HEIGHT_OFFSET_RATIO: f32 = 0.08;
 /// number line up without a measurement round-trip.
 pub(crate) const NOTE_REF_BASELINE_OFFSET_RATIO: f32 = 0.4;
 
+/// East Asian proofing language distinctions that Word uses for
+/// `w:overflowPunct`. This is deliberately separate from `resolve::Locale`,
+/// whose much coarser variants answer unrelated decimal/list questions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EastAsianLanguage {
+    ChineseSimplified,
+    ChineseTraditional,
+    Japanese,
+    Korean,
+}
+
+impl EastAsianLanguage {
+    /// Classify an effective `w:lang`. The East Asian slot wins because Word's
+    /// punctuation table is selected by the parent run's East Asian language;
+    /// `@val` is a fallback for producers that only write one slot.
+    pub(crate) fn from_lang(lang: Option<&crate::model::Lang>) -> Option<Self> {
+        let lang = lang?;
+        match lang.east_asia.as_deref() {
+            Some(tag) => Self::from_tag(tag),
+            None => lang.val.as_deref().and_then(Self::from_tag),
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        let normalized = tag.trim().replace('_', "-").to_ascii_lowercase();
+        let mut subtags = normalized.split('-');
+        match subtags.next()? {
+            "ja" => Some(Self::Japanese),
+            "ko" => Some(Self::Korean),
+            "zh" => {
+                let rest: Vec<&str> = subtags.collect();
+                if rest
+                    .iter()
+                    .any(|part| matches!(*part, "hant" | "cht" | "tw" | "hk" | "mo"))
+                {
+                    Some(Self::ChineseTraditional)
+                } else if rest.is_empty()
+                    || rest
+                        .iter()
+                        .any(|part| matches!(*part, "hans" | "chs" | "cn" | "sg" | "my"))
+                {
+                    Some(Self::ChineseSimplified)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Word's language-specific punctuation lists from MS-OE376 §2.1.56.
+    /// The duplicate `〗` in Microsoft's Simplified Chinese list naturally
+    /// collapses under membership testing.
+    pub(crate) fn is_overflow_punctuation(self, ch: char) -> bool {
+        const ZH_HANS: &str =
+            "!%),.:;>?]}¢°·ˇ’”‰′″℃∶、。〃〉》」』〗〕〗〞﹚﹜﹞！＂％＇），．：；？］｝￠";
+        const ZH_HANT: &str = "!),.:;?]}’”′、。〉》」』〗〕〞﹚﹜﹞！），．：；？］｝";
+        const JA: &str = ",.’”、。」』〗），．］｝｡､";
+        const KO: &str = "!%),.:;?]}¢°’”′″℃〉》」』〗〕！％），．：；？］｝￠";
+
+        match self {
+            Self::ChineseSimplified => ZH_HANS.contains(ch),
+            Self::ChineseTraditional => ZH_HANT.contains(ch),
+            Self::Japanese => JA.contains(ch),
+            Self::Korean => KO.contains(ch),
+        }
+    }
+}
+
 /// Font properties needed for rendering a text fragment.
 #[derive(Clone, Debug)]
 pub struct FontProps {
@@ -63,6 +134,9 @@ pub struct FontProps {
     /// (`char_spacing`) is **not** scaled by this — the spec keeps the two
     /// independent.
     pub text_scale: f32,
+    /// Parent run language used solely for Word's language-specific hanging
+    /// punctuation table.
+    pub east_asian_language: Option<EastAsianLanguage>,
     /// Underline position from font metrics (positive = below baseline).
     pub underline_position: Pt,
     /// Underline thickness from font metrics.
@@ -243,18 +317,23 @@ pub enum Fragment {
         color: RgbColor,
     },
     LineBreak {
+        /// Natural fragment height used by `exact`/`atLeast` line spacing.
+        ///
+        /// Run-level breaks retain the pre-existing nominal font-size value;
+        /// synthetic empty-paragraph breaks use their measured default height.
         line_height: Pt,
+        /// §17.3.1.33: measured text line box (ascent + descent + leading).
+        /// Auto line spacing scales this value so an empty visual line created
+        /// by a leading or consecutive `w:br` matches a text-bearing line in
+        /// the same effective run font.
+        text_height: Pt,
     },
     /// §17.3.3.1: column break — forces content to the next column.
     ColumnBreak,
     /// §17.3.3.1: page break — forces content to the next page.
-    PageBreak {
-        line_height: Pt,
-    },
+    PageBreak { line_height: Pt },
     /// Named destination (bookmark target) — zero-width marker.
-    Bookmark {
-        name: String,
-    },
+    Bookmark { name: String },
 }
 
 /// A compact UAX #14 subset for the East Asian text Word commonly receives.
@@ -263,7 +342,9 @@ pub enum Fragment {
 pub(crate) fn east_asian_break_char(ch: char) -> bool {
     matches!(
         ch,
-        '\u{2E80}'..='\u{A4CF}'
+        '\u{00D7}'
+            | '\u{FF3F}'
+            | '\u{2E80}'..='\u{A4CF}'
             | '\u{AC00}'..='\u{D7AF}'
             | '\u{F900}'..='\u{FAFF}'
             | '\u{20000}'..='\u{323AF}'
@@ -297,6 +378,35 @@ pub(crate) fn east_asian_closing_punctuation(ch: char) -> bool {
             | '；'
             | '：'
     )
+}
+
+/// The side of a full-width punctuation glyph whose built-in half-em
+/// whitespace is removed by `w:characterSpacingControl`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PunctuationCompressionSide {
+    Leading,
+    Trailing,
+}
+
+/// Fraction of a full-width punctuation advance removed by Word-compatible
+/// `compressPunctuation` layout. The value is calibrated from reference line
+/// endings across the affected corpus. Keep measurement and paint in sync.
+pub(crate) const PUNCTUATION_COMPRESSION_RATIO: f32 = 0.20;
+
+/// §17.15.1.18: punctuation eligible for full-width whitespace compression.
+///
+/// Curly quotation marks are included because an East Asian typeface normally
+/// exposes them as full-em glyphs. Measurement and paint both gate the actual
+/// adjustment on the resolved glyph advance, so half-width Latin quotes are
+/// left unchanged.
+pub(crate) fn punctuation_compression_side(ch: char) -> Option<PunctuationCompressionSide> {
+    if east_asian_opening_punctuation(ch) {
+        Some(PunctuationCompressionSide::Leading)
+    } else if east_asian_closing_punctuation(ch) {
+        Some(PunctuationCompressionSide::Trailing)
+    } else {
+        None
+    }
 }
 
 /// Whitespace that Word permits to hang past the right edge of a line.
@@ -347,7 +457,7 @@ impl Fragment {
             Fragment::Emoji { line_metrics, .. } => line_metrics.height(),
             Fragment::Tab { line_height, .. }
             | Fragment::PTab { line_height, .. }
-            | Fragment::LineBreak { line_height }
+            | Fragment::LineBreak { line_height, .. }
             | Fragment::PageBreak { line_height } => *line_height,
             Fragment::ColumnBreak | Fragment::Bookmark { .. } => Pt::ZERO,
         }
@@ -417,6 +527,7 @@ pub fn font_props_from_run(
         underline: matches!(rp.underline, Some(s) if s != UnderlineStyle::None),
         char_spacing,
         text_scale,
+        east_asian_language: EastAsianLanguage::from_lang(rp.lang.as_ref()),
         // Populated by the measurer from Skia font metrics.
         underline_position: Pt::ZERO,
         underline_thickness: Pt::ZERO,
@@ -454,6 +565,98 @@ pub fn to_roman_lower(mut n: u32) -> String {
 mod tests {
     use super::*;
     use crate::model::UnderlineStyle;
+
+    #[test]
+    fn classifies_east_asian_punctuation_compression_sides() {
+        assert_eq!(
+            punctuation_compression_side('（'),
+            Some(PunctuationCompressionSide::Leading)
+        );
+        assert_eq!(
+            punctuation_compression_side('。'),
+            Some(PunctuationCompressionSide::Trailing)
+        );
+        assert_eq!(punctuation_compression_side('A'), None);
+    }
+
+    #[test]
+    fn overflow_punctuation_uses_word_language_specific_sets() {
+        let cases = [
+            (
+                EastAsianLanguage::ChineseSimplified,
+                "!%),.:;>?]}¢°·ˇ’”‰′″℃∶、。〃〉》」』〗〕〞﹚﹜﹞！＂％＇），．：；？］｝￠",
+            ),
+            (
+                EastAsianLanguage::ChineseTraditional,
+                "!),.:;?]}’”′、。〉》」』〗〕〞﹚﹜﹞！），．：；？］｝",
+            ),
+            (EastAsianLanguage::Japanese, ",.’”、。」』〗），．］｝｡､"),
+            (
+                EastAsianLanguage::Korean,
+                "!%),.:;?]}¢°’”′″℃〉》」』〗〕！％），．：；？］｝￠",
+            ),
+        ];
+        for (language, punctuation) in cases {
+            for ch in punctuation.chars() {
+                assert!(
+                    language.is_overflow_punctuation(ch),
+                    "{language:?} must include U+{:04X}",
+                    ch as u32
+                );
+            }
+        }
+
+        assert!(EastAsianLanguage::ChineseSimplified.is_overflow_punctuation('>'));
+        assert!(!EastAsianLanguage::ChineseTraditional.is_overflow_punctuation('>'));
+        assert!(EastAsianLanguage::Japanese.is_overflow_punctuation('｡'));
+        assert!(!EastAsianLanguage::Korean.is_overflow_punctuation('｡'));
+        assert!(!EastAsianLanguage::Japanese.is_overflow_punctuation('%'));
+        assert!(!EastAsianLanguage::ChineseSimplified.is_overflow_punctuation('A'));
+    }
+
+    #[test]
+    fn overflow_punctuation_language_prefers_east_asia_and_classifies_tags() {
+        let lang = crate::model::Lang {
+            val: Some("ja-JP".into()),
+            east_asia: Some("zh-Hant-TW".into()),
+            bidi: None,
+        };
+        assert_eq!(
+            EastAsianLanguage::from_lang(Some(&lang)),
+            Some(EastAsianLanguage::ChineseTraditional)
+        );
+        assert_eq!(
+            EastAsianLanguage::from_tag("ZH_chs"),
+            Some(EastAsianLanguage::ChineseSimplified)
+        );
+        assert_eq!(
+            EastAsianLanguage::from_tag("ko-KR"),
+            Some(EastAsianLanguage::Korean)
+        );
+        assert_eq!(EastAsianLanguage::from_tag("en-US"), None);
+
+        let explicit_non_east_asian_slot = crate::model::Lang {
+            val: Some("zh-CN".into()),
+            east_asia: Some("en-US".into()),
+            bidi: None,
+        };
+        assert_eq!(
+            EastAsianLanguage::from_lang(Some(&explicit_non_east_asian_slot)),
+            None,
+            "an explicitly written East Asian slot is authoritative even when it selects no CJK table"
+        );
+
+        let val_only = crate::model::Lang {
+            val: Some("ja-JP".into()),
+            east_asia: None,
+            bidi: None,
+        };
+        assert_eq!(
+            EastAsianLanguage::from_lang(Some(&val_only)),
+            Some(EastAsianLanguage::Japanese),
+            "the general slot is a fallback only when eastAsia is absent"
+        );
+    }
 
     #[test]
     fn font_props_default_fallback() {

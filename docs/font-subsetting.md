@@ -53,7 +53,8 @@ lowercases, hashes, and clones a `TypefaceEntry` on every call, and the same
 
 1. **Extract** (`extract.rs`) — get subsettable SFNT bytes. `Embedded` origin
    reads from the registry (already deobfuscated per §17.8.1.4); `System` calls
-   `Typeface::to_font_data`. WOFF2 is decompressed via `fontcull`; **WOFF1 and
+   `Typeface::to_font_data`; `Packaged` reads the original controlled-pack
+   file bytes retained by the registry. WOFF2 is decompressed via `fontcull`; **WOFF1 and
    TTC are documented capability boundaries** — ECMA-376 forbids WOFF in DOCX,
    and Skia's `openStream` strips TTCs to a single face in practice.
 2. **Subset** — `fontcull::subset_font_data_unicode(bytes, unicodes, &[])`.

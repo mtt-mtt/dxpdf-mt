@@ -17,6 +17,7 @@ use crate::render::geometry::PtOffset;
 /// When there are no floats a single call to `fit_lines_with_first` is used.
 pub(super) fn compute_line_placements(
     fragments: &[Fragment],
+    hanging_tail_widths: &[Pt],
     style: &ParagraphStyle,
     params: &LineLayoutParams,
 ) -> Vec<LinePlacement> {
@@ -41,15 +42,18 @@ pub(super) fn compute_line_placements(
         } else {
             content_width
         };
-        return super::super::line::fit_lines_with_first(
+        return super::super::line::fit_lines_with_first_and_hanging(
             fragments,
             first_line_width,
             remaining_width,
             ptab_geometry,
+            hanging_tail_widths,
+            style.overflow_punct,
         )
         .into_iter()
         .map(|line| LinePlacement {
             line,
+            clearance_before: Pt::ZERO,
             float_left: Pt::ZERO,
             float_right: Pt::ZERO,
         })
@@ -62,6 +66,8 @@ pub(super) fn compute_line_placements(
     let mut line_y = style.space_before;
 
     while frag_idx < fragments.len() {
+        let clearance_before = full_width_float_clearance(style, line_y, default_line_height);
+        line_y += clearance_before;
         let abs_y = style.page_y + line_y;
         let (fl, fr) = super::super::float::float_adjustments_with_height(
             &style.page_floats,
@@ -99,11 +105,13 @@ pub(super) fn compute_line_placements(
             float_right: fr,
             ..ptab_geometry
         };
-        let fitted = super::super::line::fit_lines_with_first(
+        let fitted = super::super::line::fit_lines_with_first_and_hanging(
             remaining,
             line_width,
             line_width,
             line_geometry,
+            hanging_tail_widths.get(frag_idx..).unwrap_or(&[]),
+            style.overflow_punct,
         );
         let fitted_line = if let Some(first) = fitted.into_iter().next() {
             super::super::line::FittedLine {
@@ -114,6 +122,7 @@ pub(super) fn compute_line_placements(
                 text_height: first.text_height,
                 ascent: first.ascent,
                 has_break: first.has_break,
+                hanging_punct_width: first.hanging_punct_width,
             }
         } else {
             break;
@@ -134,12 +143,43 @@ pub(super) fn compute_line_placements(
         frag_idx = fitted_line.end;
         placements.push(LinePlacement {
             line: fitted_line,
+            clearance_before,
             float_left: fl,
             float_right: fr,
         });
         line_y += lh;
     }
     placements
+}
+
+/// Vertical distance needed to move one line below every overlapping
+/// full-width float. Coordinates are paragraph-relative on input and page-
+/// absolute for float intersection, matching the per-line narrowing path.
+pub(super) fn full_width_float_clearance(
+    style: &ParagraphStyle,
+    relative_y: Pt,
+    line_height: Pt,
+) -> Pt {
+    let mut line_y = relative_y;
+    loop {
+        let abs_y = style.page_y + line_y;
+        let line_bottom = abs_y + line_height;
+        let clear_to = style
+            .page_floats
+            .iter()
+            .filter(|float| float.vertical_exclusion)
+            .filter(|float| line_bottom > float.page_y_start && abs_y < float.page_y_end)
+            .map(|float| float.page_y_end)
+            .max_by(|left, right| left.raw().total_cmp(&right.raw()));
+        let Some(clear_to) = clear_to else {
+            break;
+        };
+        if clear_to <= abs_y {
+            break;
+        }
+        line_y += clear_to - abs_y;
+    }
+    line_y - relative_y
 }
 
 fn stretchable_gap_after(fragments: &[Fragment], frag_idx: usize, line_end: usize) -> bool {
@@ -168,7 +208,7 @@ fn visible_line_width(fragments: &[Fragment], line: &super::super::line::FittedL
     let last_visible = (line.start..line.end)
         .rev()
         .find(|&idx| !matches!(fragments[idx], Fragment::Bookmark { .. }));
-    (line.start..line.end)
+    let visible: Pt = (line.start..line.end)
         .map(|idx| {
             if Some(idx) == last_visible {
                 fragments[idx].trimmed_width()
@@ -176,7 +216,8 @@ fn visible_line_width(fragments: &[Fragment], line: &super::super::line::FittedL
                 fragments[idx].width()
             }
         })
-        .sum()
+        .sum();
+    (visible - line.hanging_punct_width).max(Pt::ZERO)
 }
 
 fn justification_extra_after(
@@ -316,6 +357,7 @@ pub(super) fn emit_line_commands(
     for line_idx in line_range {
         let lp = &line_placements[line_idx];
         let line = &lp.line;
+        *cursor_y += lp.clearance_before;
 
         // Drop cap lines get extra indent; after that, refit remaining lines at full width.
         let dc_offset = if line_idx < drop_cap_lines {
@@ -348,6 +390,12 @@ pub(super) fn emit_line_commands(
             text_height,
             &style.line_spacing,
             style.auto_fit,
+        );
+        let baseline_ascent = resolved_text_baseline_ascent(
+            line.ascent,
+            natural_height,
+            line_height,
+            &style.line_spacing,
         );
 
         // Alignment offset — computed relative to the line's available width.
@@ -430,7 +478,7 @@ pub(super) fn emit_line_commands(
                     // §17.3.2.32: render run-level shading behind text.
                     // Uses text bounds (ascent+descent), not full line height.
                     if let Some(bg_color) = shading {
-                        let text_top = *cursor_y + line.ascent - metrics.ascent;
+                        let text_top = *cursor_y + baseline_ascent - metrics.ascent;
                         commands.push(DrawCommand::Rect {
                             rect: crate::render::geometry::PtRect::from_xywh(
                                 x,
@@ -445,7 +493,7 @@ pub(super) fn emit_line_commands(
                     // §17.3.2.4: render run-level border (box around text).
                     // Uses text bounds, not full line height.
                     if let Some(bdr) = border {
-                        let text_top = *cursor_y + line.ascent - metrics.ascent;
+                        let text_top = *cursor_y + baseline_ascent - metrics.ascent;
                         let bx = x - bdr.space;
                         let by = text_top;
                         let bw = rendered_width + bdr.space * 2.0;
@@ -489,7 +537,7 @@ pub(super) fn emit_line_commands(
                         });
                     }
 
-                    let y = *cursor_y + line.ascent + *baseline_offset;
+                    let y = *cursor_y + baseline_ascent + *baseline_offset;
                     commands.push(DrawCommand::Text {
                         position: PtOffset::new(x + *text_offset, y),
                         text: text.clone(),
@@ -500,6 +548,7 @@ pub(super) fn emit_line_commands(
                         italic: font.italic,
                         color: *color,
                         text_scale: font.text_scale,
+                        rotation_degrees: 0.0,
                     });
 
                     if let Some(link) = hyperlink_url {
@@ -599,7 +648,7 @@ pub(super) fn emit_line_commands(
                     // Place the cluster's box so its top sits at the line
                     // baseline minus the typeface ascent, matching where text
                     // glyphs at the same baseline would sit.
-                    let baseline_y = *cursor_y + line.ascent + *baseline_offset;
+                    let baseline_y = *cursor_y + baseline_ascent + *baseline_offset;
                     let top_y = baseline_y - metrics.ascent;
                     commands.push(DrawCommand::EmojiCluster {
                         rect: crate::render::geometry::PtRect::from_xywh(
@@ -662,7 +711,7 @@ pub(super) fn emit_line_commands(
                             },
                             x,
                             new_x,
-                            *cursor_y + line.ascent,
+                            *cursor_y + baseline_ascent,
                             measure_text,
                         );
                     }
@@ -725,7 +774,7 @@ pub(super) fn emit_line_commands(
                         },
                         x,
                         new_x,
-                        *cursor_y + line.ascent,
+                        *cursor_y + baseline_ascent,
                         measure_text,
                     );
 
@@ -1185,7 +1234,39 @@ pub(super) fn emit_tab_leader(
         italic: leader_font.italic,
         color,
         text_scale: 1.0,
+        rotation_degrees: 0.0,
     });
+}
+
+/// Position a text baseline inside the resolved Word line box.
+///
+/// A document-grid line can be taller than the glyph box either because the
+/// font consumes multiple grid pitches or because Auto/AtLeast raises the
+/// grid-backed line height. Word centres the glyph box in that reserved
+/// height. Keeping the surplus entirely below the baseline makes every first
+/// grid line start too high even when the inter-line delta is already exact.
+/// Non-grid spacing keeps its existing placement here; Exact and ordinary
+/// Auto have separate Word compatibility rules and are intentionally outside
+/// this narrowly-probed change.
+pub(super) fn resolved_text_baseline_ascent(
+    ascent: Pt,
+    natural_height: Pt,
+    resolved_line_height: Pt,
+    rule: &LineSpacingRule,
+) -> Pt {
+    if ascent <= Pt::ZERO || natural_height <= Pt::ZERO {
+        return ascent;
+    }
+    if matches!(
+        rule,
+        LineSpacingRule::Grid { .. }
+            | LineSpacingRule::GridAuto { .. }
+            | LineSpacingRule::GridAtLeast { .. }
+    ) {
+        ascent + (resolved_line_height - natural_height).max(Pt::ZERO) * 0.5
+    } else {
+        ascent
+    }
 }
 
 /// §17.3.1.33: resolve the effective line height from the natural height
@@ -1250,8 +1331,8 @@ pub(super) fn resolve_line_height(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_next_tab_stop, inline_graphic_top, resolve_ptab, resolve_zone_anchor, Fragment,
-        PTabGeometry, PTabPlacement, ZoneAnchor,
+        compute_line_placements, find_next_tab_stop, inline_graphic_top, resolve_ptab,
+        resolve_zone_anchor, visible_line_width, Fragment, PTabGeometry, PTabPlacement, ZoneAnchor,
     };
     use crate::model;
     use crate::render::dimension::Pt;
@@ -1328,6 +1409,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -1346,6 +1428,57 @@ mod tests {
             text_offset: Pt::ZERO,
             is_footnote_ref: false,
         }
+    }
+
+    #[test]
+    fn visible_width_deducts_only_the_consumed_hanging_tail() {
+        let fragments = [text_fragment("中。", 110.0)];
+        let mut line = crate::render::layout::line::FittedLine {
+            start: 0,
+            end: 1,
+            width: Pt::new(110.0),
+            height: Pt::new(14.0),
+            text_height: Pt::new(14.0),
+            ascent: Pt::new(10.0),
+            has_break: false,
+            hanging_punct_width: Pt::new(10.0),
+        };
+
+        assert_eq!(visible_line_width(&fragments, &line), Pt::new(100.0));
+        line.hanging_punct_width = Pt::ZERO;
+        assert_eq!(visible_line_width(&fragments, &line), Pt::new(110.0));
+    }
+
+    #[test]
+    fn explicit_false_paragraph_style_blocks_the_hanging_exception() {
+        let fragments = [text_fragment("中", 100.0), text_fragment("。", 10.0)];
+        let tails = [Pt::ZERO, Pt::new(10.0)];
+        let params = super::super::LineLayoutParams {
+            content_width: Pt::new(100.0),
+            max_width: Pt::new(100.0),
+            first_line_adjustment: Pt::ZERO,
+            drop_cap_indent: Pt::ZERO,
+            drop_cap_lines: 0,
+            default_line_height: Pt::new(14.0),
+        };
+        let mut style = super::super::ParagraphStyle {
+            overflow_punct: false,
+            ..Default::default()
+        };
+
+        let disabled = compute_line_placements(&fragments, &tails, &style, &params);
+        assert_eq!(disabled.len(), 2);
+        assert!(
+            disabled
+                .iter()
+                .all(|placement| placement.line.hanging_punct_width == Pt::ZERO),
+            "an explicit false style must never consume the supplied tail width"
+        );
+
+        style.overflow_punct = true;
+        let enabled = compute_line_placements(&fragments, &tails, &style, &params);
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].line.hanging_punct_width, Pt::new(10.0));
     }
 
     #[test]

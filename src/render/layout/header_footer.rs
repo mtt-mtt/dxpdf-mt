@@ -514,6 +514,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::ZERO,
             text_scale: 1.0,
+            east_asian_language: None,
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,
         };
@@ -567,6 +568,7 @@ mod tests {
             italic: false,
             color: RgbColor::BLACK,
             text_scale: 1.0,
+            rotation_degrees: 0.0,
         });
 
         let config = test_config();
@@ -613,6 +615,7 @@ mod tests {
             italic: false,
             color: RgbColor::BLACK,
             text_scale: 1.0,
+            rotation_degrees: 0.0,
         });
 
         let config = test_config();

@@ -53,6 +53,18 @@ pub fn extract(
             .ok_or(ExtractionError::NoBytesAvailable)?,
         TypefaceOrigin::SystemFallback { .. } => return Err(ExtractionError::DynamicFallback),
         TypefaceOrigin::Bundled { font } => bundled_font_bytes(font).to_vec(),
+        TypefaceOrigin::Packaged { id } => {
+            let (bytes, _face_index) = registry.packaged_font_source(id);
+            if bytes.starts_with(b"ttcf") {
+                entry
+                    .typeface
+                    .to_font_data()
+                    .map(|(bytes, _ttc_index)| bytes)
+                    .ok_or(ExtractionError::NoBytesAvailable)?
+            } else {
+                bytes.to_vec()
+            }
+        }
     };
 
     classify_and_unwrap(raw)

@@ -4,14 +4,70 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use rustc_hash::FxHashMap;
-use skia_safe::{Font, FontStyle};
+use skia_safe::{Font, FontStyle, Typeface};
 
+use crate::model::CharacterSpacingControl;
 use crate::render::dimension::Pt;
 use crate::render::emoji::resolve::{EmojiFamily, EmojiResolver, EmojiTypeface, RegistryLookup};
 use crate::render::emoji::shape::ClusterShaper;
 use crate::render::fonts::{self, FontRegistry, TypefaceEntry, TypefaceId};
 
 use super::fragment::{FontProps, TextMetrics};
+
+const OS2_TABLE_TAG: u32 = u32::from_be_bytes(*b"OS/2");
+const OS2_USE_TYPO_METRICS: u16 = 1 << 7;
+const OS2_CJK_CODE_PAGE_MASK: u32 = ((1 << 5) - 1) << 17;
+
+fn be_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes: [u8; 2] = data.get(offset..offset + 2)?.try_into().ok()?;
+    Some(u16::from_be_bytes(bytes))
+}
+
+fn be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+/// Word's Windows line box for legacy CJK faces.
+///
+/// Word uses `OS/2.usWinAscent/usWinDescent` for East Asian fonts and adds
+/// 15% of their combined extent above and below the glyph box. This differs
+/// from Skia's `hhea` metrics and is large enough to change page count (for
+/// example SimSun 14pt is about 18.16pt, not 15.97pt). Fonts opting into
+/// `USE_TYPO_METRICS` stay on Skia's modern metrics path.
+fn word_cjk_metrics_from_os2(data: &[u8], units_per_em: u16, size: Pt) -> Option<TextMetrics> {
+    if units_per_em == 0 || be_u16(data, 0)? < 1 {
+        return None;
+    }
+    let selection = be_u16(data, 62)?;
+    if selection & OS2_USE_TYPO_METRICS != 0 {
+        return None;
+    }
+    let code_pages = be_u32(data, 78)?;
+    if code_pages & OS2_CJK_CODE_PAGE_MASK == 0 {
+        return None;
+    }
+
+    let win_ascent = be_u16(data, 74)? as u32;
+    let win_descent = be_u16(data, 76)? as u32;
+    let extent = win_ascent.checked_add(win_descent)?;
+    if extent == 0 {
+        return None;
+    }
+    let padding = ((extent as f32) * 0.15).round();
+    let scale = size.raw() / units_per_em as f32;
+    Some(TextMetrics {
+        ascent: Pt::new((win_ascent as f32 + padding) * scale),
+        descent: Pt::new((win_descent as f32 + padding) * scale),
+        leading: Pt::ZERO,
+    })
+}
+
+fn word_cjk_metrics(typeface: &Typeface, size: Pt) -> Option<TextMetrics> {
+    let units_per_em: u16 = typeface.units_per_em()?.try_into().ok()?;
+    let table = typeface.copy_table_data(OS2_TABLE_TAG)?;
+    word_cjk_metrics_from_os2(table.as_bytes(), units_per_em, size)
+}
 
 /// Per-font measurement memo: the font's metrics (constant for the font) plus
 /// the raw Skia `measure_str` advance for each distinct word seen. Keyed inside
@@ -24,6 +80,9 @@ struct FontMeasureCache {
     /// depends only on (typeface, size, text) — so it is safe to reuse across
     /// runs that differ only in scale or spacing.
     widths: FxHashMap<Box<str>, f32>,
+    /// Raw advances for the small set of full-width punctuation codepoints.
+    /// Used only when the document enables §17.15.1.18 compression.
+    punctuation_widths: FxHashMap<char, f32>,
 }
 
 /// Measures text using Skia fonts resolved through a [`FontRegistry`].
@@ -57,10 +116,18 @@ pub struct TextMeasurer<'r> {
     /// words dominate. Uses FxHash: an earlier std-hasher width cache was
     /// net-negative on small docs due to per-word hashing overhead.
     measure_cache: RefCell<FxHashMap<usize, FontMeasureCache>>,
+    character_spacing_control: CharacterSpacingControl,
 }
 
 impl<'r> TextMeasurer<'r> {
     pub fn new(registry: &'r FontRegistry) -> Self {
+        Self::with_character_spacing_control(registry, CharacterSpacingControl::DoNotCompress)
+    }
+
+    pub fn with_character_spacing_control(
+        registry: &'r FontRegistry,
+        character_spacing_control: CharacterSpacingControl,
+    ) -> Self {
         Self {
             registry,
             font_cache: RefCell::new(fonts::FontCache::new()),
@@ -69,6 +136,7 @@ impl<'r> TextMeasurer<'r> {
             cluster_shaper: ClusterShaper::new().ok(),
             emoji_advance_cache: RefCell::new(HashMap::new()),
             measure_cache: RefCell::new(FxHashMap::default()),
+            character_spacing_control,
         }
     }
 
@@ -100,13 +168,16 @@ impl<'r> TextMeasurer<'r> {
         let mut cache = self.measure_cache.borrow_mut();
         let fc = cache.entry(slot).or_insert_with(|| {
             let (_, m) = font.metrics();
+            let skia_metrics = TextMetrics {
+                ascent: Pt::new(-m.ascent),
+                descent: Pt::new(m.descent),
+                leading: Pt::new(m.leading.max(0.0)),
+            };
             FontMeasureCache {
-                metrics: TextMetrics {
-                    ascent: Pt::new(-m.ascent),
-                    descent: Pt::new(m.descent),
-                    leading: Pt::new(m.leading.max(0.0)),
-                },
+                metrics: word_cjk_metrics(&font.typeface(), font_props.size)
+                    .unwrap_or(skia_metrics),
                 widths: FxHashMap::default(),
+                punctuation_widths: FxHashMap::default(),
             }
         });
         let text_metrics = fc.metrics;
@@ -134,7 +205,47 @@ impl<'r> TextMeasurer<'r> {
             Pt::ZERO
         };
 
-        (scaled_width + spacing_extra, text_metrics)
+        // §17.15.1.18 / ST_CharacterSpacing: compress only punctuation that
+        // resolves to a full-width glyph. Reference probes show that Word's
+        // line-fit decisions match a conservative one-fifth-advance trim; a
+        // half-advance trim over-compresses Chinese body text by a full page.
+        // the advance gate keeps Latin curly quotes in proportional fonts
+        // unchanged even though they share Unicode codepoints with CJK text.
+        let punctuation_compression = if matches!(
+            self.character_spacing_control,
+            CharacterSpacingControl::CompressPunctuation
+                | CharacterSpacingControl::CompressPunctuationAndJapaneseKana
+        ) {
+            let full_width_floor = font_props.size.raw() * 0.8;
+            let mut adjustment = 0.0f32;
+            let mut buf = [0u8; 4];
+            for ch in text
+                .chars()
+                .filter(|ch| super::fragment::punctuation_compression_side(*ch).is_some())
+            {
+                let raw = match fc.punctuation_widths.get(&ch) {
+                    Some(&width) => width,
+                    None => {
+                        let width = font.measure_str(ch.encode_utf8(&mut buf), None).0;
+                        fc.punctuation_widths.insert(ch, width);
+                        width
+                    }
+                };
+                if raw >= full_width_floor {
+                    adjustment += raw
+                        * super::fragment::PUNCTUATION_COMPRESSION_RATIO
+                        * font_props.text_scale;
+                }
+            }
+            Pt::new(adjustment)
+        } else {
+            Pt::ZERO
+        };
+
+        (
+            (scaled_width + spacing_extra - punctuation_compression).max(Pt::ZERO),
+            text_metrics,
+        )
     }
 
     /// Query font metrics for underline positioning.
@@ -278,6 +389,51 @@ mod tests {
     use super::*;
     use std::rc::Rc;
 
+    fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn simsun_like_os2() -> Vec<u8> {
+        let mut data = vec![0u8; 86];
+        put_u16(&mut data, 0, 3);
+        put_u16(&mut data, 62, 1 << 6);
+        put_u16(&mut data, 74, 220);
+        put_u16(&mut data, 76, 36);
+        put_u32(&mut data, 78, 1 << 18);
+        data
+    }
+
+    #[test]
+    fn word_cjk_metrics_use_win_extent_with_symmetric_padding() {
+        let data = simsun_like_os2();
+        let metrics = word_cjk_metrics_from_os2(&data, 256, Pt::new(14.0)).unwrap();
+        assert!((metrics.ascent.raw() - 14.109_375).abs() < 0.001);
+        assert!((metrics.descent.raw() - 4.046_875).abs() < 0.001);
+        assert!((metrics.line_height().raw() - 18.156_25).abs() < 0.001);
+        assert_eq!(metrics.leading, Pt::ZERO);
+    }
+
+    #[test]
+    fn word_cjk_metrics_leave_latin_and_typo_metric_fonts_unchanged() {
+        let mut latin = simsun_like_os2();
+        put_u32(&mut latin, 78, 0);
+        assert!(word_cjk_metrics_from_os2(&latin, 256, Pt::new(14.0)).is_none());
+
+        let mut modern_cjk = simsun_like_os2();
+        put_u16(&mut modern_cjk, 62, (1 << 6) | OS2_USE_TYPO_METRICS);
+        assert!(word_cjk_metrics_from_os2(&modern_cjk, 256, Pt::new(14.0)).is_none());
+    }
+
+    #[test]
+    fn word_cjk_metrics_reject_truncated_or_zero_em_tables() {
+        assert!(word_cjk_metrics_from_os2(&[0; 10], 256, Pt::new(14.0)).is_none());
+        assert!(word_cjk_metrics_from_os2(&simsun_like_os2(), 0, Pt::new(14.0)).is_none());
+    }
+
     fn fp_at_scale(scale: f32) -> FontProps {
         FontProps {
             family: Rc::from("Helvetica"),
@@ -287,6 +443,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::ZERO,
             text_scale: scale,
+            east_asian_language: None,
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,
         }

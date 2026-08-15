@@ -1,12 +1,14 @@
 //! Numbering resolution — flatten abstract + instance + overrides into lookup table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{
-    Alignment, Indentation, LevelSuffix, NumId, NumPicBulletId, NumberFormat, NumberingDefinitions,
-    NumberingLevelDefinition, RunProperties,
+    AbstractNumbering, Alignment, Indentation, LevelSuffix, NumId, NumPicBulletId, NumberFormat,
+    NumberingDefinitions, NumberingInstance, NumberingLevelDefinition, RunProperties, StyleId,
 };
 use crate::render::resolve::locale::Locale;
+
+use super::styles::ResolvedStyle;
 
 /// A resolved numbering level — ready for label generation.
 #[derive(Clone, Debug)]
@@ -19,6 +21,9 @@ pub struct ResolvedNumberingLevel {
     /// §17.9.3: paragraph indentation from the numbering level definition.
     /// When present, overrides the paragraph style's indentation.
     pub indentation: Option<Indentation>,
+    /// §17.9.23 / §17.3.1.21: effective value supplied by the
+    /// numbering level's paragraph properties.
+    pub overflow_punct: Option<bool>,
     /// §17.9.7: justification of the numbering symbol (left, center, right).
     pub justification: Option<Alignment>,
     /// §17.9.10: reference to a picture bullet definition.
@@ -31,42 +36,166 @@ pub struct ResolvedNumberingLevel {
 
 /// Resolve numbering definitions into a flat lookup: `NumId` →
 /// `Vec<ResolvedNumberingLevel>`.
+///
 /// Each instance's abstract definition is looked up and level overrides applied.
+/// An abstract definition with `w:numStyleLink` first resolves the linked
+/// numbering style's `w:numPr/w:numId`; the outer instance remains the lookup
+/// and counter identity, and its overrides are applied last.
 pub fn resolve_numbering(
     defs: &NumberingDefinitions,
+    styles: &HashMap<StyleId, ResolvedStyle>,
 ) -> HashMap<NumId, Vec<ResolvedNumberingLevel>> {
     let mut result = HashMap::new();
+    let mut memo = HashMap::new();
 
-    for (num_id, instance) in &defs.numbering_instances {
-        let abstract_levels = defs
-            .abstract_nums
-            .get(&instance.abstract_num_id)
-            .map(|a| a.levels.as_slice())
-            .unwrap_or(&[]);
-
-        let mut levels: Vec<ResolvedNumberingLevel> =
-            abstract_levels.iter().map(resolve_level).collect();
-
-        // Apply level overrides (§17.9.9). A `<w:lvlOverride>` may supply a full
-        // replacement `<w:lvl>` and/or a `<w:startOverride>` that restarts the
-        // level's counter.
-        for ovr in &instance.level_overrides {
-            let idx = ovr.level as usize;
-            if idx >= levels.len() {
-                continue; // override references a level beyond the abstract def
-            }
-            if let Some(def) = &ovr.definition {
-                levels[idx] = resolve_level(def);
-            }
-            if let Some(start) = ovr.start_override {
-                levels[idx].start = start;
-            }
-        }
-
-        result.insert(*num_id, levels);
+    for num_id in defs.numbering_instances.keys().copied() {
+        let levels = resolve_instance(num_id, defs, styles, &mut memo, &mut HashSet::new())
+            .unwrap_or_else(|NumberingStyleCycle| resolve_local_instance(num_id, defs));
+        result.insert(num_id, levels);
     }
 
     result
+}
+
+/// A cycle is propagated to the top-level caller instead of being converted to
+/// a memoized fallback halfway through the chain. Otherwise the levels chosen
+/// for a cycle would depend on `HashMap` iteration order.
+#[derive(Clone, Copy, Debug)]
+struct NumberingStyleCycle;
+
+fn resolve_instance(
+    num_id: NumId,
+    defs: &NumberingDefinitions,
+    styles: &HashMap<StyleId, ResolvedStyle>,
+    memo: &mut HashMap<NumId, Vec<ResolvedNumberingLevel>>,
+    visiting: &mut HashSet<NumId>,
+) -> Result<Vec<ResolvedNumberingLevel>, NumberingStyleCycle> {
+    if let Some(levels) = memo.get(&num_id) {
+        return Ok(levels.clone());
+    }
+
+    if !visiting.insert(num_id) {
+        log::warn!(
+            "cycle detected while resolving w:numStyleLink at numId={}",
+            num_id.value()
+        );
+        return Err(NumberingStyleCycle);
+    }
+
+    let resolved = (|| {
+        let Some(instance) = defs.numbering_instances.get(&num_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(abstract_num) = defs.abstract_nums.get(&instance.abstract_num_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut levels = match resolve_style_link(abstract_num, defs, styles, memo, visiting)? {
+            Some(linked) => linked,
+            None => resolve_local_levels(abstract_num),
+        };
+        apply_level_overrides(&mut levels, instance);
+        Ok(levels)
+    })();
+
+    visiting.remove(&num_id);
+    if let Ok(levels) = &resolved {
+        memo.insert(num_id, levels.clone());
+    }
+    resolved
+}
+
+fn resolve_style_link(
+    abstract_num: &AbstractNumbering,
+    defs: &NumberingDefinitions,
+    styles: &HashMap<StyleId, ResolvedStyle>,
+    memo: &mut HashMap<NumId, Vec<ResolvedNumberingLevel>>,
+    visiting: &mut HashSet<NumId>,
+) -> Result<Option<Vec<ResolvedNumberingLevel>>, NumberingStyleCycle> {
+    let Some(style_id) = abstract_num.num_style_link.as_ref() else {
+        return Ok(None);
+    };
+    let Some(style) = styles.get(style_id) else {
+        log::warn!(
+            "w:numStyleLink references missing style '{}'",
+            style_id.as_str()
+        );
+        return Ok(None);
+    };
+    let Some(numbering) = style.paragraph.numbering else {
+        log::warn!(
+            "w:numStyleLink style '{}' has no w:numPr/w:numId",
+            style_id.as_str()
+        );
+        return Ok(None);
+    };
+
+    // In paragraph properties, numId=0 explicitly removes numbering. It must
+    // never become a reference to a concrete instance that happens to use 0.
+    if numbering.num_id == 0 {
+        return Ok(None);
+    }
+
+    let linked_num_id = NumId::new(numbering.num_id);
+    let Some(linked_instance) = defs.numbering_instances.get(&linked_num_id) else {
+        log::warn!(
+            "w:numStyleLink style '{}' references missing numId={}",
+            style_id.as_str(),
+            numbering.num_id
+        );
+        return Ok(None);
+    };
+    if !defs
+        .abstract_nums
+        .contains_key(&linked_instance.abstract_num_id)
+    {
+        log::warn!(
+            "w:numStyleLink style '{}' references numId={} with missing abstractNumId={}",
+            style_id.as_str(),
+            numbering.num_id,
+            linked_instance.abstract_num_id.value()
+        );
+        return Ok(None);
+    }
+
+    resolve_instance(linked_num_id, defs, styles, memo, visiting).map(Some)
+}
+
+fn resolve_local_instance(
+    num_id: NumId,
+    defs: &NumberingDefinitions,
+) -> Vec<ResolvedNumberingLevel> {
+    let Some(instance) = defs.numbering_instances.get(&num_id) else {
+        return Vec::new();
+    };
+    let mut levels = defs
+        .abstract_nums
+        .get(&instance.abstract_num_id)
+        .map(resolve_local_levels)
+        .unwrap_or_default();
+    apply_level_overrides(&mut levels, instance);
+    levels
+}
+
+fn resolve_local_levels(abstract_num: &AbstractNumbering) -> Vec<ResolvedNumberingLevel> {
+    abstract_num.levels.iter().map(resolve_level).collect()
+}
+
+fn apply_level_overrides(levels: &mut [ResolvedNumberingLevel], instance: &NumberingInstance) {
+    // §17.9.9: a `<w:lvlOverride>` may supply a full replacement `<w:lvl>`
+    // and/or a `<w:startOverride>` that restarts the level's counter.
+    for ovr in &instance.level_overrides {
+        let idx = ovr.level as usize;
+        if idx >= levels.len() {
+            continue; // override references a level beyond the abstract def
+        }
+        if let Some(def) = &ovr.definition {
+            levels[idx] = resolve_level(def);
+        }
+        if let Some(start) = ovr.start_override {
+            levels[idx].start = start;
+        }
+    }
 }
 
 fn resolve_level(def: &NumberingLevelDefinition) -> ResolvedNumberingLevel {
@@ -76,6 +205,7 @@ fn resolve_level(def: &NumberingLevelDefinition) -> ResolvedNumberingLevel {
         start: def.start.unwrap_or(1),
         run_properties: def.run_properties.clone(),
         indentation: def.indentation,
+        overflow_punct: def.overflow_punct,
         justification: def.justification,
         lvl_pic_bullet_id: def.lvl_pic_bullet_id,
         suffix: def.suffix,
@@ -359,7 +489,15 @@ mod tests {
         NumberingDefinitions {
             abstract_nums: abstracts
                 .into_iter()
-                .map(|(id, levels)| (id, AbstractNumbering { levels }))
+                .map(|(id, levels)| {
+                    (
+                        id,
+                        AbstractNumbering {
+                            num_style_link: None,
+                            levels,
+                        },
+                    )
+                })
                 .collect(),
             numbering_instances: instances
                 .into_iter()
@@ -392,10 +530,30 @@ mod tests {
             start: Some(start),
             justification: None,
             indentation: None,
+            overflow_punct: None,
             run_properties: None,
             lvl_pic_bullet_id: None,
             suffix: LevelSuffix::default(),
             is_legal: false,
+        }
+    }
+
+    fn numbering_style(num_id: i64) -> ResolvedStyle {
+        let mut paragraph = ParagraphProperties::default();
+        paragraph.numbering = Some(NumberingReference { num_id, level: 0 });
+        ResolvedStyle {
+            paragraph,
+            run: RunProperties::default(),
+            table: None,
+            table_style_overrides: Vec::new(),
+            is_toc_entry: false,
+        }
+    }
+
+    fn instance(abstract_num_id: i64) -> NumberingInstance {
+        NumberingInstance {
+            abstract_num_id: AbstractNumId::new(abstract_num_id),
+            level_overrides: Vec::new(),
         }
     }
 
@@ -409,7 +567,7 @@ mod tests {
             vec![(NumId::new(1), AbstractNumId::new(0), vec![])],
         );
 
-        let resolved = resolve_numbering(&defs);
+        let resolved = resolve_numbering(&defs, &HashMap::new());
         let levels = resolved.get(&NumId::new(1)).unwrap();
 
         assert_eq!(levels.len(), 1);
@@ -436,7 +594,7 @@ mod tests {
             )],
         );
 
-        let resolved = resolve_numbering(&defs);
+        let resolved = resolve_numbering(&defs, &HashMap::new());
         let levels = resolved.get(&NumId::new(1)).unwrap();
 
         assert_eq!(levels.len(), 2);
@@ -452,7 +610,7 @@ mod tests {
             vec![(NumId::new(1), AbstractNumId::new(99), vec![])],
         );
 
-        let resolved = resolve_numbering(&defs);
+        let resolved = resolve_numbering(&defs, &HashMap::new());
         let levels = resolved.get(&NumId::new(1)).unwrap();
         assert!(levels.is_empty());
     }
@@ -474,7 +632,7 @@ mod tests {
             ],
         );
 
-        let resolved = resolve_numbering(&defs);
+        let resolved = resolve_numbering(&defs, &HashMap::new());
 
         let l1 = resolved.get(&NumId::new(1)).unwrap();
         assert_eq!(l1[0].level_text, "%1.");
@@ -492,6 +650,7 @@ mod tests {
         abstract_nums.insert(
             AbstractNumId::new(0),
             AbstractNumbering {
+                num_style_link: None,
                 levels: vec![level(0, NumberFormat::Decimal, "%1.", 1)],
             },
         );
@@ -512,8 +671,159 @@ mod tests {
             numbering_instances,
             pic_bullets: HashMap::new(),
         };
-        let resolved = resolve_numbering(&defs);
+        let resolved = resolve_numbering(&defs, &HashMap::new());
         assert_eq!(resolved[&NumId::new(1)][0].start, 5);
+    }
+
+    #[test]
+    fn num_style_link_resolves_recursively_and_keeps_outer_identity_and_overrides() {
+        let mut defs = NumberingDefinitions::default();
+        defs.abstract_nums.insert(
+            AbstractNumId::new(1),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("FirstLink")),
+                levels: Vec::new(),
+            },
+        );
+        defs.abstract_nums.insert(
+            AbstractNumId::new(2),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("SecondLink")),
+                levels: Vec::new(),
+            },
+        );
+        defs.abstract_nums.insert(
+            AbstractNumId::new(3),
+            AbstractNumbering {
+                num_style_link: None,
+                levels: vec![level(0, NumberFormat::Decimal, "第 %1 章", 1)],
+            },
+        );
+
+        let mut outer = instance(1);
+        outer.level_overrides.push(LevelOverride {
+            level: 0,
+            start_override: Some(7),
+            definition: None,
+        });
+        defs.numbering_instances.insert(NumId::new(50), outer);
+        defs.numbering_instances.insert(NumId::new(14), instance(2));
+        defs.numbering_instances.insert(NumId::new(24), instance(3));
+
+        let styles = HashMap::from([
+            (StyleId::new("FirstLink"), numbering_style(14)),
+            (StyleId::new("SecondLink"), numbering_style(24)),
+        ]);
+        let resolved = resolve_numbering(&defs, &styles);
+        let outer_levels = &resolved[&NumId::new(50)];
+        assert_eq!(outer_levels[0].level_text, "第 %1 章");
+        assert_eq!(outer_levels[0].start, 7, "outer override applies last");
+
+        let counters = HashMap::from([((NumId::new(50), 0), 3), ((NumId::new(24), 0), 9)]);
+        assert_eq!(
+            format_list_label(outer_levels, 0, &counters, NumId::new(50), Locale::English),
+            Some("第 3 章".to_string()),
+            "the linked levels use the outer numId counter"
+        );
+    }
+
+    #[test]
+    fn num_style_link_never_follows_num_id_zero_sentinel() {
+        let mut defs = NumberingDefinitions::default();
+        defs.abstract_nums.insert(
+            AbstractNumId::new(1),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("DisabledNumbering")),
+                levels: vec![level(0, NumberFormat::Decimal, "local-%1", 1)],
+            },
+        );
+        defs.abstract_nums.insert(
+            AbstractNumId::new(2),
+            AbstractNumbering {
+                num_style_link: None,
+                levels: vec![level(0, NumberFormat::Decimal, "wrong-%1", 1)],
+            },
+        );
+        defs.numbering_instances.insert(NumId::new(50), instance(1));
+        // A malformed producer may define concrete numId=0. The style-level
+        // zero still means "numbering off" and must not bind to this instance.
+        defs.numbering_instances.insert(NumId::new(0), instance(2));
+
+        let styles = HashMap::from([(StyleId::new("DisabledNumbering"), numbering_style(0))]);
+        let resolved = resolve_numbering(&defs, &styles);
+        assert_eq!(resolved[&NumId::new(50)][0].level_text, "local-%1");
+    }
+
+    #[test]
+    fn invalid_num_style_links_fall_back_to_local_levels() {
+        let mut defs = NumberingDefinitions::default();
+        defs.abstract_nums.insert(
+            AbstractNumId::new(1),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("MissingStyle")),
+                levels: vec![level(0, NumberFormat::Decimal, "missing-style-%1", 1)],
+            },
+        );
+        defs.abstract_nums.insert(
+            AbstractNumId::new(2),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("DanglingNumId")),
+                levels: vec![level(0, NumberFormat::Decimal, "missing-num-%1", 1)],
+            },
+        );
+        defs.abstract_nums.insert(
+            AbstractNumId::new(3),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("MissingAbstract")),
+                levels: vec![level(0, NumberFormat::Decimal, "missing-abstract-%1", 1)],
+            },
+        );
+        defs.numbering_instances.insert(NumId::new(1), instance(1));
+        defs.numbering_instances.insert(NumId::new(2), instance(2));
+        defs.numbering_instances.insert(NumId::new(3), instance(3));
+        defs.numbering_instances
+            .insert(NumId::new(998), instance(999));
+
+        let styles = HashMap::from([
+            (StyleId::new("DanglingNumId"), numbering_style(999)),
+            (StyleId::new("MissingAbstract"), numbering_style(998)),
+        ]);
+        let resolved = resolve_numbering(&defs, &styles);
+        assert_eq!(resolved[&NumId::new(1)][0].level_text, "missing-style-%1");
+        assert_eq!(resolved[&NumId::new(2)][0].level_text, "missing-num-%1");
+        assert_eq!(
+            resolved[&NumId::new(3)][0].level_text,
+            "missing-abstract-%1"
+        );
+    }
+
+    #[test]
+    fn num_style_link_cycle_falls_back_per_outer_instance_without_memoizing() {
+        let mut defs = NumberingDefinitions::default();
+        defs.abstract_nums.insert(
+            AbstractNumId::new(1),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("ToTwo")),
+                levels: vec![level(0, NumberFormat::Decimal, "one-%1", 1)],
+            },
+        );
+        defs.abstract_nums.insert(
+            AbstractNumId::new(2),
+            AbstractNumbering {
+                num_style_link: Some(StyleId::new("ToOne")),
+                levels: vec![level(0, NumberFormat::Decimal, "two-%1", 1)],
+            },
+        );
+        defs.numbering_instances.insert(NumId::new(1), instance(1));
+        defs.numbering_instances.insert(NumId::new(2), instance(2));
+        let styles = HashMap::from([
+            (StyleId::new("ToTwo"), numbering_style(2)),
+            (StyleId::new("ToOne"), numbering_style(1)),
+        ]);
+
+        let resolved = resolve_numbering(&defs, &styles);
+        assert_eq!(resolved[&NumId::new(1)][0].level_text, "one-%1");
+        assert_eq!(resolved[&NumId::new(2)][0].level_text, "two-%1");
     }
 
     #[test]
@@ -525,6 +835,7 @@ mod tests {
                 start: 1,
                 run_properties: None,
                 indentation: None,
+                overflow_punct: None,
                 justification: None,
                 lvl_pic_bullet_id: None,
                 suffix: LevelSuffix::default(),
@@ -536,6 +847,7 @@ mod tests {
                 start: 1,
                 run_properties: None,
                 indentation: None,
+                overflow_punct: None,
                 justification: None,
                 lvl_pic_bullet_id: None,
                 suffix: LevelSuffix::default(),
@@ -565,6 +877,7 @@ mod tests {
                     start: None,
                     justification: None,
                     indentation: None,
+                    overflow_punct: None,
                     run_properties: None,
                     lvl_pic_bullet_id: None,
                     suffix: LevelSuffix::default(),
@@ -574,7 +887,7 @@ mod tests {
             vec![(NumId::new(1), AbstractNumId::new(0), vec![])],
         );
 
-        let resolved = resolve_numbering(&defs);
+        let resolved = resolve_numbering(&defs, &HashMap::new());
         let levels = resolved.get(&NumId::new(1)).unwrap();
         assert_eq!(levels[0].format, NumberFormat::None);
         assert_eq!(levels[0].start, 1);

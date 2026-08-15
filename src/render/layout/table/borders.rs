@@ -461,6 +461,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -497,6 +498,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 
@@ -1005,6 +1007,7 @@ mod edge_mapping_tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 

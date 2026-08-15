@@ -53,6 +53,13 @@ pub struct ActiveFloat {
     pub width: Pt,
     /// Source of this float (image vs shape vs table).
     pub source: FloatSource,
+    /// §20.4.2.18 `wrapTopAndBottom`: this float blocks the full line
+    /// vertically instead of selecting a left/right wrapping side.
+    ///
+    /// Keep this semantic flag explicit. Inferring it from `width` also
+    /// classifies full-width Square/Tight/VML objects as vertical exclusion
+    /// bands and changes otherwise unrelated documents.
+    pub vertical_exclusion: bool,
     /// §20.4.2.20 ST_WrapText — which sides of the float text may flow on.
     /// `Table` sources default to `BothSides`; images/shapes carry the
     /// value from their `wrapSquare/Tight/Through` element.
@@ -205,6 +212,7 @@ mod tests {
             page_y_end: Pt::new(200.0),
             width: Pt::new(100.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         }];
         let (l, r) = float_adjustments(&floats, Pt::new(100.0), Pt::new(72.0), Pt::new(468.0));
@@ -220,6 +228,7 @@ mod tests {
             page_y_end: Pt::new(200.0),
             width: Pt::new(100.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         }];
         let (l, r) = float_adjustments(&floats, Pt::new(100.0), Pt::new(72.0), Pt::new(468.0));
@@ -235,6 +244,7 @@ mod tests {
             page_y_end: Pt::new(300.0),
             width: Pt::new(100.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         }];
         let (l, r) = float_adjustments(&floats, Pt::new(100.0), Pt::new(72.0), Pt::new(468.0));
@@ -251,6 +261,7 @@ mod tests {
                 page_y_end: Pt::new(100.0),
                 width: Pt::new(50.0),
                 source: FloatSource::Image,
+                vertical_exclusion: false,
                 wrap_text: WrapTextSide::BothSides,
             },
             ActiveFloat {
@@ -259,6 +270,7 @@ mod tests {
                 page_y_end: Pt::new(300.0),
                 width: Pt::new(50.0),
                 source: FloatSource::Image,
+                vertical_exclusion: false,
                 wrap_text: WrapTextSide::BothSides,
             },
         ];
@@ -276,6 +288,7 @@ mod tests {
             page_y_end: Pt::new(200.0),
             width: Pt::new(100.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::Right,
         }];
         let (l, r) = float_adjustments(&floats, Pt::new(100.0), Pt::new(72.0), Pt::new(468.0));
@@ -294,6 +307,7 @@ mod tests {
             page_y_end: Pt::new(200.0),
             width: Pt::new(100.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::Left,
         }];
         let (l, r) = float_adjustments(&floats, Pt::new(100.0), Pt::new(72.0), Pt::new(468.0));
@@ -314,6 +328,7 @@ mod tests {
             page_y_end: Pt::new(200.0),
             width: Pt::new(50.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::Largest,
         }];
         let (l, r) = float_adjustments(&floats, Pt::new(100.0), Pt::new(72.0), Pt::new(468.0));
@@ -331,6 +346,7 @@ mod tests {
             page_y_end: Pt::new(200.0),
             width: Pt::new(50.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         };
         assert!(!f.overlaps_y(Pt::new(99.0)));

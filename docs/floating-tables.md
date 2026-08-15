@@ -30,7 +30,7 @@ Everything below is an **attribute of `tblpPr`**, so all of it lives in §17.4.5
 
 ```rust
 let anchor_y = match vert_anchor {
-    Text   => last_para_start_y + y_offset,
+    Text   => cursor_y + y_offset,
     Margin => margins.top + y_offset,
     Page   => y_offset,
 };
@@ -39,11 +39,32 @@ let anchor_y = match vert_anchor {
 let float_y_start = anchor_y.max(cursor_y);
 ```
 
-The `max(cursor_y)` floor prevents the table from overlapping already-rendered paragraph content above it.
+The `max(cursor_y)` floor prevents margin- or page-relative placement from
+overlapping already-rendered paragraph content above it.
 
-### `last_para_start_y`
+### Anchor-page admission
 
-Tracked in `layout_section` — set to `cursor_y` at the start of each paragraph's processing (before spacing adjustments). Used as the anchor reference for `vertAnchor="text"`.
+The table's monolithic total height does not decide whether its anchor moves to
+the next page. A floating table may span pages, so rejecting the anchor merely
+because the *whole* table does not fit wastes usable space and shifts every
+continuation page.
+
+After resolving `tblpY`, the normal table paginator receives the exact remaining
+height (`page_bottom - anchor_y`). It keeps the table on that page when the first
+legal row group or split-row fragment fits. If nothing can legally fit, the
+paginator returns an empty anchor slice and the first non-empty slice begins on
+the next page. This keeps admission consistent with `cantSplit`, vertical-merge
+row groups, repeating headers, row splitting, footnote reservation, and
+page-specific body heights.
+
+### Text-relative anchor
+
+§17.4.58 says a floating table's logical block location is resolved relative
+to the next regular (non-table, non-frame) paragraph. At the point the table is
+laid out, `cursor_y` is that following paragraph's flow position. Therefore
+`vertAnchor="text"` adds `tblpY` to `cursor_y`; using the preceding paragraph's
+start would consume the offset inside that paragraph's own line box and can
+place the table over a large heading.
 
 ## Float Registration
 

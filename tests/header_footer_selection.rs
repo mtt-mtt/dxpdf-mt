@@ -577,6 +577,41 @@ fn pg_num_type_start_resets_on_second_section() {
     );
 }
 
+#[test]
+fn odd_numbering_restart_after_an_odd_sheet_inserts_a_blank_even_page() {
+    use dxpdf::model::PageNumberType;
+    let mut doc = empty_document();
+    doc.settings.even_and_odd_headers = true;
+
+    let s1_break = SectionProperties {
+        section_type: Some(SectionType::NextPage),
+        ..Default::default()
+    };
+    doc.final_section = SectionProperties {
+        page_number_type: Some(PageNumberType {
+            format: None,
+            start: Some(1),
+            chap_style: None,
+            chap_sep: None,
+        }),
+        ..Default::default()
+    };
+    doc.body = vec![
+        para("S1"),
+        Block::SectionBreak(Box::new(s1_break)),
+        para("S2"),
+    ];
+
+    let (_, pages) = resolve_and_layout(doc);
+    assert_eq!(pages.len(), 3);
+    assert!(page_text(&pages[0]).contains("S1"));
+    assert!(
+        page_text(&pages[1]).trim().is_empty(),
+        "the physical even separator must be genuinely blank"
+    );
+    assert!(page_text(&pages[2]).contains("S2"));
+}
+
 // ── Real-document regression ─────────────────────────────────────────────
 
 /// Regression for the `vorlage_baustellenkoordinator_v12.docx` issue:

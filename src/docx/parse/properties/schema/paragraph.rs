@@ -6,11 +6,12 @@
 
 use serde::Deserialize;
 
-use crate::docx::model::dimension::{Dimension, Twips};
+use crate::docx::model::dimension::{Dimension, HundredthChars, Twips};
 use crate::docx::model::{
-    Alignment, CnfStyle, DropCap, FirstLineIndent, FrameKind, FrameWrap, HeightRule, Indentation,
-    LineSpacing, NumberingReference, OutlineLevel, ParagraphBorders, ParagraphProperties,
-    ParagraphSpacing, RunProperties, Shading, StyleId, TabStop, TextAlignment, TextBoxPositioning,
+    Alignment, CnfStyle, DropCap, FirstLineIndent, FirstLineIndentChars, FrameKind, FrameWrap,
+    HeightRule, Indentation, LineSpacing, NumberingReference, OutlineLevel, ParagraphBorders,
+    ParagraphProperties, ParagraphSpacing, RunProperties, Shading, StyleId, TabStop, TextAlignment,
+    TextBoxPositioning,
 };
 use crate::docx::parse::primitives::st_enums::{
     StAnchor, StFrameWrap, StHeightRule, StJc, StLineSpacingRule, StTextAlignment, StXAlign,
@@ -88,6 +89,8 @@ pub(crate) struct PPrXml {
     bidi: Vec<OnOff>,
     #[serde(rename = "wordWrap", default)]
     word_wrap: Vec<OnOff>,
+    #[serde(rename = "overflowPunct", default)]
+    overflow_punct: Vec<OnOff>,
     #[serde(rename = "snapToGrid", default)]
     snap_to_grid: Vec<OnOff>,
     #[serde(rename = "autoSpaceDE", default)]
@@ -116,12 +119,20 @@ struct ValAttr<T> {
 struct IndXml {
     #[serde(rename = "@start", alias = "@left", default)]
     start: Option<Dimension<Twips>>,
+    #[serde(rename = "@startChars", alias = "@leftChars", default)]
+    start_chars: Option<Dimension<HundredthChars>>,
     #[serde(rename = "@end", alias = "@right", default)]
     end: Option<Dimension<Twips>>,
+    #[serde(rename = "@endChars", alias = "@rightChars", default)]
+    end_chars: Option<Dimension<HundredthChars>>,
     #[serde(rename = "@firstLine", default)]
     first_line: Option<Dimension<Twips>>,
+    #[serde(rename = "@firstLineChars", default)]
+    first_line_chars: Option<Dimension<HundredthChars>>,
     #[serde(rename = "@hanging", default)]
     hanging: Option<Dimension<Twips>>,
+    #[serde(rename = "@hangingChars", default)]
+    hanging_chars: Option<Dimension<HundredthChars>>,
     #[serde(rename = "@mirrorIndents", default)]
     mirror: Option<AttrBool>,
 }
@@ -133,10 +144,18 @@ impl From<IndXml> for Indentation {
             (Some(f), None) => Some(FirstLineIndent::FirstLine(f)),
             (None, None) => None,
         };
+        let first_line_chars = match (x.first_line_chars, x.hanging_chars) {
+            (_, Some(h)) => Some(FirstLineIndentChars::Hanging(h)),
+            (Some(f), None) => Some(FirstLineIndentChars::FirstLine(f)),
+            (None, None) => None,
+        };
         Self {
             start: x.start,
+            start_chars: x.start_chars,
             end: x.end,
+            end_chars: x.end_chars,
             first_line,
+            first_line_chars,
             mirror: x.mirror.map(|b| b.0),
         }
     }
@@ -316,6 +335,7 @@ impl PPrXml {
             contextual_spacing: last_toggle(self.contextual_spacing),
             bidi: last_toggle(self.bidi),
             word_wrap: last_toggle(self.word_wrap),
+            overflow_punct: last_toggle(self.overflow_punct),
             snap_to_grid: last_toggle(self.snap_to_grid),
             outline_level: self
                 .outline_lvl
@@ -421,6 +441,37 @@ mod tests {
     }
 
     #[test]
+    fn character_unit_indentation_and_legacy_aliases_are_preserved() {
+        let r =
+            parse(r#"<pPr><ind leftChars="2500" rightChars="-53" firstLineChars="200"/></pPr>"#);
+        let ind = r.properties.indentation.unwrap();
+        assert_eq!(ind.start_chars.unwrap().raw(), 2500);
+        assert_eq!(ind.end_chars.unwrap().raw(), -53);
+        assert_eq!(
+            ind.first_line_chars,
+            Some(FirstLineIndentChars::FirstLine(Dimension::new(200)))
+        );
+    }
+
+    #[test]
+    fn character_unit_zero_and_absolute_fallback_are_both_preserved() {
+        let r = parse(
+            r#"<pPr><ind startChars="0" start="720" hangingChars="0" firstLine="360"/></pPr>"#,
+        );
+        let ind = r.properties.indentation.unwrap();
+        assert_eq!(ind.start_chars.unwrap().raw(), 0);
+        assert_eq!(ind.start.unwrap().raw(), 720);
+        assert_eq!(
+            ind.first_line_chars,
+            Some(FirstLineIndentChars::Hanging(Dimension::new(0)))
+        );
+        assert_eq!(
+            ind.first_line,
+            Some(FirstLineIndent::FirstLine(Dimension::new(360)))
+        );
+    }
+
+    #[test]
     fn num_pr_both_ilvl_and_num_id() {
         let r = parse(r#"<pPr><numPr><ilvl val="2"/><numId val="5"/></numPr></pPr>"#);
         let n = r.properties.numbering.unwrap();
@@ -449,6 +500,29 @@ mod tests {
 
         let disabled = parse(r#"<pPr><snapToGrid val="0"/></pPr>"#);
         assert_eq!(disabled.properties.snap_to_grid, Some(false));
+    }
+
+    #[test]
+    fn overflow_punctuation_preserves_absent_on_off_and_last_wins() {
+        assert_eq!(parse(r#"<pPr/>"#).properties.overflow_punct, None);
+        assert_eq!(
+            parse(r#"<pPr><overflowPunct/></pPr>"#)
+                .properties
+                .overflow_punct,
+            Some(true)
+        );
+        assert_eq!(
+            parse(r#"<pPr><overflowPunct val="0"/></pPr>"#)
+                .properties
+                .overflow_punct,
+            Some(false)
+        );
+        assert_eq!(
+            parse(r#"<pPr><overflowPunct val="1"/><overflowPunct val="off"/></pPr>"#)
+                .properties
+                .overflow_punct,
+            Some(false)
+        );
     }
 
     #[test]
@@ -512,11 +586,11 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_toggles() {
+    fn all_paragraph_toggles() {
         let r = parse(
             r#"<pPr>
                 <keepNext/><keepLines/><widowControl/><pageBreakBefore/>
-                <suppressAutoHyphens/><contextualSpacing/><bidi/><wordWrap/>
+                <suppressAutoHyphens/><contextualSpacing/><bidi/><wordWrap/><overflowPunct/>
                 <autoSpaceDE/><autoSpaceDN/>
             </pPr>"#,
         );
@@ -529,6 +603,7 @@ mod tests {
         assert_eq!(p.contextual_spacing, Some(true));
         assert_eq!(p.bidi, Some(true));
         assert_eq!(p.word_wrap, Some(true));
+        assert_eq!(p.overflow_punct, Some(true));
         assert_eq!(p.auto_space_de, Some(true));
         assert_eq!(p.auto_space_dn, Some(true));
     }

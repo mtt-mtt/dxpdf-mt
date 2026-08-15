@@ -22,10 +22,13 @@ use super::BoxConstraints;
 use crate::render::dimension::Pt;
 use crate::render::geometry::{PtOffset, PtRect, PtSize};
 
-use crate::render::layout::fragment::split_oversized_fragments;
+use crate::render::layout::fragment::split_oversized_fragments_for_word_wrap;
 
 use borders::{emit_paragraph_borders_and_shading, emit_segment_borders_and_shading, SegmentEdges};
-use line_emit::{compute_line_placements, emit_line_commands, resolve_line_height};
+use line_emit::{
+    compute_line_placements, emit_line_commands, full_width_float_clearance, resolve_line_height,
+    resolved_text_baseline_ascent,
+};
 
 // ── Tab leader rendering constants ────────────────────────────────────────────
 
@@ -35,6 +38,8 @@ const LEADER_CHAR_WIDTH_FALLBACK: Pt = Pt::new(4.0);
 /// A fitted line together with the per-line float adjustments that were active when it was placed.
 struct LinePlacement {
     line: super::line::FittedLine,
+    /// Vertical space skipped before this line to clear a full-width float.
+    clearance_before: Pt,
     /// Width stolen from the left by an active float.
     float_left: Pt,
     /// Width stolen from the right by an active float.
@@ -199,10 +204,11 @@ pub(crate) fn place_paragraph<'a>(
     let first_line_adjustment = style.indent_first_line + drop_cap_indent;
 
     // Effective fragments: clip inline images wider than the content box
-    // (§20.4.2.7 — Word clips rather than scales), then split oversized text
-    // fragments into per-character fragments for narrow-cell character-level
-    // breaking. `Cow` so the common path (nothing over-wide) borrows the input
-    // without cloning; only an actual transform materializes an owned `Vec`.
+    // (§20.4.2.7 — Word clips rather than scales). Only `w:wordWrap=true`
+    // enables character-level splitting for oversized Latin words; when the
+    // property is absent Word keeps a space-delimited word intact and lets it
+    // overflow. East Asian text is already segmented at its legal character
+    // boundaries by `fragment::text`. `Cow` keeps the common path allocation-free.
     let min_avail = (content_width - first_line_adjustment).max(Pt::ZERO);
     let effective: Cow<'a, [Fragment]> = {
         let clipped: Cow<'a, [Fragment]> = match clip_oversized_images(fragments, content_width) {
@@ -212,7 +218,12 @@ pub(crate) fn place_paragraph<'a>(
         // `split_oversized_fragments` returns `None` when nothing needs
         // splitting, so the borrow survives the common case untouched — no
         // mirrored predicate, and no clone.
-        match split_oversized_fragments(&clipped, min_avail, measure_text) {
+        match split_oversized_fragments_for_word_wrap(
+            &clipped,
+            min_avail,
+            measure_text,
+            style.word_wrap,
+        ) {
             Some(split) => Cow::Owned(split),
             None => clipped,
         }
@@ -228,7 +239,18 @@ pub(crate) fn place_paragraph<'a>(
     };
     // Per-line float adjustment: fit one line at a time, computing the available
     // width for each line based on its absolute y position on the page.
-    let line_placements = compute_line_placements(&effective, style, &params);
+    // §17.3.1.21: measure the marginal advance of exactly the final eligible
+    // Unicode scalar with the same callback and FontProps used to shape the
+    // fragment. This keeps fallback, kerning, character spacing, text scaling,
+    // and punctuation compression identical to ordinary measurement.
+    let hanging_tail_widths = if style.overflow_punct {
+        measure_text
+            .map(|measure| measure_hanging_tail_widths(&effective, measure))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let line_placements = compute_line_placements(&effective, &hanging_tail_widths, style, &params);
 
     // §17.3.1.11: compute the drop cap baseline.
     // When frame_height is set (lineRule="exact"):
@@ -241,6 +263,7 @@ pub(crate) fn place_paragraph<'a>(
             let n = dc.lines.max(1) as usize;
             let mut y = style.space_before;
             for (i, lp) in line_placements.iter().enumerate().take(n) {
+                y += lp.clearance_before;
                 let natural = if lp.line.height > Pt::ZERO {
                     lp.line.height
                 } else {
@@ -253,7 +276,12 @@ pub(crate) fn place_paragraph<'a>(
                 };
                 let lh = resolve_line_height(natural, text_h, &style.line_spacing, style.auto_fit);
                 if i == n - 1 {
-                    y += lp.line.ascent;
+                    y += resolved_text_baseline_ascent(
+                        lp.line.ascent,
+                        natural,
+                        lh,
+                        &style.line_spacing,
+                    );
                     break;
                 }
                 y += lh;
@@ -278,7 +306,8 @@ pub(crate) fn place_paragraph<'a>(
             } else {
                 default_line_height
             };
-            resolve_line_height(natural, text_h, &style.line_spacing, style.auto_fit)
+            lp.clearance_before
+                + resolve_line_height(natural, text_h, &style.line_spacing, style.auto_fit)
         })
         .collect();
 
@@ -293,6 +322,39 @@ pub(crate) fn place_paragraph<'a>(
         drop_cap_baseline_y,
         line_heights,
     }
+}
+
+fn measure_hanging_tail_widths(
+    fragments: &[Fragment],
+    measure_text: &dyn Fn(&str, &super::fragment::FontProps) -> (Pt, super::fragment::TextMetrics),
+) -> Vec<Pt> {
+    fragments
+        .iter()
+        .map(|fragment| {
+            let Fragment::Text {
+                text,
+                font,
+                trimmed_width,
+                ..
+            } = fragment
+            else {
+                return Pt::ZERO;
+            };
+            let trimmed = text.trim_end_matches(super::fragment::is_trimmable_trailing_whitespace);
+            let Some((last_offset, last)) = trimmed.char_indices().next_back() else {
+                return Pt::ZERO;
+            };
+            let Some(language) = font.east_asian_language else {
+                return Pt::ZERO;
+            };
+            if !language.is_overflow_punctuation(last) {
+                return Pt::ZERO;
+            }
+
+            let prefix_width = measure_text(&trimmed[..last_offset], font).0;
+            (*trimmed_width - prefix_width).max(Pt::ZERO)
+        })
+        .collect()
 }
 
 impl PlacedParagraph<'_> {
@@ -318,7 +380,11 @@ impl PlacedParagraph<'_> {
         let float_prefix = self
             .line_placements
             .iter()
-            .rposition(|lp| lp.float_left > Pt::ZERO || lp.float_right > Pt::ZERO)
+            .rposition(|lp| {
+                lp.float_left > Pt::ZERO
+                    || lp.float_right > Pt::ZERO
+                    || lp.clearance_before > Pt::ZERO
+            })
             .map_or(0, |i| i + 1);
         self.params.drop_cap_lines.max(float_prefix)
     }
@@ -382,6 +448,7 @@ impl PlacedParagraph<'_> {
                         italic: font.italic,
                         color: *color,
                         text_scale: font.text_scale,
+                        rotation_degrees: 0.0,
                     });
                 }
             }
@@ -393,6 +460,10 @@ impl PlacedParagraph<'_> {
     pub(crate) fn emit_full(&self) -> ParagraphLayout {
         let mut commands = Vec::new();
         let mut cursor_y = self.style.space_before;
+
+        if self.line_placements.is_empty() {
+            cursor_y += full_width_float_clearance(self.style, cursor_y, self.default_line_height);
+        }
 
         self.emit_drop_cap(&mut commands);
 
@@ -531,7 +602,7 @@ pub fn layout_paragraph(
 mod tests {
     use super::*;
     use crate::model::{Alignment, PTabAlignment, PTabRelativeTo};
-    use crate::render::layout::fragment::{FontProps, LinkTarget, TextMetrics};
+    use crate::render::layout::fragment::{EastAsianLanguage, FontProps, LinkTarget, TextMetrics};
     use crate::render::resolve::color::RgbColor;
     use std::rc::Rc;
 
@@ -546,6 +617,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -564,6 +636,65 @@ mod tests {
             text_offset: Pt::ZERO,
             is_footnote_ref: false,
         }
+    }
+
+    fn manual_break(natural_height: f32, text_height: f32) -> Fragment {
+        Fragment::LineBreak {
+            line_height: Pt::new(natural_height),
+            text_height: Pt::new(text_height),
+        }
+    }
+
+    #[test]
+    fn hanging_tail_uses_the_same_measurer_and_effective_font_properties() {
+        let font = Rc::new(FontProps {
+            family: Rc::from("Test"),
+            size: Pt::new(12.0),
+            bold: false,
+            italic: false,
+            underline: false,
+            char_spacing: Pt::new(2.0),
+            text_scale: 0.75,
+            east_asian_language: Some(EastAsianLanguage::ChineseSimplified),
+            underline_position: Pt::ZERO,
+            underline_thickness: Pt::ZERO,
+        });
+        let metrics = TextMetrics {
+            ascent: Pt::new(10.0),
+            descent: Pt::new(4.0),
+            leading: Pt::ZERO,
+        };
+        let measure = |text: &str, props: &FontProps| {
+            assert_eq!(props.char_spacing, Pt::new(2.0));
+            assert_eq!(props.text_scale, 0.75);
+            let glyph_width: f32 = text
+                .chars()
+                .map(|ch| if ch == '。' { 8.0 } else { 10.0 })
+                .sum();
+            let width = glyph_width * props.text_scale
+                + props.char_spacing.raw() * text.chars().count() as f32;
+            (Pt::new(width), metrics)
+        };
+        let full_width = measure("中。", &font).0;
+        let fragment = Fragment::Text {
+            text: "中。".into(),
+            font: Rc::clone(&font),
+            color: RgbColor::BLACK,
+            width: full_width,
+            trimmed_width: full_width,
+            metrics,
+            hyperlink_url: None,
+            shading: None,
+            border: None,
+            baseline_offset: Pt::ZERO,
+            text_offset: Pt::ZERO,
+            is_footnote_ref: false,
+        };
+
+        let widths = measure_hanging_tail_widths(&[fragment], &measure);
+        let prefix_width = measure("中", &font).0;
+        assert_eq!(widths, vec![full_width - prefix_width]);
+        assert_eq!(widths[0], Pt::new(8.0));
     }
 
     fn hyperlink_frag(text: &str, width: f32, url: &str) -> Fragment {
@@ -659,6 +790,53 @@ mod tests {
     fn clip_oversized_images_guards_nonpositive_width() {
         let frags = vec![image_frag(516.0, 290.0)];
         assert!(clip_oversized_images(&frags, Pt::ZERO).is_none());
+    }
+
+    #[test]
+    fn oversized_latin_word_stays_intact_when_word_wrap_is_absent() {
+        // §17.3.1.45: the default for space-delimited languages is word-level
+        // wrapping. A short risk code in a narrow table column must overflow as
+        // one word rather than becoming the two lines "C" / "2".
+        let result = layout_paragraph(
+            &[text_frag("C2", 26.0)],
+            &body_constraints(20.0),
+            &ParagraphStyle::default(),
+            Pt::new(14.0),
+            None,
+        );
+        let text: Vec<_> = result
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text { text, position, .. } => Some((text.as_ref(), position.y.raw())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, [("C2", 10.0)]);
+    }
+
+    #[test]
+    fn explicit_word_wrap_allows_character_level_breaking() {
+        let style = ParagraphStyle {
+            word_wrap: true,
+            ..Default::default()
+        };
+        let result = layout_paragraph(
+            &[text_frag("C2", 26.0)],
+            &body_constraints(20.0),
+            &style,
+            Pt::new(14.0),
+            None,
+        );
+        let text: Vec<_> = result
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Text { text, position, .. } => Some((text.as_ref(), position.y.raw())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, [("C", 10.0), ("2", 24.0)]);
     }
 
     #[test]
@@ -1065,6 +1243,7 @@ mod tests {
             text_frag("beta", 25.0),
             Fragment::LineBreak {
                 line_height: Pt::new(14.0),
+                text_height: Pt::new(14.0),
             },
             text_frag("gamma", 30.0),
         ];
@@ -1424,6 +1603,79 @@ mod tests {
     }
 
     #[test]
+    fn auto_spacing_scales_measured_empty_manual_break_lines() {
+        let frags = vec![manual_break(11.0, 14.5), manual_break(11.0, 14.5)];
+        let style = ParagraphStyle {
+            line_spacing: LineSpacingRule::Auto(1.15),
+            ..Default::default()
+        };
+        let result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &style,
+            Pt::new(14.0),
+            None,
+        );
+
+        let expected = 2.0 * 14.5 * 1.15;
+        assert!((result.size.height.raw() - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn auto_spacing_keeps_an_ordinary_single_break_at_the_text_line_height() {
+        let frags = vec![
+            text_frag("before", 30.0),
+            manual_break(12.0, 14.0),
+            text_frag("after", 25.0),
+        ];
+        let style = ParagraphStyle {
+            line_spacing: LineSpacingRule::Auto(1.15),
+            ..Default::default()
+        };
+        let result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &style,
+            Pt::new(14.0),
+            None,
+        );
+
+        let expected = 2.0 * 14.0 * 1.15;
+        assert!((result.size.height.raw() - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn manual_break_text_metrics_do_not_change_exact_or_at_least_rules() {
+        let frags = vec![manual_break(11.0, 14.5), manual_break(11.0, 14.5)];
+        let exact = ParagraphStyle {
+            line_spacing: LineSpacingRule::Exact(Pt::new(18.0)),
+            ..Default::default()
+        };
+        let at_least = ParagraphStyle {
+            line_spacing: LineSpacingRule::AtLeast(Pt::new(12.0)),
+            ..Default::default()
+        };
+
+        let exact_result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &exact,
+            Pt::new(14.0),
+            None,
+        );
+        let at_least_result = layout_paragraph(
+            &frags,
+            &body_constraints(400.0),
+            &at_least,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(exact_result.size.height, Pt::new(36.0));
+        assert_eq!(at_least_result.size.height, Pt::new(24.0));
+    }
+
+    #[test]
     fn wrapping_produces_multiple_lines() {
         let frags = vec![
             text_frag("word1 ", 45.0),
@@ -1558,6 +1810,7 @@ mod tests {
             page_y_end: Pt::new(30.0),
             width: Pt::new(60.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         };
         let style = ParagraphStyle {
@@ -1806,6 +2059,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn document_grid_centres_the_glyph_box_in_the_reserved_line() {
+        let baseline = resolved_text_baseline_ascent(
+            Pt::new(14.109_375),
+            Pt::new(18.156_25),
+            Pt::new(36.0),
+            &LineSpacingRule::GridAuto {
+                pitch: Pt::new(18.0),
+                multiplier: 1.0,
+            },
+        );
+        assert!(
+            (baseline.raw() - 23.031_25).abs() < 0.001,
+            "Word puts half of the 17.84375pt surplus above the glyph box"
+        );
+    }
+
+    #[test]
+    fn non_grid_spacing_keeps_the_existing_baseline_position() {
+        let ascent = Pt::new(10.0);
+        assert_eq!(
+            resolved_text_baseline_ascent(
+                ascent,
+                Pt::new(14.0),
+                Pt::new(24.0),
+                &LineSpacingRule::Auto(2.0),
+            ),
+            ascent,
+        );
+        assert_eq!(
+            resolved_text_baseline_ascent(
+                ascent,
+                Pt::new(14.0),
+                Pt::new(24.0),
+                &LineSpacingRule::Exact(Pt::new(24.0)),
+            ),
+            ascent,
+        );
+    }
+
     fn ptab_frag(align: PTabAlignment, relative_to: PTabRelativeTo) -> Fragment {
         Fragment::PTab {
             align,
@@ -2047,6 +2340,7 @@ mod tests {
             page_y_end: Pt::new(30.0),
             width: Pt::new(60.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         };
         let style = ParagraphStyle {
@@ -2080,6 +2374,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn full_width_float_inserts_vertical_clearance_between_lines() {
+        use crate::render::layout::float::{ActiveFloat, FloatSource, WrapTextSide};
+        let style = ParagraphStyle {
+            page_floats: vec![ActiveFloat {
+                page_x: Pt::ZERO,
+                page_y_start: Pt::new(28.0),
+                page_y_end: Pt::new(70.0),
+                width: Pt::new(200.0),
+                source: FloatSource::Image,
+                vertical_exclusion: true,
+                wrap_text: WrapTextSide::BothSides,
+            }],
+            page_x: Pt::ZERO,
+            page_content_width: Pt::new(200.0),
+            ..Default::default()
+        };
+        let fragments: Vec<Fragment> = (0..4)
+            .map(|index| text_frag(&format!("line-{index}"), 200.0))
+            .collect();
+        let result = layout_paragraph(
+            &fragments,
+            &body_constraints(200.0),
+            &style,
+            Pt::new(14.0),
+            None,
+        );
+        let positions = text_positions(&result);
+
+        assert_eq!(positions.len(), 4, "{positions:?}");
+        assert!((positions[1].2 - positions[0].2 - 14.0).abs() < 0.01);
+        assert!(
+            (positions[2].2 - positions[1].2 - 56.0).abs() < 0.01,
+            "the third line must skip the 28-70pt band: {positions:?}",
+        );
+        assert!((positions[3].2 - positions[2].2 - 14.0).abs() < 0.01);
+    }
+
     /// A float occupying `x0..x0+60` of a 200pt line for y `0..30`.
     fn float_at(x0: f32) -> crate::render::layout::float::ActiveFloat {
         use crate::render::layout::float::{ActiveFloat, FloatSource, WrapTextSide};
@@ -2089,6 +2421,7 @@ mod tests {
             page_y_end: Pt::new(30.0),
             width: Pt::new(60.0),
             source: FloatSource::Image,
+            vertical_exclusion: false,
             wrap_text: WrapTextSide::BothSides,
         }
     }
@@ -2349,6 +2682,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::ZERO,
             text_scale: 1.0,
+            east_asian_language: None,
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,
         })

@@ -64,8 +64,16 @@ pub fn merge_paragraph_properties(target: &mut ParagraphProperties, base: &Parag
     match (&mut target.indentation, &base.indentation) {
         (Some(ref mut ti), Some(bi)) => {
             merge_opt(&mut ti.start, &bi.start);
+            // Character-unit indents are a parallel cascade, not an alternate
+            // serialization of the twip value.  Word lets a non-zero character
+            // indent survive a related absolute indent from another hierarchy
+            // level; an explicit zero blocks an earlier character value and
+            // then falls back to the absolute cascade.
+            merge_opt(&mut ti.start_chars, &bi.start_chars);
             merge_opt(&mut ti.end, &bi.end);
+            merge_opt(&mut ti.end_chars, &bi.end_chars);
             merge_opt(&mut ti.first_line, &bi.first_line);
+            merge_opt(&mut ti.first_line_chars, &bi.first_line_chars);
             merge_opt(&mut ti.mirror, &bi.mirror);
         }
         (None, Some(_)) => target.indentation = base.indentation,
@@ -99,6 +107,7 @@ pub fn merge_paragraph_properties(target: &mut ParagraphProperties, base: &Parag
         contextual_spacing,
         bidi,
         word_wrap,
+        overflow_punct,
         snap_to_grid,
         outline_level,
         text_alignment,
@@ -142,9 +151,13 @@ pub fn merge_table_properties(
     base: &Option<TableProperties>,
 ) {
     match (target.as_mut(), base.as_ref()) {
-        (Some(t), Some(b)) => {
-            merge_opt(&mut t.cell_margins, &b.cell_margins);
-        }
+        (Some(t), Some(b)) => match (&mut t.cell_margins, b.cell_margins) {
+            (Some(target_margins), Some(base_margins)) => {
+                *target_margins = target_margins.inherit_missing_from(base_margins);
+            }
+            (None, Some(base_margins)) => t.cell_margins = Some(base_margins),
+            _ => {}
+        },
         (None, Some(_)) => {
             *target = base.clone();
         }
@@ -179,7 +192,12 @@ pub fn overlay_table_properties(
     take(&mut out.layout, overlay.layout);
     take(&mut out.indent, overlay.indent);
     take(&mut out.borders, overlay.borders);
-    take(&mut out.cell_margins, overlay.cell_margins);
+    if let Some(overlay_margins) = overlay.cell_margins {
+        out.cell_margins = Some(match out.cell_margins {
+            Some(base_margins) => overlay_margins.inherit_missing_from(base_margins),
+            None => overlay_margins,
+        });
+    }
     take(&mut out.cell_spacing, overlay.cell_spacing);
     take(&mut out.look, overlay.look);
     take(&mut out.style_row_band_size, overlay.style_row_band_size);
@@ -629,6 +647,7 @@ mod tests {
             contextual_spacing: Some(true),
             bidi: Some(true),
             word_wrap: Some(true),
+            overflow_punct: Some(true),
             snap_to_grid: Some(true),
             outline_level: Some(OutlineLevel::new(1)),
             text_alignment: Some(TextAlignment::Center),
@@ -655,12 +674,60 @@ mod tests {
         assert!(target.contextual_spacing.is_some());
         assert!(target.bidi.is_some());
         assert!(target.word_wrap.is_some());
+        assert!(target.overflow_punct.is_some());
         assert!(target.snap_to_grid.is_some());
         assert!(target.outline_level.is_some());
         assert!(target.text_alignment.is_some());
         assert!(target.cnf_style.is_some());
         assert!(target.auto_space_de.is_some());
         assert!(target.auto_space_dn.is_some());
+    }
+
+    #[test]
+    fn nonzero_character_indent_survives_related_absolute_indent() {
+        let mut target = ParagraphProperties {
+            indentation: Some(Indentation {
+                start: Some(Dimension::<Twips>::new(720)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let base = ParagraphProperties {
+            indentation: Some(Indentation {
+                start_chars: Some(Dimension::new(200)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        merge_paragraph_properties(&mut target, &base);
+        let ind = target.indentation.unwrap();
+        assert_eq!(ind.start, Some(Dimension::new(720)));
+        assert_eq!(ind.start_chars, Some(Dimension::new(200)));
+    }
+
+    #[test]
+    fn explicit_zero_character_indent_clears_earlier_character_value() {
+        let mut target = ParagraphProperties {
+            indentation: Some(Indentation {
+                start_chars: Some(Dimension::new(0)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let base = ParagraphProperties {
+            indentation: Some(Indentation {
+                start: Some(Dimension::<Twips>::new(720)),
+                start_chars: Some(Dimension::new(200)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        merge_paragraph_properties(&mut target, &base);
+        let ind = target.indentation.unwrap();
+        assert_eq!(ind.start, Some(Dimension::new(720)));
+        assert_eq!(ind.start_chars, Some(Dimension::new(0)));
     }
 
     // ── wholeTable table-property overlay (§17.7.6) ──────────────────────
@@ -670,7 +737,7 @@ mod tests {
     /// setting it would be silently dropped — this fails instead.
     #[test]
     fn table_properties_overlay_covers_every_field() {
-        use crate::model::geometry::EdgeInsets;
+        use crate::model::geometry::PartialEdgeInsets;
         let overlay = TableProperties {
             style_id: Some(StyleId::new("Ignored")),
             alignment: Some(Alignment::Center),
@@ -685,12 +752,12 @@ mod tests {
                 inside_h: None,
                 inside_v: None,
             }),
-            cell_margins: Some(EdgeInsets {
-                top: Dimension::new(1),
-                right: Dimension::new(2),
-                bottom: Dimension::new(3),
-                left: Dimension::new(4),
-            }),
+            cell_margins: Some(PartialEdgeInsets::new(
+                Some(Dimension::new(1)),
+                Some(Dimension::new(2)),
+                Some(Dimension::new(3)),
+                Some(Dimension::new(4)),
+            )),
             cell_spacing: Some(TableMeasure::Twips(Dimension::new(30))),
             look: Some(TableLook {
                 first_row: Some(true),
@@ -742,15 +809,15 @@ mod tests {
     /// what the overlay specifies wins, and what it omits falls through.
     #[test]
     fn table_properties_overlay_wins_but_only_where_specified() {
-        use crate::model::geometry::EdgeInsets;
+        use crate::model::geometry::PartialEdgeInsets;
         let base = TableProperties {
             alignment: Some(Alignment::Start),
-            cell_margins: Some(EdgeInsets {
-                top: Dimension::new(9),
-                right: Dimension::new(9),
-                bottom: Dimension::new(9),
-                left: Dimension::new(9),
-            }),
+            cell_margins: Some(PartialEdgeInsets::new(
+                Some(Dimension::new(9)),
+                Some(Dimension::new(9)),
+                Some(Dimension::new(9)),
+                Some(Dimension::new(9)),
+            )),
             ..Default::default()
         };
         let overlay = TableProperties {

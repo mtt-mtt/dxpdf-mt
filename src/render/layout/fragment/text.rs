@@ -76,7 +76,7 @@ pub(super) fn resolve_highlight_color(hl: crate::model::HighlightColor) -> Optio
 }
 
 /// Resolved styling for a single text fragment.
-pub(super) struct TextRunStyle {
+pub(crate) struct TextRunStyle {
     pub color: RgbColor,
     pub shading: Option<RgbColor>,
     pub border: Option<FragmentBorder>,
@@ -196,7 +196,7 @@ pub(super) fn emit_text_fragments<F>(
 /// Skia requires the fallback typeface to be selected explicitly. Adjacent
 /// graphemes that resolve to the same family stay coalesced so ordinary text
 /// follows the unchanged word-splitting fast path.
-pub(super) fn emit_text_with_glyph_fallback<F>(
+pub(crate) fn emit_text_with_glyph_fallback<F>(
     text: &str,
     font: &FontProps,
     style: &TextRunStyle,
@@ -407,6 +407,7 @@ mod tests {
     fn cjk_text_exposes_breaks_without_whitespace() {
         assert_eq!(split_into_words("收费管理"), vec!["收", "费", "管", "理"]);
         assert_eq!(split_into_words("ABC收费"), vec!["ABC", "收", "费"]);
+        assert_eq!(split_into_words("×××。"), vec!["×", "×", "×。"]);
     }
 
     #[test]
@@ -438,6 +439,7 @@ mod tests {
             underline: false,
             char_spacing: Pt::ZERO,
             text_scale: 1.0,
+            east_asian_language: None,
             underline_position: Pt::ZERO,
             underline_thickness: Pt::ZERO,
         }

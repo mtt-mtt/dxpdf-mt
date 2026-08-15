@@ -2,7 +2,9 @@
 
 use crate::render::dimension::Pt;
 
-use crate::render::layout::cell::{layout_cell, CellLayout};
+use crate::render::layout::cell::{
+    intrinsic_rotated_cell_extent, layout_cell, layout_rotated_cell, CellLayout,
+};
 
 use super::borders::{
     border_width, resolve_border_conflict, resolve_cell_effective_borders, CellBorders, CellEdge,
@@ -239,6 +241,7 @@ pub(super) fn measure_table_rows(
     for (row_idx, row) in rows.iter().enumerate() {
         let mut entries = Vec::new();
         let mut max_height = Pt::ZERO;
+        let mut natural_content_height = Pt::ZERO;
         // §17.4.17: gridBefore — first cell offset.
         let mut grid_idx = row.grid_before as usize;
 
@@ -273,6 +276,48 @@ pub(super) fn measure_table_rows(
                     commands: Vec::new(),
                     content_height: Pt::ZERO,
                     lines: Vec::new(),
+                    footnotes: Vec::new(),
+                }
+            } else if matches!(
+                cell.text_direction,
+                Some(
+                    crate::model::TextDirection::BottomToTopLeftToRight
+                        | crate::model::TextDirection::TopToBottomRightToLeft
+                )
+            ) {
+                let physical_extent = match row.height_rule {
+                    Some(RowHeightRule::AtLeast(height) | RowHeightRule::Exact(height))
+                        if height > Pt::ZERO =>
+                    {
+                        Some(height)
+                    }
+                    _ => intrinsic_rotated_cell_extent(
+                        &cell.blocks,
+                        &cell.margins,
+                        cell.text_direction.expect("matched rotated direction"),
+                        default_line_height,
+                    ),
+                };
+                if let Some(physical_extent) = physical_extent {
+                    layout_rotated_cell(
+                        &cell.blocks,
+                        physical_extent,
+                        &cell.margins,
+                        cell.text_direction.expect("matched rotated direction"),
+                        default_line_height,
+                        measure_text,
+                    )
+                } else {
+                    log::warn!(
+                        "§17.4.70: rotated table cell has non-measurable auto-height content; using horizontal fallback"
+                    );
+                    layout_cell(
+                        &cell.blocks,
+                        layout_w,
+                        &cell.margins,
+                        default_line_height,
+                        measure_text,
+                    )
                 }
             } else {
                 layout_cell(
@@ -283,6 +328,19 @@ pub(super) fn measure_table_rows(
                     measure_text,
                 )
             };
+
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!(
+                    "[table] row={row_idx} cell={cell_ci} width={:.2}pt content_height={:.2}pt margins={:.2}/{:.2}/{:.2}/{:.2}pt lines={}",
+                    cell_w.raw(),
+                    layout.content_height.raw(),
+                    cell.margins.top.raw(),
+                    cell.margins.right.raw(),
+                    cell.margins.bottom.raw(),
+                    cell.margins.left.raw(),
+                    layout.lines.len(),
+                );
+            }
 
             // §17.4.85: a merged cell's height is normally decided by
             // `expand_rows_for_vmerge` over the whole span, not here — folding a
@@ -301,6 +359,7 @@ pub(super) fn measure_table_rows(
             let is_lone_restart =
                 cell.vertical_merge == Some(VerticalMergeState::Restart) && !continues_below;
             if cell.vertical_merge.is_none() || is_lone_restart {
+                natural_content_height = natural_content_height.max(layout.content_height);
                 max_height = max_height.max(layout.content_height + cell.margins.vertical());
             }
 
@@ -318,13 +377,25 @@ pub(super) fn measure_table_rows(
         // WPS pagination: a 38 pt exact row with the common 4 pt bottom cell
         // margin occupies 42 pt. Keeping the margin outside the exact content
         // budget also prevents the last line from colliding with the row edge.
+        let top_margin = row
+            .cells
+            .iter()
+            .map(|cell| cell.margins.top)
+            .fold(Pt::ZERO, Pt::max);
         let bottom_margin = row
             .cells
             .iter()
             .map(|cell| cell.margins.bottom)
             .fold(Pt::ZERO, Pt::max);
         match row.height_rule {
-            Some(RowHeightRule::AtLeast(min_h)) => max_height = max_height.max(min_h),
+            // §17.4.81: `atLeast` constrains the row's content box. Cell
+            // padding remains outside that minimum, so it must not disappear
+            // when `min_h` is taller than the natural content. Word takes the
+            // row-wide maximum on each edge; the two maxima may come from
+            // different cells.
+            Some(RowHeightRule::AtLeast(min_h)) => {
+                max_height = natural_content_height.max(min_h) + top_margin + bottom_margin;
+            }
             Some(RowHeightRule::Exact(h)) => max_height = h + bottom_margin,
             None => {}
         }
@@ -427,6 +498,7 @@ mod tests {
             cell_borders: borders,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 

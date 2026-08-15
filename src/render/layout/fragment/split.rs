@@ -22,10 +22,33 @@ pub type MeasureFn<'a> = Option<&'a dyn Fn(&str, &FontProps) -> (Pt, TextMetrics
 /// spelling of this test disagreed with the split itself for any non-ASCII
 /// single character — it reported "needs split", then split nothing, and the
 /// caller paid for a full clone of the fragment vector.
-fn needs_split(fragment: &Fragment, max_width: Pt) -> bool {
+fn is_fill_marker_run(text: &str) -> bool {
+    let mut marker = None;
+    for ch in text.chars() {
+        if matches!(ch, '_' | '\u{FF3F}' | '\u{00D7}') {
+            if marker.is_some_and(|known| known != ch) {
+                return false;
+            }
+            marker = Some(ch);
+        } else if !(ch.is_whitespace()
+            || matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '\u{3002}' | '\u{FF0C}' | '\u{FF1B}'
+            ))
+        {
+            return false;
+        }
+    }
+    marker.is_some()
+}
+
+fn needs_split(fragment: &Fragment, max_width: Pt, word_wrap: bool) -> bool {
     matches!(
         fragment,
-        Fragment::Text { width, text, .. } if *width > max_width && text.chars().count() > 1
+        Fragment::Text { width, text, .. }
+            if *width > max_width
+                && text.chars().count() > 1
+                && (word_wrap || is_fill_marker_run(text))
     )
 }
 
@@ -43,12 +66,28 @@ pub fn split_oversized_fragments(
     max_width: Pt,
     measure: MeasureFn<'_>,
 ) -> Option<Vec<Fragment>> {
+    split_oversized_fragments_for_word_wrap(fragments, max_width, measure, true)
+}
+
+/// Apply §17.3.1.45 character-level splitting according to the resolved
+/// `w:wordWrap` value. Repeated form-fill markers (`_`, full-width `_`, `×`)
+/// remain breakable even when ordinary words are not: Word flows these visual
+/// leaders across lines instead of treating hundreds of markers as one word.
+pub fn split_oversized_fragments_for_word_wrap(
+    fragments: &[Fragment],
+    max_width: Pt,
+    measure: MeasureFn<'_>,
+    word_wrap: bool,
+) -> Option<Vec<Fragment>> {
     // A non-positive budget can't be met by any split, and dividing by it
     // below would be meaningless.
     if max_width <= Pt::ZERO {
         return None;
     }
-    if !fragments.iter().any(|f| needs_split(f, max_width)) {
+    if !fragments
+        .iter()
+        .any(|f| needs_split(f, max_width, word_wrap))
+    {
         return None;
     }
 
@@ -73,7 +112,7 @@ pub fn split_oversized_fragments(
             result.push(frag.clone());
             continue;
         };
-        if !needs_split(frag, max_width) {
+        if !needs_split(frag, max_width, word_wrap) {
             result.push(frag.clone());
             continue;
         }
@@ -122,6 +161,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -168,6 +208,22 @@ mod tests {
                 unreachable!()
             };
             assert!((width.raw() - 30.0).abs() < 1e-4, "uniform fallback 60/2");
+        }
+    }
+
+    #[test]
+    fn absent_word_wrap_keeps_latin_word_but_splits_fill_markers() {
+        let latin = vec![text_frag("C2", 30.0)];
+        assert!(
+            split_oversized_fragments_for_word_wrap(&latin, Pt::new(20.0), None, false,).is_none()
+        );
+
+        for marker in ["____", "××××。", "＿＿＿＿"] {
+            let leaders = vec![text_frag(marker, 60.0)];
+            let result =
+                split_oversized_fragments_for_word_wrap(&leaders, Pt::new(20.0), None, false)
+                    .expect("form-fill marker run remains breakable");
+            assert_eq!(result.len(), marker.chars().count());
         }
     }
 

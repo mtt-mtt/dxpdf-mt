@@ -12,7 +12,7 @@ use crate::render::resolve::styles::ResolvedStyle;
 
 use super::convert::{
     paragraph_style_from_props, populate_image_data, populate_underline_metrics,
-    resolve_paragraph_defaults,
+    resolve_indentation, resolve_paragraph_defaults,
 };
 use super::floating::{extract_floating_images, AnchorFrame};
 use super::table::build_table;
@@ -39,7 +39,7 @@ fn should_apply_document_grid(
 /// cascade; applying only its size while retaining the style's family makes
 /// missing-font substitutions use the wrong line box and compresses forms by
 /// several points for every spacer paragraph.
-fn paragraph_mark_font(
+pub(super) fn paragraph_mark_font(
     paragraph: &Paragraph,
     resolved: &crate::render::resolve::ResolvedDocument,
     run_defaults: &model::RunProperties,
@@ -101,7 +101,19 @@ pub(super) fn build_paragraph_block(
     table_style: Option<&ResolvedStyle>,
     cond: Option<&CellConditionalFormatting>,
 ) -> Option<LayoutBlock> {
-    let (mut fragments, mut merged_props) = build_fragments(p, ctx, state, table_style, cond);
+    let (mut fragments, mut merged_props, paragraph_font_size) =
+        build_fragments(p, ctx, state, table_style, cond);
+    let indent_character_width = state.shape_auto_fit.scale_font(paragraph_font_size);
+    // §17.3.3.1 / Word compatibility: an inline page break inside a table
+    // cell cannot advance the containing row to another page. Word ignores
+    // the marker rather than turning it into an empty text line. Keeping it
+    // in the cell fragment stream makes `line_emit` charge one line per
+    // marker, inflating row height and potentially spilling the final row to
+    // a new page (for example, en_048 has two leading page breaks in a table
+    // heading that Word renders as zero-height markers).
+    if cond.is_some() {
+        suppress_table_page_breaks(&mut fragments);
+    }
     // Drain immediately: this paragraph owns exactly the references its own
     // fragment collection recorded. Draining before the drop-cap early return
     // below keeps them from leaking into the next paragraph's batch, and
@@ -134,7 +146,10 @@ pub(super) fn build_paragraph_block(
         );
         let (family, size) = paragraph_mark_font(p, ctx.resolved, &run_defaults, family, size);
         let line_height = ctx.measurer.default_line_height(&family, size);
-        fragments.push(Fragment::LineBreak { line_height });
+        fragments.push(Fragment::LineBreak {
+            line_height,
+            text_height: line_height,
+        });
     }
 
     // Word suppresses Hyperlink character style (blue/underline) for ToC
@@ -191,20 +206,8 @@ pub(super) fn build_paragraph_block(
         let margin_mode = matches!(style, model::DropCap::Margin);
         // The drop cap paragraph's own indent determines the x position.
         // This includes indent_left + indent_first_line from the cascade.
-        let dc_indent_left = merged_props
-            .indentation
-            .and_then(|i| i.start)
-            .map(Pt::from)
-            .unwrap_or(Pt::ZERO);
-        let dc_indent_first = merged_props
-            .indentation
-            .and_then(|i| i.first_line)
-            .map(|fl| match fl {
-                model::FirstLineIndent::FirstLine(v) => Pt::from(v),
-                model::FirstLineIndent::Hanging(v) => -Pt::from(v),
-                model::FirstLineIndent::None => Pt::ZERO,
-            })
-            .unwrap_or(Pt::ZERO);
+        let (dc_indent_left, _, dc_indent_first) =
+            resolve_indentation(merged_props.indentation, indent_character_width);
         // §17.3.1.33: frame height from drop cap paragraph's exact line spacing.
         let frame_height = merged_props
             .spacing
@@ -241,11 +244,13 @@ pub(super) fn build_paragraph_block(
     let outline = super::convert::paragraph_outline(p, &merged_props, state);
     let mut style = paragraph_style_from_props(
         &merged_props,
+        indent_character_width,
         Pt::from(ctx.resolved.default_tab_stop),
         state.shape_auto_fit,
         super::convert::paragraph_locale(p, ctx.resolved),
         outline,
     );
+    super::apply_overflow_punctuation_compat(&mut style, ctx, state);
     // §17.6.5 / §17.3.1.33: Exact spacing and snapToGrid=false override the
     // document grid. Auto and AtLeast do not: Word combines Auto with the grid
     // multiplier and AtLeast with the grid-backed natural line box. This is
@@ -307,9 +312,11 @@ pub(super) fn build_paragraph_block(
         if let Some(content) = ctx.resolved.footnotes.get(&note.id) {
             let display = format!("{}", note.display);
             let notes = build_note_content(&display, content, ctx, state);
-            for (_, frags, style) in notes {
-                para_footnotes.push((frags, style));
-            }
+            let paragraphs = notes
+                .into_iter()
+                .map(|(_, frags, style)| (frags, style))
+                .collect();
+            para_footnotes.push(crate::render::layout::section::LayoutFootnote { paragraphs });
         }
     }
 
@@ -339,6 +346,10 @@ pub(super) fn build_paragraph_block(
         floating_images,
         floating_shapes,
     })
+}
+
+fn suppress_table_page_breaks(fragments: &mut Vec<Fragment>) {
+    fragments.retain(|fragment| !matches!(fragment, Fragment::PageBreak { .. }));
 }
 
 /// Build note content (footnotes or endnotes) with a display number prefix.
@@ -379,7 +390,8 @@ fn build_note_blocks(
     let mut results = Vec::new();
     for (i, block) in content.iter().enumerate() {
         if let model::Block::Paragraph(p) = block {
-            let (mut frags, merged_props) = build_fragments(p, ctx, state, None, None);
+            let (mut frags, merged_props, paragraph_font_size) =
+                build_fragments(p, ctx, state, None, None);
             // §17.11.12: a footnote body may itself carry references. We don't
             // render nested footnote bodies (matching the previous behaviour),
             // but the references must be drained so they aren't attributed to
@@ -399,6 +411,7 @@ fn build_note_blocks(
                     underline: false,
                     char_spacing: Pt::ZERO,
                     text_scale: 1.0,
+                    east_asian_language: None,
                     underline_position: Pt::ZERO,
                     underline_thickness: Pt::ZERO,
                 });
@@ -428,8 +441,9 @@ fn build_note_blocks(
                     },
                 );
             }
-            let style = paragraph_style_from_props(
+            let mut style = paragraph_style_from_props(
                 &merged_props,
+                state.shape_auto_fit.scale_font(paragraph_font_size),
                 Pt::from(ctx.resolved.default_tab_stop),
                 state.shape_auto_fit,
                 super::convert::paragraph_locale(p, ctx.resolved),
@@ -438,6 +452,7 @@ fn build_note_blocks(
                 // heading decision in one place for every path.
                 super::convert::paragraph_outline(p, &merged_props, state),
             );
+            super::apply_overflow_punctuation_compat(&mut style, ctx, state);
             results.push((display_num.to_string(), frags, style));
         }
     }
@@ -480,7 +495,7 @@ pub(super) fn build_fragments(
     state: &mut BuildState,
     table_style: Option<&ResolvedStyle>,
     cond: Option<&CellConditionalFormatting>,
-) -> (Vec<Fragment>, model::ParagraphProperties) {
+) -> (Vec<Fragment>, model::ParagraphProperties, Pt) {
     // §17.7.2: resolve paragraph defaults (direct → paragraph style).
     // Doc defaults are deferred so table style/conditional can be inserted
     // between paragraph style and doc defaults in the cascade.
@@ -507,6 +522,8 @@ pub(super) fn build_fragments(
     if table_style.is_some() {
         merge_paragraph_properties(&mut merged_props, &ctx.resolved.doc_defaults_paragraph);
     }
+
+    super::list_label::apply_numbering_level_paragraph_properties(para, &mut merged_props, ctx);
 
     // §17.7.2: table style run properties override Normal.
     if let Some(ts) = table_style {
@@ -545,6 +562,7 @@ pub(super) fn build_fragments(
         default_color,
         resolved_styles: Some(&ctx.resolved.styles),
         paragraph_run_defaults: Some(&run_defaults),
+        paragraph_mark_properties: para.mark_run_properties.as_ref(),
         theme: ctx.resolved.theme.as_ref(),
         measurer: Some(ctx.measurer),
         auto_fit: state.shape_auto_fit,
@@ -562,7 +580,7 @@ pub(super) fn build_fragments(
     populate_image_data(&mut fragments, ctx.media());
     populate_underline_metrics(&mut fragments, ctx.measurer);
 
-    (fragments, merged_props)
+    (fragments, merged_props, default_size)
 }
 
 #[cfg(test)]
@@ -593,6 +611,8 @@ mod tests {
             even_and_odd_headers: false,
             default_tab_stop: Dimension::new(720),
             adjust_line_height_in_table: false,
+            do_not_wrap_text_with_punct: false,
+            character_spacing_control: model::CharacterSpacingControl::DoNotCompress,
         }
     }
 
@@ -669,7 +689,7 @@ mod tests {
                 panic!("expected a paragraph block");
             };
             assert!(
-                matches!(fragments.as_slice(), [Fragment::LineBreak { line_height }] if line_height.raw() > 0.0),
+                matches!(fragments.as_slice(), [Fragment::LineBreak { line_height, .. }] if line_height.raw() > 0.0),
                 "exactly one LineBreak with a real height"
             );
         });
@@ -812,7 +832,7 @@ mod tests {
 
         with_ctx(&resolved, |ctx, state| {
             // Table style alone.
-            let (_, props) = build_fragments(
+            let (_, props, _) = build_fragments(
                 &para(vec![text_run("x")]),
                 ctx,
                 state,
@@ -834,7 +854,7 @@ mod tests {
                     ..Default::default()
                 }),
             };
-            let (_, props) = build_fragments(
+            let (_, props, _) = build_fragments(
                 &para(vec![text_run("x")]),
                 ctx,
                 state,
@@ -869,7 +889,7 @@ mod tests {
         with_ctx(&resolved, |ctx, state| {
             let mut p = para(vec![text_run("x")]);
             p.properties.alignment = Some(model::Alignment::Both);
-            let (_, props) = build_fragments(&p, ctx, state, Some(&table_style), Some(&cond));
+            let (_, props, _) = build_fragments(&p, ctx, state, Some(&table_style), Some(&cond));
             assert_eq!(
                 props.alignment,
                 Some(model::Alignment::Both),
@@ -890,6 +910,25 @@ mod tests {
         assert!(!should_apply_document_grid(false, false, &exact, true));
         assert!(!should_apply_document_grid(true, false, &auto, true));
         assert!(should_apply_document_grid(true, true, &auto, true));
+        assert!(!should_apply_document_grid(false, false, &auto, false));
         assert!(!should_apply_document_grid(true, true, &auto, false));
     }
+}
+#[test]
+fn table_page_breaks_are_removed_without_removing_line_breaks() {
+    let mut fragments = vec![
+        Fragment::PageBreak {
+            line_height: Pt::new(12.0),
+        },
+        Fragment::LineBreak {
+            line_height: Pt::new(12.0),
+            text_height: Pt::new(12.0),
+        },
+        Fragment::PageBreak {
+            line_height: Pt::new(12.0),
+        },
+    ];
+    suppress_table_page_breaks(&mut fragments);
+    assert_eq!(fragments.len(), 1);
+    assert!(matches!(fragments[0], Fragment::LineBreak { .. }));
 }

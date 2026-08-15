@@ -315,6 +315,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 
@@ -511,6 +512,7 @@ mod tests {
                 commands: Vec::new(),
                 content_height: Pt::new(content_height),
                 lines: Vec::new(),
+                footnotes: Vec::new(),
             },
             cell_x: Pt::ZERO,
             cell_w: Pt::new(100.0),

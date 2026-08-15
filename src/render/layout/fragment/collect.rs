@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
 use crate::model::{
-    Block, FieldCharType, Inline, NoteId, RunElement, RunProperties, TextRun, VerticalAlign,
+    Block, BreakKind, FieldCharType, Inline, NoteId, RunElement, RunProperties, TextRun,
+    VerticalAlign,
 };
 use crate::render::dimension::Pt;
 use crate::render::emoji::cluster::EmojiCluster;
@@ -139,6 +140,49 @@ fn split_text_for_font_slots(text: &str) -> Vec<&str> {
         parts.push(text);
     }
     parts
+}
+
+/// Emit synthetic text through the same two-stage font selection used by
+/// ordinary OOXML runs: split at Latin/East-Asian font-slot boundaries, then
+/// resolve missing glyphs below the run level one grapheme at a time.
+///
+/// List labels and evaluated fields do not necessarily have a physical
+/// `TextRun` to feed through `resolve_run_styling`, but non-legacy synthetic
+/// text still needs the exact same script-slot and glyph-fallback semantics.
+/// Legacy Symbol/Wingdings text must stay on its remap-selected family and is
+/// deliberately kept out of this helper by the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_text_with_font_slots_and_glyph_fallback<F>(
+    text: &str,
+    font_slots: &crate::model::FontSet,
+    lang: Option<&crate::model::Lang>,
+    theme: Option<&crate::model::Theme>,
+    base_font: &FontProps,
+    style: &TextRunStyle,
+    hyperlink_url: Option<&LinkTarget>,
+    measure_text: &F,
+    measurer: &crate::render::layout::measurer::TextMeasurer<'_>,
+    fragments: &mut Vec<Fragment>,
+) where
+    F: Fn(&str, &FontProps) -> (Pt, TextMetrics),
+{
+    for text_part in split_text_for_font_slots(text) {
+        let mut font = base_font.clone();
+        if let Some(family) = crate::render::resolve::fonts::effective_font_for_text(
+            font_slots, text_part, lang, theme,
+        ) {
+            font.family = Rc::from(family);
+        }
+        emit_text_with_glyph_fallback(
+            text_part,
+            &font,
+            style,
+            hyperlink_url,
+            measure_text,
+            measurer,
+            fragments,
+        );
+    }
 }
 
 /// §17.7.2: resolve the effective styling of a single run by walking the
@@ -481,6 +525,7 @@ fn emit_field_substitution<F>(
         >,
     >,
     paragraph_run_defaults: Option<&RunProperties>,
+    paragraph_mark_properties: Option<&RunProperties>,
     theme: Option<&crate::model::Theme>,
     auto_fit: crate::render::layout::ShapeAutoFit,
     hyperlink_url: Option<&LinkTarget>,
@@ -496,10 +541,22 @@ fn emit_field_substitution<F>(
         ) => Some(*tr),
         _ => None,
     };
-    // A legacy MACROBUTTON often has no result run at all. Keep the old
-    // paragraph-default fallback for model callers that do not preserve the
-    // instruction run, but prefer the actual source run whenever available.
-    let synthetic = paragraph_run_defaults.map(|props| TextRun {
+    // The paragraph mark is not a run default for ordinary visible text.
+    // It is, however, the only paragraph-local formatting source available
+    // when a complex field has no result run, and it supplies missing fields
+    // for a legacy MACROBUTTON instruction-display run. Keep that exceptional
+    // cascade local to field fallback instead of leaking it into every run.
+    let use_mark_fallback = !matches!(source, Some(FieldFormatSource::FirstResultRun(_)));
+    let mut field_defaults = paragraph_mark_properties.cloned().unwrap_or_default();
+    if let Some(defaults) = paragraph_run_defaults {
+        crate::render::resolve::properties::merge_run_properties(&mut field_defaults, defaults);
+    }
+    let selected_defaults = if use_mark_fallback && paragraph_mark_properties.is_some() {
+        Some(&field_defaults)
+    } else {
+        paragraph_run_defaults
+    };
+    let synthetic = selected_defaults.map(|props| TextRun {
         style_id: None,
         properties: props.clone(),
         content: Vec::new(),
@@ -518,7 +575,7 @@ fn emit_field_substitution<F>(
                 default_size,
                 default_color,
                 resolved_styles,
-                paragraph_run_defaults,
+                selected_defaults,
                 theme,
                 auto_fit,
                 Some(text_part),
@@ -545,6 +602,7 @@ fn emit_field_substitution<F>(
         underline: false,
         char_spacing: Pt::ZERO,
         text_scale: 1.0,
+        east_asian_language: None,
         underline_position: Pt::ZERO,
         underline_thickness: Pt::ZERO,
     };
@@ -572,6 +630,7 @@ fn make_field_text_fragment<F>(
     default_family: &str,
     default_size: Pt,
     default_color: crate::render::resolve::color::RgbColor,
+    east_asian_language: Option<super::EastAsianLanguage>,
     measure_text: &F,
 ) -> Fragment
 where
@@ -585,6 +644,7 @@ where
         underline: false,
         char_spacing: Pt::ZERO,
         text_scale: 1.0,
+        east_asian_language,
         underline_position: Pt::ZERO,
         underline_thickness: Pt::ZERO,
     };
@@ -617,6 +677,10 @@ pub struct FragmentCtx<'a> {
         >,
     >,
     pub paragraph_run_defaults: Option<&'a RunProperties>,
+    /// Run properties on the paragraph mark (`w:pPr/w:rPr`). These do not
+    /// cascade into ordinary visible runs. They are carried separately for
+    /// empty-paragraph metrics and complex fields that have no result run.
+    pub paragraph_mark_properties: Option<&'a RunProperties>,
     pub theme: Option<&'a crate::model::Theme>,
     /// Measurer used by the emoji pipeline for typeface resolution and
     /// raster-backend metrics. `None` disables the emoji path entirely —
@@ -652,6 +716,7 @@ where
     let default_color = ctx.default_color;
     let resolved_styles = ctx.resolved_styles;
     let paragraph_run_defaults = ctx.paragraph_run_defaults;
+    let paragraph_mark_properties = ctx.paragraph_mark_properties;
     let theme = ctx.theme;
     let auto_fit = ctx.auto_fit;
     let mut fragments = Vec::new();
@@ -722,6 +787,7 @@ where
                         default_color,
                         resolved_styles,
                         paragraph_run_defaults,
+                        paragraph_mark_properties,
                         theme,
                         auto_fit,
                         hyperlink_url,
@@ -871,6 +937,7 @@ where
                                 default_color,
                                 resolved_styles,
                                 paragraph_run_defaults,
+                                paragraph_mark_properties,
                                 theme,
                                 auto_fit,
                                 hyperlink_url,
@@ -928,9 +995,25 @@ where
                                         color: text_style.color,
                                     });
                                 }
-                                RunElement::LineBreak(_) => {
+                                RunElement::LineBreak(kind) => {
+                                    // §17.3.3.1 + §17.3.1.33: a leading or
+                                    // consecutive text-wrapping break creates
+                                    // an empty visual line. Auto spacing must
+                                    // scale the same measured font line box as
+                                    // adjacent text, including real leading;
+                                    // the nominal point size is not that box.
+                                    // Clear breaks retain their existing
+                                    // height until their float-clear semantics
+                                    // are handled independently.
+                                    let text_height = match kind {
+                                        BreakKind::TextWrapping => {
+                                            measure_text("", &font).1.line_height()
+                                        }
+                                        BreakKind::Clear(_) => font.size,
+                                    };
                                     fragments.push(Fragment::LineBreak {
                                         line_height: font.size,
+                                        text_height,
                                     });
                                 }
                                 RunElement::PageBreak => {
@@ -1000,6 +1083,10 @@ where
                             default_family,
                             default_size,
                             default_color,
+                            super::EastAsianLanguage::from_lang(
+                                ctx.paragraph_run_defaults
+                                    .and_then(|props| props.lang.as_ref()),
+                            ),
                             measure_text,
                         ));
                     } else {
@@ -1081,6 +1168,7 @@ where
                                         default_color,
                                         resolved_styles,
                                         paragraph_run_defaults,
+                                        paragraph_mark_properties,
                                         theme,
                                         auto_fit,
                                         hyperlink_url,
@@ -1166,6 +1254,10 @@ where
                         underline: false,
                         char_spacing: Pt::ZERO,
                         text_scale: 1.0,
+                        east_asian_language: super::EastAsianLanguage::from_lang(
+                            ctx.paragraph_run_defaults
+                                .and_then(|props| props.lang.as_ref()),
+                        ),
                         underline_position: Pt::ZERO,
                         underline_thickness: Pt::ZERO,
                     };
@@ -1210,6 +1302,10 @@ where
                         underline: false,
                         char_spacing: Pt::ZERO,
                         text_scale: 1.0,
+                        east_asian_language: super::EastAsianLanguage::from_lang(
+                            ctx.paragraph_run_defaults
+                                .and_then(|props| props.lang.as_ref()),
+                        ),
                         underline_position: Pt::ZERO,
                         underline_thickness: Pt::ZERO,
                     };
@@ -1246,6 +1342,10 @@ where
                         underline: false,
                         char_spacing: Pt::ZERO,
                         text_scale: 1.0,
+                        east_asian_language: super::EastAsianLanguage::from_lang(
+                            ctx.paragraph_run_defaults
+                                .and_then(|props| props.lang.as_ref()),
+                        ),
                         underline_position: Pt::ZERO,
                         underline_thickness: Pt::ZERO,
                     };
@@ -1309,7 +1409,10 @@ where
                                             default_size,
                                             default_color,
                                             resolved_styles,
-                                            paragraph_run_defaults: p.mark_run_properties.as_ref(),
+                                            paragraph_run_defaults: None,
+                                            paragraph_mark_properties: p
+                                                .mark_run_properties
+                                                .as_ref(),
                                             theme,
                                             measurer: ctx.measurer,
                                             auto_fit: ctx.auto_fit,
@@ -1349,6 +1452,10 @@ mod tests {
             split_text_for_font_slots("ABC 123：中文，XYZ"),
             vec!["ABC 123：", "中文，", "XYZ"]
         );
+        assert_eq!(
+            split_text_for_font_slots("第 1 章"),
+            vec!["第 ", "1 ", "章"]
+        );
         assert_eq!(split_text_for_font_slots("（中文）"), vec!["（中文）"]);
     }
 
@@ -1371,6 +1478,7 @@ mod tests {
             default_color: RgbColor::BLACK,
             resolved_styles: None,
             paragraph_run_defaults: None,
+            paragraph_mark_properties: None,
             theme: None,
             measurer: None,
             auto_fit: crate::render::layout::ShapeAutoFit::NONE,
@@ -1477,6 +1585,40 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_visible_run_does_not_inherit_paragraph_mark_properties() {
+        let inlines = vec![text_run("body")];
+        let paragraph_defaults = RunProperties {
+            font_size: Some(Dimension::<HalfPoints>::new(22)),
+            bold: Some(false),
+            ..Default::default()
+        };
+        let paragraph_mark = RunProperties {
+            font_size: Some(Dimension::<HalfPoints>::new(40)),
+            bold: Some(true),
+            ..Default::default()
+        };
+        let mut ctx = default_ctx(11.0);
+        ctx.paragraph_run_defaults = Some(&paragraph_defaults);
+        ctx.paragraph_mark_properties = Some(&paragraph_mark);
+
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+
+        let Fragment::Text { font, .. } = &frags[0] else {
+            panic!("expected Text fragment");
+        };
+        assert_eq!(font.size, Pt::new(11.0));
+        assert!(!font.bold);
+    }
+
+    #[test]
     fn text_run_uses_run_font() {
         let inlines = vec![text_run_with_font("hi", "Arial", 24)];
         let ctx = default_ctx(10.0);
@@ -1578,6 +1720,80 @@ mod tests {
 
         assert_eq!(frags.len(), 1);
         assert!(frags[0].is_line_break());
+    }
+
+    #[test]
+    fn text_wrapping_break_carries_the_effective_run_font_line_box() {
+        let inlines = vec![Inline::TextRun(Box::new(TextRun {
+            style_id: None,
+            properties: RunProperties {
+                font_size: Some(Dimension::new(26)),
+                bold: Some(true),
+                ..Default::default()
+            },
+            content: vec![RunElement::LineBreak(BreakKind::TextWrapping)],
+            rsids: RevisionIds::default(),
+        }))];
+        let measure = |text: &str, font: &FontProps| {
+            assert_eq!(text, "", "a break needs metrics, not a glyph advance");
+            assert_eq!(font.size, Pt::new(13.0));
+            assert!(font.bold, "effective run styling reaches the measurer");
+            (
+                Pt::ZERO,
+                TextMetrics {
+                    ascent: Pt::new(9.0),
+                    descent: Pt::new(3.0),
+                    leading: Pt::new(2.5),
+                },
+            )
+        };
+        let frags = collect_fragments(
+            &inlines,
+            &default_ctx(12.0),
+            None,
+            &measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+
+        assert!(matches!(
+            frags.as_slice(),
+            [Fragment::LineBreak {
+                line_height,
+                text_height,
+            }] if *line_height == Pt::new(13.0) && *text_height == Pt::new(14.5)
+        ));
+    }
+
+    #[test]
+    fn clear_break_retains_its_pre_existing_nominal_text_height() {
+        let inlines = vec![Inline::TextRun(Box::new(TextRun {
+            style_id: None,
+            properties: RunProperties::default(),
+            content: vec![RunElement::LineBreak(BreakKind::Clear(BreakClear::All))],
+            rsids: RevisionIds::default(),
+        }))];
+        let must_not_measure = |_text: &str, _font: &FontProps| -> (Pt, TextMetrics) {
+            panic!("float-clear line breaks are outside the manual-break metrics change")
+        };
+        let frags = collect_fragments(
+            &inlines,
+            &default_ctx(12.0),
+            None,
+            &must_not_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+
+        assert!(matches!(
+            frags.as_slice(),
+            [Fragment::LineBreak {
+                line_height,
+                text_height,
+            }] if *line_height == Pt::new(12.0) && *text_height == Pt::new(12.0)
+        ));
     }
 
     #[test]
@@ -1787,6 +2003,123 @@ mod tests {
     }
 
     #[test]
+    fn field_without_result_uses_paragraph_mark_fallback_only_for_its_value() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("PAGE".into()),
+            fld_char(FieldCharType::Separate),
+            fld_char(FieldCharType::End),
+        ];
+        let paragraph_defaults = RunProperties {
+            font_size: Some(Dimension::<HalfPoints>::new(22)),
+            bold: Some(false),
+            ..Default::default()
+        };
+        let paragraph_mark = RunProperties {
+            font_size: Some(Dimension::<HalfPoints>::new(30)),
+            bold: Some(true),
+            ..Default::default()
+        };
+        let mut ctx = default_ctx(11.0);
+        ctx.paragraph_run_defaults = Some(&paragraph_defaults);
+        ctx.paragraph_mark_properties = Some(&paragraph_mark);
+
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext {
+                page_number: Some(7),
+                num_pages: None,
+            },
+        );
+
+        let Fragment::Text { text, font, .. } = &frags[0] else {
+            panic!("expected Text fragment");
+        };
+        assert_eq!(text.as_ref(), "7");
+        assert_eq!(font.size, Pt::new(15.0));
+        assert!(font.bold);
+    }
+
+    #[test]
+    fn macrobutton_format_priority_is_run_then_character_style_then_mark() {
+        let display_style_id = StyleId::new("FieldDisplay");
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrTextRun(Box::new(TextRun {
+                style_id: None,
+                properties: RunProperties::default(),
+                content: vec![RunElement::Text(
+                    " MACROBUTTON AcceptAllChangesShown ".into(),
+                )],
+                rsids: RevisionIds::default(),
+            })),
+            Inline::InstrTextRun(Box::new(TextRun {
+                style_id: Some(display_style_id.clone()),
+                properties: RunProperties {
+                    underline: Some(UnderlineStyle::Single),
+                    ..Default::default()
+                },
+                content: vec![RunElement::Text("[display]".into())],
+                rsids: RevisionIds::default(),
+            })),
+            fld_char(FieldCharType::End),
+        ];
+        let paragraph_defaults = RunProperties {
+            font_size: Some(Dimension::<HalfPoints>::new(22)),
+            bold: Some(true),
+            italic: Some(false),
+            ..Default::default()
+        };
+        let paragraph_mark = RunProperties {
+            font_size: Some(Dimension::<HalfPoints>::new(30)),
+            bold: Some(true),
+            italic: Some(false),
+            ..Default::default()
+        };
+        let mut styles = std::collections::HashMap::new();
+        styles.insert(
+            display_style_id,
+            crate::render::resolve::styles::ResolvedStyle {
+                paragraph: ParagraphProperties::default(),
+                run: RunProperties {
+                    bold: Some(false),
+                    italic: Some(true),
+                    ..Default::default()
+                },
+                table: None,
+                table_style_overrides: Vec::new(),
+                is_toc_entry: false,
+            },
+        );
+        let mut ctx = default_ctx(11.0);
+        ctx.resolved_styles = Some(&styles);
+        ctx.paragraph_run_defaults = Some(&paragraph_defaults);
+        ctx.paragraph_mark_properties = Some(&paragraph_mark);
+
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+
+        assert!(frags.iter().all(|fragment| match fragment {
+            Fragment::Text { font, .. } => {
+                font.underline && !font.bold && font.italic && font.size == Pt::new(15.0)
+            }
+            _ => true,
+        }));
+    }
+
+    #[test]
     fn macrobutton_uses_the_display_arguments_first_character_format() {
         let inlines = vec![
             fld_char(FieldCharType::Begin),
@@ -1839,6 +2172,75 @@ mod tests {
             })
             .collect();
         assert_eq!(rendered, "[placeholder]");
+    }
+
+    #[test]
+    fn toc_hyperlink_renders_macrobutton_display_and_keeps_pageref_cache() {
+        let inlines = vec![Inline::Hyperlink(Hyperlink {
+            target: HyperlinkTarget::Internal {
+                anchor: "_Toc42".into(),
+            },
+            content: vec![
+                text_run("第2章"),
+                fld_char(FieldCharType::Begin),
+                Inline::InstrText(" MACROBUTTON AcceptAllChangesShown [请输入章节名称] ".into()),
+                fld_char(FieldCharType::End),
+                fld_char(FieldCharType::Begin),
+                Inline::InstrText(" PAGEREF _Toc42 \\h ".into()),
+                fld_char(FieldCharType::Separate),
+                text_run("3"),
+                fld_char(FieldCharType::End),
+            ],
+        })];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rendered, "第2章[请输入章节名称]3");
+    }
+
+    #[test]
+    fn malformed_complex_field_keeps_its_cached_result() {
+        let inlines = vec![
+            fld_char(FieldCharType::Begin),
+            Inline::InstrText("BROKEN \"unterminated".into()),
+            fld_char(FieldCharType::Separate),
+            text_run("cached result"),
+            fld_char(FieldCharType::End),
+        ];
+        let ctx = default_ctx(12.0);
+        let frags = collect_fragments(
+            &inlines,
+            &ctx,
+            None,
+            &dummy_measure,
+            &mut FootnoteTracker::default(),
+            &mut 0,
+            FieldContext::default(),
+        );
+        let rendered: String = frags
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Text { text, .. } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rendered, "cached result");
     }
 
     #[test]

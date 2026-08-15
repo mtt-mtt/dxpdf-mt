@@ -33,9 +33,12 @@ With widths fixed, each cell is laid out under a tight width constraint via
 `layout_cell`, producing a `CellLayout` and therefore a natural height. Row
 height is the max over its cells, then adjusted by:
 
-- **§17.4.81 `RowHeightRule`** — `AtLeast(Pt)` grows to fit content;
+- **§17.4.81 `RowHeightRule`** — `AtLeast(Pt)` constrains the row's content
+  box, then preserves cell padding outside it. Its measured height is
+  `max(natural content, atLeast) + max(top cell margin) + max(bottom cell
+  margin)`; the two row-wide margin maxima may come from different cells.
   `Exact(Pt)` pins the content budget and lets content clip. Word/WPS reserve
-  the largest effective bottom cell margin after that exact budget, so the
+  only the largest effective bottom cell margin after that exact budget, so the
   measured row height is `exact + max(bottom cell margin)` (plus any table cell
   spacing handled separately).
 - **§17.4.85 vertical merge** — `expand_rows_for_vmerge` grows the rows of a
@@ -256,14 +259,37 @@ Two rules make this safe:
   whole row to the next page.
 
 Cut-point *legality* within a cell's text comes from `CellLine` records
-produced by the section stacker, not from raw draw commands — so §17.3.1.14
-`keepLines`, §17.3.1.44 widow/orphan control, and §17.3.1.15 `keepNext` are all
-honoured inside table cells exactly as they are in the body. See
-[Section Stacking](section-stacking.md).
+produced by the section stacker, not from raw draw commands. §17.3.1.14
+`keepLines` (together with bordered, shaded, and drop-cap paragraphs) still
+makes an interior paragraph cut atomic, and §17.3.1.15 `keepNext` still blocks
+a cut at that paragraph boundary.
+
+Word gives §17.4.1 row splitting a narrower widow/orphan rule than body
+pagination: once an otherwise splittable row crosses a page, an interior cut
+may leave one line of a cell paragraph on either side. Thus a two-line cell can
+split 1/1, a three-line cell can split 1/2 or 2/1, and a longer cell can end in
+a one-line continuation even when its resolved §17.3.1.44 `widowControl` is
+enabled. This exception exists only in `table::split::largest_legal_cut`;
+ordinary body paragraphs continue to use the 2/2 widow/orphan gate described
+in [Section Stacking](section-stacking.md). The row-group rules above still
+exclude `cantSplit`, vMerge spans, nested-table rows, and repeating headers
+before this interior-cut logic can run.
 
 `emit_table_rows` takes a `top_border_override` so a continuation slice still
 gets a visible top edge, even though the measured top borders were suppressed
 or resolved away.
+
+### Footnotes in cells
+
+Cell layout records every footnote together with the line that contains its
+reference. Row splitting partitions those records with the same cut used for
+text commands, so a note follows the split half that owns its reference.
+
+The paginated table path measures note bodies at page content width and charges
+their height, plus one separator gap per page, while packing rows. Each
+`TableSlice` returns the complete notes referenced by that slice to the section
+stacker. Repeated header rows do not repeat their original footnotes on later
+pages.
 
 ## Related
 

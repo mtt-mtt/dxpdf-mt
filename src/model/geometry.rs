@@ -130,6 +130,17 @@ impl<U: Unit> PartialEdgeInsets<U> {
             left: self.left.unwrap_or(default.left),
         }
     }
+
+    /// Fill only structurally absent sides from a lower-priority partial
+    /// value. Present sides, including explicit zeroes, remain authoritative.
+    pub fn inherit_missing_from(self, base: Self) -> Self {
+        Self {
+            top: self.top.or(base.top),
+            right: self.right.or(base.right),
+            bottom: self.bottom.or(base.bottom),
+            left: self.left.or(base.left),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +182,17 @@ mod tests {
             partial.resolve_against(default),
             EdgeInsets::new(tw(1), tw(2), tw(3), tw(4))
         );
+    }
+
+    #[test]
+    fn partial_inheritance_preserves_explicit_zero() {
+        let child = PartialEdgeInsets::new(Some(tw(0)), None, None, Some(tw(12)));
+        let base = PartialEdgeInsets::new(Some(tw(9)), Some(tw(8)), Some(tw(7)), Some(tw(6)));
+        let merged = child.inherit_missing_from(base);
+        assert_eq!(merged.top, Some(tw(0)), "explicit zero must win");
+        assert_eq!(merged.right, Some(tw(8)), "missing side inherits");
+        assert_eq!(merged.bottom, Some(tw(7)), "missing side inherits");
+        assert_eq!(merged.left, Some(tw(12)), "explicit value must win");
     }
 
     #[test]

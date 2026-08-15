@@ -62,6 +62,44 @@ pub(crate) fn measure_leading_table_group_height(
     )
 }
 
+/// Measure a complete, non-paginated table without emitting draw commands.
+///
+/// This is intentionally the same height formula as [`layout_table`].  It is
+/// used by the body-level `keepNext` admission predictor for a table that
+/// bridges two body blocks; it does not build or alter paginator row groups.
+pub(crate) fn measure_complete_table_height(
+    rows: &[TableRowInput],
+    col_widths: &[Pt],
+    cell_spacing: Pt,
+    default_line_height: Pt,
+    borders: Option<&TableBorderConfig>,
+    measure_text: super::paragraph::MeasureTextFn<'_>,
+    suppress_first_row_top: bool,
+) -> Option<Pt> {
+    if rows.is_empty() || col_widths.is_empty() {
+        return None;
+    }
+
+    let measured = measure_table_rows(
+        rows,
+        col_widths,
+        cell_spacing,
+        default_line_height,
+        borders,
+        measure_text,
+        suppress_first_row_top,
+    );
+    let rows_height: Pt = measured
+        .rows
+        .iter()
+        .map(|row| row.height + row.border_gap_below)
+        .sum();
+
+    // §17.4.44: every row owns its leading spacing; only the trailing table
+    // spacing remains after summing the measured rows (matching layout_table).
+    Some(rows_height + cell_spacing)
+}
+
 /// Lay out a table: compute column widths, lay out cells, emit borders.
 ///
 /// §17.4.38: `suppress_first_row_top` suppresses the top border of the first row
@@ -132,6 +170,8 @@ pub struct TableSlice {
     pub commands: Vec<super::draw_command::DrawCommand>,
     /// Size of this slice.
     pub size: PtSize,
+    /// Complete footnotes whose references occur in this slice.
+    pub footnotes: Vec<super::section::LayoutFootnote>,
 }
 
 /// Pagination parameters for `layout_table_paginated`.
@@ -148,6 +188,13 @@ pub(crate) struct TablePaginationHeights<F> {
     pub(crate) available_height: Pt,
     pub(crate) suppress_first_row_top: bool,
     pub(crate) page_height_for_slice: F,
+    /// Width used to lay out footnote bodies. `None` keeps the public
+    /// table-only API pagination-neutral while still returning note metadata.
+    pub(crate) footnote_width: Option<Pt>,
+    /// Separator budget charged once on a page that did not already contain notes.
+    pub(crate) footnote_separator_height: Pt,
+    /// Whether the first physical page already reserved a footnote separator.
+    pub(crate) first_page_has_footnotes: bool,
 }
 
 /// Lay out a table with page splitting at row boundaries.
@@ -180,11 +227,14 @@ pub fn layout_table_paginated(
             available_height: pagination.available_height,
             suppress_first_row_top: pagination.suppress_first_row_top,
             page_height_for_slice: |_| page_height,
+            footnote_width: None,
+            footnote_separator_height: Pt::ZERO,
+            first_page_has_footnotes: false,
         },
     )
 }
 
-pub(crate) fn layout_table_paginated_with_page_heights(
+pub(crate) fn layout_table_paginated_with_page_heights<F>(
     rows: &[TableRowInput],
     col_widths: &[Pt],
     // §17.4.44 `tblCellSpacing`, resolved to points (zero when unset). The grid
@@ -194,21 +244,28 @@ pub(crate) fn layout_table_paginated_with_page_heights(
     default_line_height: Pt,
     borders: Option<&TableBorderConfig>,
     measure_text: super::paragraph::MeasureTextFn<'_>,
-    pagination: TablePaginationHeights<impl FnMut(usize) -> Pt>,
-) -> Vec<TableSlice> {
+    pagination: TablePaginationHeights<F>,
+) -> Vec<TableSlice>
+where
+    F: FnMut(usize) -> Pt,
+{
     let TablePaginationHeights {
         available_height,
         suppress_first_row_top,
         mut page_height_for_slice,
+        footnote_width,
+        footnote_separator_height,
+        first_page_has_footnotes,
     } = pagination;
     if rows.is_empty() || col_widths.is_empty() {
         return vec![TableSlice {
             commands: Vec::new(),
             size: PtSize::ZERO,
+            footnotes: Vec::new(),
         }];
     }
 
-    let measured = measure_table_rows(
+    let mut measured = measure_table_rows(
         rows,
         col_widths,
         cell_spacing,
@@ -217,6 +274,60 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         measure_text,
         suppress_first_row_top,
     );
+    if let Some(footnote_width) = footnote_width {
+        let constraints = super::BoxConstraints::tight_width(footnote_width, Pt::INFINITY);
+        for row in &mut measured.rows {
+            for entry in &mut row.entries {
+                for footnote in &mut entry.layout.footnotes {
+                    footnote.page_height = footnote
+                        .footnote
+                        .paragraphs
+                        .iter()
+                        .map(|(fragments, style)| {
+                            super::paragraph::layout_paragraph(
+                                fragments,
+                                &constraints,
+                                style,
+                                default_line_height,
+                                measure_text,
+                            )
+                            .size
+                            .height
+                        })
+                        .sum();
+                }
+            }
+        }
+    }
+
+    if log::log_enabled!(log::Level::Trace) {
+        log::trace!(
+            "[table] paginate rows={} cols={} first_available={:.2}pt",
+            rows.len(),
+            col_widths.len(),
+            available_height.raw(),
+        );
+        for (row_idx, (row, measured_row)) in rows.iter().zip(&measured.rows).enumerate() {
+            let merge_restarts = row
+                .cells
+                .iter()
+                .filter(|cell| cell.vertical_merge == Some(VerticalMergeState::Restart))
+                .count();
+            let merge_continues = row
+                .cells
+                .iter()
+                .filter(|cell| cell.vertical_merge == Some(VerticalMergeState::Continue))
+                .count();
+            log::trace!(
+                "[table] row={row_idx} height={:.2}pt border_gap={:.2}pt rule={:?} header={:?} cant_split={:?} vmerge={merge_restarts}/{merge_continues}",
+                measured_row.height.raw(),
+                measured_row.border_gap_below.raw(),
+                row.height_rule,
+                row.is_header,
+                row.cant_split,
+            );
+        }
+    }
 
     // §17.4.49: contiguous header rows from index 0.
     let header_count = rows
@@ -276,12 +387,36 @@ pub(crate) fn layout_table_paginated_with_page_heights(
     let mut slices: Vec<Vec<SliceItem>> = Vec::new();
     let mut current_slice: Vec<SliceItem> = Vec::new();
     let mut remaining = available_height;
+    let mut page_has_footnotes = first_page_has_footnotes;
 
     let mut pending_groups: std::collections::VecDeque<_> = effective_groups.into();
     while let Some(group) = pending_groups.pop_front() {
-        if group.height <= remaining {
+        log::trace!(
+            "[table] consider group={}-{} height={:.2}pt remaining={:.2}pt slice={}",
+            group.start,
+            group.end,
+            group.height.raw(),
+            remaining.raw(),
+            slices.len(),
+        );
+        let group_footnote_height =
+            measured_range_footnote_height(&measured, group.start..group.end);
+        let group_footnote_cost = footnote_page_cost(
+            group_footnote_height,
+            page_has_footnotes,
+            footnote_separator_height,
+        );
+        if group.height + group_footnote_cost <= remaining {
+            log::trace!(
+                "[table] place group={}-{} on slice={} remaining_after={:.2}pt",
+                group.start,
+                group.end,
+                slices.len(),
+                (remaining - group.height - group_footnote_cost).raw(),
+            );
             current_slice.push(SliceItem::Range(group.start..group.end));
-            remaining -= group.height;
+            remaining -= group.height + group_footnote_cost;
+            page_has_footnotes |= group_footnote_height > Pt::ZERO;
             continue;
         }
 
@@ -302,9 +437,23 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             let first_end = group.start + 1;
             let first_height =
                 measured.rows[group.start].height + measured.rows[group.start].border_gap_below;
-            if first_height <= remaining {
+            let first_footnote_height = measured_row_footnote_height(&measured.rows[group.start]);
+            let first_footnote_cost = footnote_page_cost(
+                first_footnote_height,
+                page_has_footnotes,
+                footnote_separator_height,
+            );
+            if first_height + first_footnote_cost <= remaining {
+                log::trace!(
+                    "[table] continue vMerge group={}-{} after row={} at slice={}",
+                    group.start,
+                    group.end,
+                    group.start,
+                    slices.len(),
+                );
                 current_slice.push(SliceItem::Range(group.start..first_end));
-                remaining -= first_height;
+                remaining -= first_height + first_footnote_cost;
+                page_has_footnotes |= first_footnote_height > Pt::ZERO;
                 for row_idx in (first_end..group.end).rev() {
                     pending_groups.push_front(grid::RowGroup {
                         start: row_idx,
@@ -329,13 +478,26 @@ pub(crate) fn layout_table_paginated_with_page_heights(
         // splittable — vMerge spans and cantSplit rows set `splittable=false`.
         if !is_header && group.splittable && group.end - group.start == 1 {
             let row_idx = group.start;
-            let cut_input = RowCutInput {
-                mr: &measured.rows[row_idx],
-                row: &rows[row_idx],
-                available: remaining,
-            };
-            if let Some(cut) = find_row_cut(&cut_input) {
-                let parts = split_row_at(&measured.rows[row_idx], &cut);
+            if let Some(parts) = split_row_with_footnote_budget(
+                &measured.rows[row_idx],
+                &rows[row_idx],
+                remaining,
+                page_has_footnotes,
+                footnote_separator_height,
+            ) {
+                log::trace!(
+                    "[table] split row={} at {:.2}pt on slice={}",
+                    row_idx,
+                    remaining.raw(),
+                    slices.len(),
+                );
+                let first_footnote_height = measured_row_footnote_height(&parts.first);
+                let first_footnote_cost = footnote_page_cost(
+                    first_footnote_height,
+                    page_has_footnotes,
+                    footnote_separator_height,
+                );
+                remaining -= parts.first.height + first_footnote_cost;
                 current_slice.push(SliceItem::Split {
                     row_idx,
                     mr: parts.first,
@@ -343,6 +505,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 slices.push(std::mem::take(&mut current_slice));
                 // New page: start with header rows (if any).
                 remaining = page_height_for_slice(slices.len());
+                page_has_footnotes = false;
                 if header_count > 0 {
                     current_slice.push(SliceItem::Range(0..header_count));
                     remaining -= header_height;
@@ -352,28 +515,43 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 // time it exceeds the new page's remaining space.
                 let mut pending = parts.second;
                 loop {
-                    if pending.height <= remaining {
-                        remaining -= pending.height;
+                    let pending_footnote_height = measured_row_footnote_height(&pending);
+                    let pending_footnote_cost = footnote_page_cost(
+                        pending_footnote_height,
+                        page_has_footnotes,
+                        footnote_separator_height,
+                    );
+                    if pending.height + pending_footnote_cost <= remaining {
+                        remaining -= pending.height + pending_footnote_cost;
+                        page_has_footnotes |= pending_footnote_height > Pt::ZERO;
                         current_slice.push(SliceItem::Continuation {
                             row_idx,
                             mr: pending,
                         });
                         break;
                     }
-                    let sub_cut_input = RowCutInput {
-                        mr: &pending,
-                        row: &rows[row_idx],
-                        available: remaining,
-                    };
-                    match find_row_cut(&sub_cut_input) {
-                        Some(sub_cut) => {
-                            let sub = split_row_at(&pending, &sub_cut);
+                    match split_row_with_footnote_budget(
+                        &pending,
+                        &rows[row_idx],
+                        remaining,
+                        page_has_footnotes,
+                        footnote_separator_height,
+                    ) {
+                        Some(sub) => {
+                            let sub_footnote_height = measured_row_footnote_height(&sub.first);
+                            let sub_footnote_cost = footnote_page_cost(
+                                sub_footnote_height,
+                                page_has_footnotes,
+                                footnote_separator_height,
+                            );
+                            remaining -= sub.first.height + sub_footnote_cost;
                             current_slice.push(SliceItem::Continuation {
                                 row_idx,
                                 mr: sub.first,
                             });
                             slices.push(std::mem::take(&mut current_slice));
                             remaining = page_height_for_slice(slices.len());
+                            page_has_footnotes = false;
                             if header_count > 0 {
                                 current_slice.push(SliceItem::Range(0..header_count));
                                 remaining -= header_height;
@@ -427,8 +605,16 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             next_page_height
         };
         if next_remaining > remaining {
+            log::trace!(
+                "[table] spill group={}-{} to slice={} next_remaining={:.2}pt",
+                group.start,
+                group.end,
+                slices.len() + 1,
+                next_remaining.raw(),
+            );
             slices.push(std::mem::take(&mut current_slice));
             remaining = next_page_height;
+            page_has_footnotes = false;
             // §17.4.49: prepend the repeating header rows only when this group
             // sits past the headers. When advancing because a header row itself
             // doesn't fit, the row is part of the table's first appearance —
@@ -438,17 +624,23 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 remaining -= header_height;
             }
         }
-        if group.height > remaining {
+        let group_footnote_cost = footnote_page_cost(
+            group_footnote_height,
+            page_has_footnotes,
+            footnote_separator_height,
+        );
+        if group.height + group_footnote_cost > remaining {
             log::warn!(
-                "[table] row group {}-{} ({:.1}pt) exceeds page height ({:.1}pt available)",
+                "[table] row group {}-{} including footnotes ({:.1}pt) exceeds page height ({:.1}pt available)",
                 group.start,
                 group.end,
-                group.height.raw(),
+                (group.height + group_footnote_cost).raw(),
                 remaining.raw(),
             );
         }
         current_slice.push(SliceItem::Range(group.start..group.end));
-        remaining -= group.height;
+        remaining -= group.height + group_footnote_cost;
+        page_has_footnotes |= group_footnote_height > Pt::ZERO;
     }
     slices.push(current_slice);
 
@@ -466,6 +658,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             let mut commands = Vec::new();
             let mut content_commands = Vec::new();
             let mut border_commands = Vec::new();
+            let mut footnotes = Vec::new();
             let mut cursor_y = Pt::ZERO;
             for (item_idx, item) in items.iter().enumerate() {
                 // First item on each continuation slice (slice_idx > 0) needs
@@ -479,6 +672,15 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                 };
                 match item {
                     SliceItem::Range(range) => {
+                        let repeated_header =
+                            slice_idx > 0 && range.start == 0 && range.end <= header_count;
+                        if !repeated_header {
+                            append_measured_range_footnotes(
+                                &measured,
+                                range.clone(),
+                                &mut footnotes,
+                            );
+                        }
                         emit_table_rows(
                             &measured,
                             rows,
@@ -493,6 +695,7 @@ pub(crate) fn layout_table_paginated_with_page_heights(
                         );
                     }
                     SliceItem::Split { row_idx, mr } | SliceItem::Continuation { row_idx, mr } => {
+                        append_measured_row_footnotes(mr, &mut footnotes);
                         // A split half's bottom border sits in a reserved gap
                         // only when something follows it on *this* slice. The
                         // last item on a page ends at a cut or page edge, where
@@ -529,9 +732,94 @@ pub(crate) fn layout_table_paginated_with_page_heights(
             TableSlice {
                 commands,
                 size: PtSize::new(measured.table_width, cursor_y + trailing_gap),
+                footnotes,
             }
         })
         .collect()
+}
+
+fn measured_row_footnote_height(row: &types::MeasuredRow) -> Pt {
+    row.entries
+        .iter()
+        .flat_map(|entry| &entry.layout.footnotes)
+        .map(|footnote| footnote.page_height)
+        .sum()
+}
+
+fn measured_range_footnote_height(
+    measured: &types::MeasuredTable,
+    range: std::ops::Range<usize>,
+) -> Pt {
+    measured.rows[range]
+        .iter()
+        .map(measured_row_footnote_height)
+        .sum()
+}
+
+fn footnote_page_cost(height: Pt, page_has_footnotes: bool, separator_height: Pt) -> Pt {
+    if height <= Pt::ZERO {
+        Pt::ZERO
+    } else if page_has_footnotes {
+        height
+    } else {
+        height + separator_height
+    }
+}
+
+fn split_row_with_footnote_budget(
+    measured: &types::MeasuredRow,
+    row: &types::TableRowInput,
+    available: Pt,
+    page_has_footnotes: bool,
+    separator_height: Pt,
+) -> Option<split::SplitRow> {
+    let mut body_budget = available;
+    loop {
+        let cut = find_row_cut(&RowCutInput {
+            mr: measured,
+            row,
+            available: body_budget,
+        })?;
+        let parts = split_row_at(measured, &cut);
+        let note_cost = footnote_page_cost(
+            measured_row_footnote_height(&parts.first),
+            page_has_footnotes,
+            separator_height,
+        );
+        if parts.first.height + note_cost <= available {
+            return Some(parts);
+        }
+        let reduced = (available - note_cost).max(Pt::ZERO);
+        if reduced >= body_budget {
+            return None;
+        }
+        body_budget = reduced;
+    }
+}
+
+fn append_measured_row_footnotes(
+    row: &types::MeasuredRow,
+    output: &mut Vec<super::section::LayoutFootnote>,
+) {
+    for entry in &row.entries {
+        output.extend(
+            entry
+                .layout
+                .footnotes
+                .iter()
+                .map(|footnote| footnote.footnote.clone()),
+        );
+    }
+}
+
+fn append_measured_range_footnotes(
+    measured: &types::MeasuredTable,
+    range: std::ops::Range<usize>,
+    output: &mut Vec<super::section::LayoutFootnote>,
+) {
+    for row in &measured.rows[range] {
+        append_measured_row_footnotes(row, output);
+    }
 }
 
 /// One item inside a page slice's emit list.
@@ -560,7 +848,7 @@ mod tests {
     use crate::render::geometry::PtEdgeInsets;
     use crate::render::layout::fragment::{FontProps, Fragment, TextMetrics};
     use crate::render::layout::paragraph::ParagraphStyle;
-    use crate::render::layout::section::LayoutBlock;
+    use crate::render::layout::section::{LayoutBlock, LayoutFootnote};
     use crate::render::resolve::color::RgbColor;
     use std::rc::Rc;
 
@@ -575,6 +863,7 @@ mod tests {
                 underline: false,
                 char_spacing: Pt::ZERO,
                 text_scale: 1.0,
+                east_asian_language: None,
                 underline_position: Pt::ZERO,
                 underline_thickness: Pt::ZERO,
             }),
@@ -611,6 +900,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: None,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         }
     }
 
@@ -653,6 +943,56 @@ mod tests {
             .filter(|c| matches!(c, DrawCommand::Text { .. }))
             .count();
         assert_eq!(text_count, 1);
+    }
+
+    #[test]
+    fn complete_height_measurement_matches_monolithic_layout() {
+        let rows = vec![TableRowInput {
+            cells: vec![simple_cell("measured")],
+            height_rule: None,
+            is_header: None,
+            cant_split: None,
+            grid_before: 0,
+            border_overrides: None,
+        }];
+        let col_widths = vec![Pt::new(200.0)];
+        let border = TableBorderLine {
+            width: Pt::new(2.0),
+            color: RgbColor::BLACK,
+            style: TableBorderStyle::Single,
+        };
+        let borders = TableBorderConfig {
+            top: Some(border),
+            bottom: Some(border),
+            left: None,
+            right: None,
+            inside_h: None,
+            inside_v: None,
+        };
+        let cell_spacing = Pt::new(3.0);
+
+        let laid_out = layout_table(
+            &rows,
+            &col_widths,
+            cell_spacing,
+            Pt::new(14.0),
+            Some(&borders),
+            None,
+            false,
+        );
+        let measured = measure_complete_table_height(
+            &rows,
+            &col_widths,
+            cell_spacing,
+            Pt::new(14.0),
+            Some(&borders),
+            None,
+            false,
+        )
+        .expect("non-empty table has a complete height");
+
+        assert_eq!(measured, laid_out.size.height);
+        assert!(measured > Pt::new(14.0) + cell_spacing);
     }
 
     #[test]
@@ -718,6 +1058,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: None,
                     vertical_align: CellVAlign::Top,
+                    text_direction: None,
                 },
             ],
             height_rule: None,
@@ -742,7 +1083,61 @@ mod tests {
     }
 
     #[test]
-    fn min_row_height_respected() {
+    fn at_least_row_height_adds_row_wide_vertical_cell_margins() {
+        let mut top_cell = simple_cell("top");
+        top_cell.margins = PtEdgeInsets::new(Pt::new(3.0), Pt::ZERO, Pt::ZERO, Pt::ZERO);
+        let mut bottom_cell = simple_cell("bottom");
+        bottom_cell.margins = PtEdgeInsets::new(Pt::ZERO, Pt::ZERO, Pt::new(4.0), Pt::ZERO);
+        let rows = vec![TableRowInput {
+            cells: vec![top_cell, bottom_cell],
+            height_rule: Some(RowHeightRule::AtLeast(Pt::new(40.0))),
+            is_header: None,
+            cant_split: None,
+            grid_before: 0,
+            border_overrides: None,
+        }];
+        let result = layout_table(
+            &rows,
+            &[Pt::new(100.0), Pt::new(100.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            result.size.height.raw(),
+            47.0,
+            "40pt content minimum plus row-wide 3pt top and 4pt bottom margins"
+        );
+    }
+
+    #[test]
+    fn at_least_row_height_adds_margins_after_taller_natural_content() {
+        let mut row = tall_row(3);
+        row.cells[0].margins = PtEdgeInsets::new(Pt::new(3.0), Pt::ZERO, Pt::new(4.0), Pt::ZERO);
+        row.height_rule = Some(RowHeightRule::AtLeast(Pt::new(40.0)));
+
+        let result = layout_table(
+            &[row],
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            result.size.height.raw(),
+            49.0,
+            "42pt natural content plus 3pt top and 4pt bottom margins"
+        );
+    }
+
+    #[test]
+    fn at_least_row_height_with_zero_margins_stays_declared_height() {
         let rows = vec![TableRowInput {
             cells: vec![simple_cell("x")],
             height_rule: Some(RowHeightRule::AtLeast(Pt::new(40.0))),
@@ -821,6 +1216,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: None,
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -865,6 +1261,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: None,
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -1112,6 +1509,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: Some(VerticalMergeState::Restart),
                     vertical_align: CellVAlign::Top,
+                    text_direction: None,
                 },
                 simple_cell("header"),
             ],
@@ -1132,6 +1530,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: Some(VerticalMergeState::Continue),
                     vertical_align: CellVAlign::Top,
+                    text_direction: None,
                 },
                 simple_cell("row1col2"),
             ],
@@ -1209,6 +1608,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: None,
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -1322,6 +1722,7 @@ mod tests {
             cell_borders: None,
             vertical_merge: Some(state),
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         };
         let rows = vec![
             TableRowInput {
@@ -1355,6 +1756,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: None,
                     vertical_align: CellVAlign::Top,
+                    text_direction: None,
                 }],
                 height_rule: None,
                 is_header: None,
@@ -1425,6 +1827,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: Some(VerticalMergeState::Restart),
                     vertical_align: CellVAlign::Bottom,
+                    text_direction: None,
                 },
                 simple_cell("header"),
             ],
@@ -1444,6 +1847,7 @@ mod tests {
                     cell_borders: None,
                     vertical_merge: Some(VerticalMergeState::Continue),
                     vertical_align: CellVAlign::Top,
+                    text_direction: None,
                 },
                 simple_cell("value"),
             ],
@@ -1521,6 +1925,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: None,
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -1556,6 +1961,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: None,
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -1631,6 +2037,109 @@ mod tests {
     }
 
     #[test]
+    fn table_footnote_reserves_space_on_reference_page() {
+        let mut reference = text_frag("1", 10.0);
+        if let Fragment::Text {
+            is_footnote_ref, ..
+        } = &mut reference
+        {
+            *is_footnote_ref = true;
+        }
+        let noted_row = one_cell_row(vec![LayoutBlock::Paragraph {
+            fragments: vec![reference],
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![LayoutFootnote {
+                paragraphs: vec![(
+                    vec![text_frag("note body", 40.0)],
+                    ParagraphStyle::default(),
+                )],
+            }],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        }]);
+        let mut rows = vec![noted_row];
+        rows.extend((0..4).map(|_| one_cell_row(vec![styled_para(1, ParagraphStyle::default())])));
+
+        let slices = layout_table_paginated_with_page_heights(
+            &rows,
+            &[Pt::new(200.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            TablePaginationHeights {
+                available_height: Pt::new(75.0),
+                suppress_first_row_top: false,
+                page_height_for_slice: |_| Pt::new(75.0),
+                footnote_width: Some(Pt::new(200.0)),
+                footnote_separator_height: Pt::new(4.0),
+                first_page_has_footnotes: false,
+            },
+        );
+
+        assert_eq!(slices.len(), 2, "the note must displace the fifth row");
+        assert_eq!(slices[0].footnotes.len(), 1);
+        assert!(slices[1].footnotes.is_empty());
+        assert_eq!(slice_line_count(&slices[0]), 4);
+        assert_eq!(slice_line_count(&slices[1]), 1);
+    }
+
+    #[test]
+    fn split_table_row_moves_footnote_with_its_reference_line() {
+        let mut fragments: Vec<Fragment> =
+            (0..6).map(|i| text_frag(&format!("L{i} "), 30.0)).collect();
+        if let Fragment::Text {
+            is_footnote_ref, ..
+        } = &mut fragments[4]
+        {
+            *is_footnote_ref = true;
+        }
+        let rows = vec![one_cell_row(vec![LayoutBlock::Paragraph {
+            fragments,
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![LayoutFootnote {
+                paragraphs: vec![(
+                    vec![text_frag("late note", 40.0)],
+                    ParagraphStyle::default(),
+                )],
+            }],
+            floating_images: vec![],
+            floating_shapes: vec![],
+        }])];
+
+        let slices = layout_table_paginated_with_page_heights(
+            &rows,
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            TablePaginationHeights {
+                available_height: Pt::new(50.0),
+                suppress_first_row_top: false,
+                page_height_for_slice: |_| Pt::new(200.0),
+                footnote_width: Some(Pt::new(200.0)),
+                footnote_separator_height: Pt::new(4.0),
+                first_page_has_footnotes: false,
+            },
+        );
+
+        assert!(slices.len() >= 2);
+        assert!(slices[0].footnotes.is_empty());
+        assert_eq!(
+            slices
+                .iter()
+                .skip(1)
+                .map(|slice| slice.footnotes.len())
+                .sum::<usize>(),
+            1,
+            "the note body must follow the continuation containing its reference",
+        );
+    }
+
+    #[test]
     fn cant_split_row_moves_whole_to_next_page() {
         // cantSplit=true ⇒ entire row moves when it doesn't fit.
         let mut row = tall_row(6);
@@ -1665,6 +2174,39 @@ mod tests {
             .count();
         assert_eq!(count0, 0, "first slice has no text with cantSplit");
         assert_eq!(count1, 6, "all 6 lines on second slice");
+    }
+
+    #[test]
+    fn at_least_row_margins_count_against_the_pagination_budget() {
+        let mut row = tall_row(1);
+        row.cells[0].margins = PtEdgeInsets::new(Pt::new(3.0), Pt::ZERO, Pt::new(4.0), Pt::ZERO);
+        row.height_rule = Some(RowHeightRule::AtLeast(Pt::new(40.0)));
+        row.cant_split = Some(true);
+
+        let slices = layout_table_paginated(
+            &[row],
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(45.0),
+                page_height: Pt::new(100.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert_eq!(
+            slices.len(),
+            2,
+            "the corrected 47pt row must not fit a 45pt first-page budget"
+        );
+        assert!(
+            slices[0].commands.is_empty(),
+            "the unsplittable row moves whole"
+        );
+        assert_eq!(slices[1].size.height.raw(), 47.0);
     }
 
     #[test]
@@ -1730,6 +2272,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: Some(VerticalMergeState::Restart),
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -1746,6 +2289,7 @@ mod tests {
                 cell_borders: None,
                 vertical_merge: Some(VerticalMergeState::Continue),
                 vertical_align: CellVAlign::Top,
+                text_direction: None,
             }],
             height_rule: None,
             is_header: None,
@@ -1799,6 +2343,7 @@ mod tests {
             cell_borders: None,
             vertical_merge,
             vertical_align: CellVAlign::Top,
+            text_direction: None,
         };
         let rows: Vec<TableRowInput> = (0..5)
             .map(|row_idx| TableRowInput {
@@ -2015,6 +2560,9 @@ mod tests {
                     1 => Pt::new(30.0),
                     _ => Pt::new(60.0),
                 },
+                footnote_width: None,
+                footnote_separator_height: Pt::ZERO,
+                first_page_has_footnotes: false,
             },
         );
 
@@ -2168,13 +2716,40 @@ mod tests {
         assert!(!slices[1].commands.is_empty());
     }
 
-    // ── In-cell paragraph splitting semantics (§17.3.1.14/.15/.44) ───────
+    // ── In-cell paragraph splitting semantics (§17.4.1/.3.1.14/.15) ──────
 
     #[test]
-    fn widow_control_keeps_two_cell_lines_on_each_side_of_a_split() {
-        // §17.3.1.44: a 6-line cell paragraph where 5 lines would fit must not
-        // strand a single-line widow — the split leaves 4 on page 1 and 2 on
-        // page 2 (not 5 + 1).
+    fn table_row_split_allows_two_line_paragraph_to_divide_one_one() {
+        // Word applies row-splitting semantics here rather than the body
+        // widow/orphan 2/2 gate: one line may remain on each page.
+        let rows = vec![one_cell_row(vec![styled_para(
+            2,
+            ParagraphStyle::default(),
+        )])];
+        let slices = layout_table_paginated(
+            &rows,
+            &[Pt::new(40.0)],
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+            None,
+            &TablePaginationConfig {
+                available_height: Pt::new(14.0),
+                page_height: Pt::new(200.0),
+                suppress_first_row_top: false,
+            },
+        );
+
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slice_line_count(&slices[0]), 1);
+        assert_eq!(slice_line_count(&slices[1]), 1);
+    }
+
+    #[test]
+    fn body_widow_control_does_not_limit_an_interior_table_row_cut() {
+        // A 6-line cell paragraph where 5 lines fit splits 5/1 even though its
+        // resolved paragraph style has widow control enabled. The same style
+        // in body pagination still uses the ordinary 2/2 gate.
         let rows = vec![one_cell_row(vec![styled_para(
             6,
             ParagraphStyle::default(),
@@ -2193,15 +2768,15 @@ mod tests {
             },
         );
         assert_eq!(slices.len(), 2);
-        assert_eq!(slice_line_count(&slices[0]), 4, "orphan side keeps >= 2");
-        assert_eq!(slice_line_count(&slices[1]), 2, "widow side keeps >= 2");
+        assert_eq!(slice_line_count(&slices[0]), 5);
+        assert_eq!(slice_line_count(&slices[1]), 1);
     }
 
     #[test]
-    fn without_widow_control_a_cell_paragraph_may_strand_one_line() {
-        // Same geometry, widow control off (§17.3.1.44 disabled) ⇒ the cell
-        // splits as far as it fits: 5 lines on page 1, 1 on page 2. This is the
-        // behaviour the widow-control test above suppresses.
+    fn explicit_widow_off_matches_default_table_row_split_semantics() {
+        // Explicit widowControl=off and the default widow-on style produce the
+        // same table-row cut. This pins that only the table-row context owns
+        // the exception; parsing the paragraph property remains unchanged.
         let style = ParagraphStyle {
             widow_control: false,
             ..Default::default()
@@ -2259,13 +2834,16 @@ mod tests {
 
     #[test]
     fn cell_splits_at_paragraph_boundary_when_neither_paragraph_can_split() {
-        // Two 3-line paragraphs: neither can split under widow control (a
-        // 3-line paragraph has no ≥2/≥2 cut). With 4 lines of room the cell
-        // must break at the *paragraph boundary* — 3 lines (para A) on page 1,
-        // 3 (para B) on page 2 — not mid-paragraph.
+        // Two keepLines paragraphs cannot split internally. With 4 lines of
+        // room the cell must therefore break at the paragraph boundary — 3
+        // lines (para A) on page 1, 3 (para B) on page 2.
+        let keep_lines = ParagraphStyle {
+            keep_lines: true,
+            ..Default::default()
+        };
         let rows = vec![one_cell_row(vec![
-            styled_para(3, ParagraphStyle::default()),
-            styled_para(3, ParagraphStyle::default()),
+            styled_para(3, keep_lines.clone()),
+            styled_para(3, keep_lines),
         ])];
         let slices = layout_table_paginated(
             &rows,
@@ -2288,15 +2866,20 @@ mod tests {
     #[test]
     fn keep_next_forbids_splitting_a_cell_at_that_paragraph_boundary() {
         // §17.3.1.15: para A is keepNext, so the cell may not break between A
-        // and B. Neither 3-line paragraph can split internally (widow control),
-        // so — unlike the boundary test above — the whole cell moves to page 2.
+        // and B. Both 3-line paragraphs are keepLines and cannot split
+        // internally, so the whole cell moves to page 2.
         let keep_next = ParagraphStyle {
             keep_next: true,
+            keep_lines: true,
+            ..Default::default()
+        };
+        let keep_lines = ParagraphStyle {
+            keep_lines: true,
             ..Default::default()
         };
         let rows = vec![one_cell_row(vec![
             styled_para(3, keep_next),
-            styled_para(3, ParagraphStyle::default()),
+            styled_para(3, keep_lines),
         ])];
         let slices = layout_table_paginated(
             &rows,
@@ -2321,10 +2904,10 @@ mod tests {
     }
 
     #[test]
-    fn cell_paragraph_split_across_three_pages_never_widows() {
-        // §17.3.1.44 must hold at *every* break, not just the first. An 11-line
-        // cell paragraph over pages that each hold 5 lines splits 5/4/2 — never
-        // the 5/5/1 a naive re-split would produce.
+    fn table_row_continuation_may_end_with_a_single_line_slice() {
+        // An 11-line cell paragraph over pages that each hold 5 lines splits
+        // 5/5/1. Re-splitting the continuation retains the table-row exception
+        // instead of reintroducing the body widow/orphan rule.
         let rows = vec![one_cell_row(vec![styled_para(
             11,
             ParagraphStyle::default(),
@@ -2342,17 +2925,9 @@ mod tests {
                 suppress_first_row_top: false,
             },
         );
-        assert!(
-            slices.len() >= 3,
-            "expected >= 3 slices, got {}",
-            slices.len()
-        );
         let counts: Vec<usize> = slices.iter().map(slice_line_count).collect();
         assert_eq!(counts.iter().sum::<usize>(), 11, "every line emitted once");
-        assert!(
-            counts.iter().all(|&c| c >= 2),
-            "no single-line widow/orphan segment: {counts:?}"
-        );
+        assert_eq!(counts, vec![5, 5, 1]);
     }
 
     /// §17.4.44: the bottom-edge gap belongs to the table, not to the page it
