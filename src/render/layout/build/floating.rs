@@ -121,6 +121,50 @@ fn effective_wrap_distance(
     }
 }
 
+/// WPS sometimes writes a full-width TopAndBottom strip whose outer
+/// `wp:extent` contains transparent vertical padding while its inner
+/// `a:xfrm/a:ext` is the painted/exclusion height. Keep this compatibility
+/// deliberately narrow: the inner transform must start at (0, 0), preserve
+/// the outer width to within one twip, and only shorten the height. Other
+/// transforms need explicit offset/scale handling and retain the outer box.
+fn wps_top_and_bottom_extent(
+    anchor: &model::AnchorProperties,
+    outer: PtSize,
+    shape_props: Option<&model::ShapeProperties>,
+) -> PtSize {
+    if !matches!(anchor.wrap, model::TextWrap::TopAndBottom { .. }) {
+        return outer;
+    }
+
+    let Some(transform) = shape_props.and_then(|props| props.transform) else {
+        return outer;
+    };
+    if transform
+        .offset
+        .is_some_and(|offset| offset.x.raw() != 0 || offset.y.raw() != 0)
+        || transform
+            .rotation
+            .is_some_and(|rotation| rotation.raw() != 0)
+        || transform.flip_h.unwrap_or(false)
+        || transform.flip_v.unwrap_or(false)
+    {
+        return outer;
+    }
+    let Some(inner) = transform.extent else {
+        return outer;
+    };
+    if inner.width.raw() <= 0 || inner.height.raw() <= 0 {
+        return outer;
+    }
+
+    let inner = PtSize::new(Pt::from(inner.width), Pt::from(inner.height));
+    if (inner.width - outer.width).abs() > Pt::new(0.05) || inner.height >= outer.height {
+        return outer;
+    }
+
+    inner
+}
+
 pub(super) fn extract_floating_images(
     para: &Paragraph,
     ctx: &BuildContext,
@@ -315,7 +359,8 @@ pub(super) fn extract_floating_shapes(
 
         let w = Pt::from(img.extent.width);
         let h = Pt::from(img.extent.height);
-        let extent = PtSize::new(w, h);
+        let outer_extent = PtSize::new(w, h);
+        let extent = wps_top_and_bottom_extent(anchor, outer_extent, shape_props);
 
         let (shape_path, used_geometry_fallback) = match build_geometry(geometry, extent) {
             Some(p) => (p, false),
@@ -1728,14 +1773,16 @@ fn overflow_keeps(
 
 #[cfg(test)]
 mod tests {
-    use super::find_vml_absolute_position;
+    use super::{find_vml_absolute_position, wps_top_and_bottom_extent};
     use crate::model::dimension::Dimension;
     use crate::model::geometry::{EdgeInsets, Size};
     use crate::model::{
         AlternateContent, AnchorPosition, AnchorProperties, AnchorRelativeFrom, DocProperties,
-        GraphicContent, Image, ImagePlacement, Inline, McChoice, McRequires, TextWrap,
-        WordProcessingShape,
+        GraphicContent, Image, ImagePlacement, Inline, McChoice, McRequires, ShapeProperties,
+        TextWrap, Transform2D, WordProcessingShape,
     };
+    use crate::render::dimension::Pt;
+    use crate::render::geometry::PtSize;
     use crate::render::layout::{live_mc_branch, McBranch};
 
     /// A minimally-populated anchored `wps:wsp` shape (as `Inline::Image`).
@@ -1806,6 +1853,130 @@ mod tests {
             live_mc_branch(&ac_with_wps_choice()),
             McBranch::Choice(_)
         ));
+    }
+
+    #[test]
+    fn top_and_bottom_wps_shape_uses_positive_inner_extent() {
+        let mut image = anchored_wps_image();
+        let ImagePlacement::Anchor(ref mut anchor) = image.placement else {
+            panic!("expected anchored image")
+        };
+        anchor.wrap = TextWrap::TopAndBottom {
+            distance_top: Dimension::new(0),
+            distance_bottom: Dimension::new(0),
+        };
+        let props = ShapeProperties {
+            bw_mode: None,
+            transform: Some(Transform2D {
+                rotation: None,
+                flip_h: None,
+                flip_v: None,
+                offset: None,
+                extent: Some(Size::new(
+                    Dimension::new(3_810_000),
+                    Dimension::new(914_400),
+                )),
+            }),
+            geometry: None,
+            fill: None,
+            outline: None,
+            effect_list: None,
+        };
+        let outer = PtSize::new(Pt::new(300.0), Pt::new(100.0));
+
+        let actual = wps_top_and_bottom_extent(anchor, outer, Some(&props));
+
+        assert!((actual.width.raw() - 300.0).abs() < 0.001);
+        assert!((actual.height.raw() - 72.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn offset_or_width_changing_inner_transform_keeps_outer_extent() {
+        let mut image = anchored_wps_image();
+        let ImagePlacement::Anchor(ref mut anchor) = image.placement else {
+            panic!("expected anchored image")
+        };
+        anchor.wrap = TextWrap::TopAndBottom {
+            distance_top: Dimension::new(0),
+            distance_bottom: Dimension::new(0),
+        };
+        let outer = PtSize::new(Pt::new(300.0), Pt::new(100.0));
+        let mut transform = Transform2D {
+            rotation: None,
+            flip_h: None,
+            flip_v: None,
+            offset: Some(crate::model::geometry::Offset::new(
+                Dimension::new(1),
+                Dimension::new(0),
+            )),
+            extent: Some(Size::new(
+                Dimension::new(3_810_000),
+                Dimension::new(914_400),
+            )),
+        };
+        let mut props = ShapeProperties {
+            bw_mode: None,
+            transform: Some(transform),
+            geometry: None,
+            fill: None,
+            outline: None,
+            effect_list: None,
+        };
+        assert_eq!(
+            wps_top_and_bottom_extent(anchor, outer, Some(&props)),
+            outer
+        );
+
+        transform.offset = None;
+        transform.rotation = Some(Dimension::new(60_000));
+        props.transform = Some(transform);
+        assert_eq!(
+            wps_top_and_bottom_extent(anchor, outer, Some(&props)),
+            outer
+        );
+
+        transform.rotation = None;
+        transform.offset = None;
+        transform.extent = Some(Size::new(
+            Dimension::new(2_540_000),
+            Dimension::new(914_400),
+        ));
+        props.transform = Some(transform);
+        assert_eq!(
+            wps_top_and_bottom_extent(anchor, outer, Some(&props)),
+            outer
+        );
+    }
+
+    #[test]
+    fn non_top_and_bottom_wps_shape_keeps_outer_extent() {
+        let image = anchored_wps_image();
+        let ImagePlacement::Anchor(ref anchor) = image.placement else {
+            panic!("expected anchored image")
+        };
+        let props = ShapeProperties {
+            bw_mode: None,
+            transform: Some(Transform2D {
+                rotation: None,
+                flip_h: None,
+                flip_v: None,
+                offset: None,
+                extent: Some(Size::new(
+                    Dimension::new(2_540_000),
+                    Dimension::new(914_400),
+                )),
+            }),
+            geometry: None,
+            fill: None,
+            outline: None,
+            effect_list: None,
+        };
+        let outer = PtSize::new(Pt::new(300.0), Pt::new(100.0));
+
+        assert_eq!(
+            wps_top_and_bottom_extent(anchor, outer, Some(&props)),
+            outer
+        );
     }
 
     /// A Choice whose `Requires` we meet but whose content yields no anchored
@@ -2032,7 +2203,6 @@ mod tests {
 
     use super::{resolve_anchor_y, AnchorFrame};
     use crate::model::AnchorAlignment;
-    use crate::render::dimension::Pt;
     use crate::render::layout::build::BuildState;
     use crate::render::layout::section::FloatingImageY;
     use crate::render::layout::section::{FloatingImageX, PageParity};
@@ -2144,7 +2314,6 @@ mod tests {
         RunProperties, TextAnchoringType, TextRun,
     };
     use crate::render::fonts::FontRegistry;
-    use crate::render::geometry::PtSize;
     use crate::render::layout::build::BuildContext;
     use crate::render::layout::measurer::TextMeasurer;
     use crate::render::resolve::ResolvedDocument;

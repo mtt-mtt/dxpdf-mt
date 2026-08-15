@@ -368,6 +368,12 @@ impl PlacedParagraph<'_> {
         self.line_heights[i]
     }
 
+    /// Total vertical extent occupied by fitted line boxes, including any
+    /// per-line float clearance but excluding paragraph before/after spacing.
+    pub(crate) fn line_box_height(&self) -> Pt {
+        self.line_heights.iter().copied().sum()
+    }
+
     /// Number of leading lines that must stay together on the first segment
     /// when this paragraph splits — the larger of:
     ///

@@ -337,6 +337,13 @@ pub struct ContinuationState {
     pub bottom: Pt,
     /// Floats from the shared physical page that still affect following text.
     pub page_floats: Vec<ActiveFloat>,
+    /// Page-absolute TopAndBottom exclusions already registered on this
+    /// physical page. Unlike ordinary floats, these survive a later-column
+    /// cursor returning above their y range.
+    pub page_absolute_exclusions: Vec<ActiveFloat>,
+    /// Whether this physical page has seen a flow-affecting float that cannot
+    /// safely be reconstructed after returning to a later column's top.
+    pub column_reactivation_unsafe: bool,
 }
 
 #[cfg(test)]

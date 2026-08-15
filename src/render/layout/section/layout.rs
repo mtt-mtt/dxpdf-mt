@@ -7,10 +7,11 @@ use super::super::header_footer::{HeaderFooterClearance, PageBodyBounds};
 use super::super::page::PageConfig;
 use super::super::paragraph::{
     layout_paragraph, place_paragraph, ListSpacingContext, ParagraphBorderStyle, ParagraphStyle,
+    PlacedParagraph,
 };
 use super::super::table::{
     layout_table, layout_table_paginated_with_page_heights, measure_complete_table_height,
-    measure_leading_table_group_height, TablePaginationHeights, TableSlice,
+    measure_leading_table_group_height, TablePaginationHeights, TableRowInput, TableSlice,
 };
 use super::super::BoxConstraints;
 use super::floating_table::{
@@ -91,6 +92,13 @@ struct PageLayoutState<'doc> {
     page_floats: Vec<float::ActiveFloat>,
     /// Forward-scanned absolute floats from future paragraphs on this page.
     current_page_abs_floats: Vec<float::ActiveFloat>,
+    /// Page-absolute TopAndBottom exclusions that have actually been
+    /// registered on this physical page. They remain available after ordinary
+    /// float pruning so a later column can reactivate the band.
+    page_absolute_exclusions: Vec<float::ActiveFloat>,
+    /// Sticky per-physical-page guard for side wraps and paragraph-relative
+    /// TopAndBottom bands, which cannot be revived after pruning.
+    column_reactivation_unsafe: bool,
     /// True when `current_page_abs_floats` needs rebuilding (e.g. after a page break).
     abs_floats_dirty: bool,
     /// Index of the first block on the current page (for forward scanning).
@@ -128,58 +136,73 @@ impl<'doc> PageLayoutState<'doc> {
         bounds: PageBodyBounds,
         logical_page_base: usize,
     ) -> Self {
-        let (current_page, cursor_y, page_top, current_col, column_top, bottom, page_floats) =
-            match continuation {
-                Some(c) => {
-                    let same_columns = c.columns.len() == config.columns.len()
-                        && c.columns.iter().zip(&config.columns).all(|(left, right)| {
-                            left.x_offset == right.x_offset && left.width == right.width
-                        });
-                    let same_flow_geometry = c.page_size == config.page_size
-                        && c.page_top == bounds.top
-                        && c.body_bottom == bounds.bottom
-                        && same_columns;
+        let (
+            current_page,
+            cursor_y,
+            page_top,
+            current_col,
+            column_top,
+            bottom,
+            page_floats,
+            page_absolute_exclusions,
+            column_reactivation_unsafe,
+        ) = match continuation {
+            Some(c) => {
+                let same_columns = c.columns.len() == config.columns.len()
+                    && c.columns.iter().zip(&config.columns).all(|(left, right)| {
+                        left.x_offset == right.x_offset && left.width == right.width
+                    });
+                let same_flow_geometry = c.page_size == config.page_size
+                    && c.page_top == bounds.top
+                    && c.body_bottom == bounds.bottom
+                    && same_columns;
 
-                    if same_flow_geometry {
-                        // Preserve the real column. Using cursor_y as column_top
-                        // makes a page-tail continuation look like a fresh,
-                        // full-height column and permits silent overflow.
-                        (
-                            c.page,
-                            c.cursor_y,
-                            c.page_top,
-                            c.current_col.min(config.num_columns().saturating_sub(1)),
-                            c.column_top,
-                            c.bottom.min(bounds.bottom),
-                            c.page_floats,
-                        )
-                    } else {
-                        // Changed geometry starts a new flow region on the shared
-                        // physical page. It is not a full-height fresh column;
-                        // overflow must advance rather than paint below the body.
-                        // Full Word-style column balancing is handled separately.
-                        let region_top = c.cursor_y.max(bounds.top);
-                        (
-                            c.page,
-                            region_top,
-                            bounds.top,
-                            0,
-                            region_top,
-                            c.bottom.min(bounds.bottom),
-                            c.page_floats,
-                        )
-                    }
+                if same_flow_geometry {
+                    // Preserve the real column. Using cursor_y as column_top
+                    // makes a page-tail continuation look like a fresh,
+                    // full-height column and permits silent overflow.
+                    (
+                        c.page,
+                        c.cursor_y,
+                        c.page_top,
+                        c.current_col.min(config.num_columns().saturating_sub(1)),
+                        c.column_top,
+                        c.bottom.min(bounds.bottom),
+                        c.page_floats,
+                        c.page_absolute_exclusions,
+                        c.column_reactivation_unsafe,
+                    )
+                } else {
+                    // Changed geometry starts a new flow region on the shared
+                    // physical page. It is not a full-height fresh column;
+                    // overflow must advance rather than paint below the body.
+                    // Full Word-style column balancing is handled separately.
+                    let region_top = c.cursor_y.max(bounds.top);
+                    (
+                        c.page,
+                        region_top,
+                        bounds.top,
+                        0,
+                        region_top,
+                        c.bottom.min(bounds.bottom),
+                        c.page_floats,
+                        c.page_absolute_exclusions,
+                        c.column_reactivation_unsafe,
+                    )
                 }
-                None => (
-                    LayoutedPage::new(config.page_size),
-                    bounds.top,
-                    bounds.top,
-                    0,
-                    bounds.top,
-                    bounds.bottom,
-                    Vec::new(),
-                ),
-            };
+            }
+            None => (
+                LayoutedPage::new(config.page_size),
+                bounds.top,
+                bounds.top,
+                0,
+                bounds.top,
+                bounds.bottom,
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+        };
         PageLayoutState {
             pages: Vec::new(),
             column_top,
@@ -199,6 +222,8 @@ impl<'doc> PageLayoutState<'doc> {
             prev_borders: None,
             page_floats,
             current_page_abs_floats: Vec::new(),
+            page_absolute_exclusions,
+            column_reactivation_unsafe,
             abs_floats_dirty: true,
             page_start_block: 0,
             prev_table_style_id: None,
@@ -217,6 +242,18 @@ impl<'doc> PageLayoutState<'doc> {
     /// part-way down the page, where `cursor_y == column_top` is also true.
     fn at_full_column_top(&self) -> bool {
         self.cursor_y <= self.column_top && self.column_top <= self.page_top
+    }
+
+    fn archive_page_absolute_exclusion(&mut self, exclusion: float::ActiveFloat) {
+        let duplicate = self.page_absolute_exclusions.iter().any(|existing| {
+            (existing.page_x - exclusion.page_x).raw().abs() < FLOAT_DEDUP_EPSILON_PT
+                && (existing.page_y_start - exclusion.page_y_start).raw().abs()
+                    < FLOAT_DEDUP_EPSILON_PT
+                && (existing.page_y_end - exclusion.page_y_end).raw().abs() < FLOAT_DEDUP_EPSILON_PT
+        });
+        if !duplicate {
+            self.page_absolute_exclusions.push(exclusion);
+        }
     }
 
     fn flush_footnotes(&mut self, ctx: &LayoutCtx<'_>) {
@@ -275,6 +312,8 @@ impl<'doc> PageLayoutState<'doc> {
         self.page_start_block = block_idx;
         self.abs_floats_dirty = true;
         self.page_floats.clear();
+        self.page_absolute_exclusions.clear();
+        self.column_reactivation_unsafe = false;
     }
 
     /// Flush any remaining footnotes and either push the last page or preserve
@@ -294,6 +333,8 @@ impl<'doc> PageLayoutState<'doc> {
                 column_top: self.column_top,
                 bottom: self.bottom,
                 page_floats: self.page_floats,
+                page_absolute_exclusions: self.page_absolute_exclusions,
+                column_reactivation_unsafe: self.column_reactivation_unsafe,
             };
             SectionLayoutResult {
                 pages: self.pages,
@@ -395,15 +436,22 @@ impl<'doc> PageLayoutState<'doc> {
             self.abs_floats_dirty = false;
         }
 
-        // Merge page_floats with forward-scanned absolute floats (dedup). Only
-        // include absolute floats whose y range starts at or above the current
-        // cursor — floats below shouldn't affect text above.
+        // Merge page_floats with forward-scanned absolute floats (dedup).
+        // Ordinary side-wrapping floats become active at their own y;
+        // TopAndBottom exclusions are retained ahead of the cursor so the
+        // line fitter can detect a line box that crosses into the band.
         let mut effective_floats = self.page_floats.clone();
-        let y_threshold = self.cursor_y + space_before;
         let deduped: Vec<float::ActiveFloat> = self
             .current_page_abs_floats
             .iter()
-            .filter(|af| af.page_y_start <= y_threshold)
+            .chain(self.page_absolute_exclusions.iter())
+            .filter(|af| {
+                // A vertical exclusion may begin inside the upcoming line,
+                // so the line fitter must see it even when its top is below
+                // the current cursor. Ordinary side-wrapping floats keep the
+                // historical threshold and become active at their own y.
+                af.vertical_exclusion || af.page_y_start <= self.cursor_y + space_before
+            })
             .filter(|af| {
                 !effective_floats.iter().any(|pf| {
                     (pf.page_x - af.page_x).raw().abs() < FLOAT_DEDUP_EPSILON_PT
@@ -448,6 +496,8 @@ struct ParagraphFloatCheckpoint {
     command_count: usize,
     behind_doc_commands: Vec<LayeredDrawCommand>,
     page_floats: Vec<float::ActiveFloat>,
+    page_absolute_exclusions: Vec<float::ActiveFloat>,
+    column_reactivation_unsafe: bool,
     cursor_y: Pt,
 }
 
@@ -468,6 +518,8 @@ struct PageReplayCheckpoint<'doc> {
     prev_borders: Option<ParagraphBorderStyle>,
     page_floats: Vec<float::ActiveFloat>,
     current_page_abs_floats: Vec<float::ActiveFloat>,
+    page_absolute_exclusions: Vec<float::ActiveFloat>,
+    column_reactivation_unsafe: bool,
     abs_floats_dirty: bool,
     page_start_block: usize,
     prev_table_style_id: Option<StyleId>,
@@ -493,6 +545,8 @@ impl<'doc> PageReplayCheckpoint<'doc> {
             prev_borders: state.prev_borders.clone(),
             page_floats: state.page_floats.clone(),
             current_page_abs_floats: state.current_page_abs_floats.clone(),
+            page_absolute_exclusions: state.page_absolute_exclusions.clone(),
+            column_reactivation_unsafe: state.column_reactivation_unsafe,
             abs_floats_dirty: state.abs_floats_dirty,
             page_start_block: state.page_start_block,
             prev_table_style_id: state.prev_table_style_id.clone(),
@@ -519,6 +573,10 @@ impl<'doc> PageReplayCheckpoint<'doc> {
         state
             .current_page_abs_floats
             .clone_from(&self.current_page_abs_floats);
+        state
+            .page_absolute_exclusions
+            .clone_from(&self.page_absolute_exclusions);
+        state.column_reactivation_unsafe = self.column_reactivation_unsafe;
         state.abs_floats_dirty = self.abs_floats_dirty;
         state.page_start_block = self.page_start_block;
         state
@@ -548,6 +606,8 @@ impl ParagraphFloatCheckpoint {
             command_count: state.current_page.commands.len(),
             behind_doc_commands: state.current_page.behind_doc_commands.clone(),
             page_floats: state.page_floats.clone(),
+            page_absolute_exclusions: state.page_absolute_exclusions.clone(),
+            column_reactivation_unsafe: state.column_reactivation_unsafe,
             cursor_y: state.cursor_y,
         }
     }
@@ -559,6 +619,10 @@ impl ParagraphFloatCheckpoint {
             .behind_doc_commands
             .clone_from(&self.behind_doc_commands);
         state.page_floats.clone_from(&self.page_floats);
+        state
+            .page_absolute_exclusions
+            .clone_from(&self.page_absolute_exclusions);
+        state.column_reactivation_unsafe = self.column_reactivation_unsafe;
         state.cursor_y = self.cursor_y;
     }
 }
@@ -623,7 +687,7 @@ fn register_paragraph_floats(
                     src_rect: fi.src_rect,
                 },
             );
-            state.page_floats.push(float::ActiveFloat {
+            let exclusion = float::ActiveFloat {
                 page_x: content_x,
                 page_y_start: y_start,
                 page_y_end: y_end,
@@ -631,7 +695,13 @@ fn register_paragraph_floats(
                 source: float::FloatSource::Image,
                 vertical_exclusion: true,
                 wrap_text: float::WrapTextSide::BothSides,
-            });
+            };
+            state.page_floats.push(exclusion.clone());
+            if matches!(fi.y, FloatingImageY::Absolute(_)) {
+                state.archive_page_absolute_exclusion(exclusion);
+            } else {
+                state.column_reactivation_unsafe = true;
+            }
         } else if fi.wrap_mode.registers_as_wrap_float() {
             let float_entry = float::ActiveFloat {
                 page_x: fi.x.resolve(parity) - fi.dist_left,
@@ -650,6 +720,7 @@ fn register_paragraph_floats(
                 float_entry.width.raw()
             );
             state.page_floats.push(float_entry);
+            state.column_reactivation_unsafe = true;
         }
     }
 
@@ -681,7 +752,7 @@ fn register_paragraph_floats(
                 },
             );
             emit_shape_text(state, fs, shape_y);
-            state.page_floats.push(float::ActiveFloat {
+            let exclusion = float::ActiveFloat {
                 page_x: content_x,
                 page_y_start: y_start,
                 page_y_end: y_end,
@@ -689,7 +760,13 @@ fn register_paragraph_floats(
                 source: float::FloatSource::Shape,
                 vertical_exclusion: true,
                 wrap_text: float::WrapTextSide::BothSides,
-            });
+            };
+            state.page_floats.push(exclusion.clone());
+            if matches!(fs.y, FloatingImageY::Absolute(_)) {
+                state.archive_page_absolute_exclusion(exclusion);
+            } else {
+                state.column_reactivation_unsafe = true;
+            }
         } else {
             let float_entry = float::ActiveFloat {
                 page_x: fs.x.resolve(parity) - fs.dist_left,
@@ -709,6 +786,7 @@ fn register_paragraph_floats(
                 fs.wrap_mode
             );
             state.page_floats.push(float_entry);
+            state.column_reactivation_unsafe = true;
         }
     }
 }
@@ -736,6 +814,67 @@ fn register_destination_paragraph_floats(
         }
     }
     float::prune_floats(&mut state.page_floats, state.cursor_y);
+}
+
+/// WPS compatibility for a narrow TopAndBottom edge case. When a visible,
+/// single-line owner fits wholly above its own exclusion band but its trailing
+/// paragraph spacing would enter that band, WPS clears the owner below the
+/// band and then applies `space_before` normally. This is deliberately not a
+/// blanket owner-paragraph barrier: ordinary lines that overlap a band keep
+/// using the standard per-line clearance path.
+fn wps_trailing_space_clearance_start(
+    current_y: Pt,
+    body_bottom: Pt,
+    style: &ParagraphStyle,
+    placed: &PlacedParagraph<'_>,
+    fragments: &[Fragment],
+    floating_images: &[FloatingImage],
+    floating_shapes: &[FloatingShape],
+) -> Option<Pt> {
+    let has_visible_owner_content = fragments.iter().any(|fragment| match fragment {
+        Fragment::Text { text, .. } => !text.trim().is_empty(),
+        Fragment::Image { .. } | Fragment::InlineGraphic { .. } | Fragment::Emoji { .. } => true,
+        Fragment::Tab { .. }
+        | Fragment::PTab { .. }
+        | Fragment::LineBreak { .. }
+        | Fragment::ColumnBreak
+        | Fragment::PageBreak { .. }
+        | Fragment::Bookmark { .. } => false,
+    });
+    if !has_visible_owner_content
+        || placed.line_count() != 1
+        || !floating_images.is_empty()
+        || floating_shapes.len() != 1
+        || style.space_after <= Pt::ZERO
+    {
+        return None;
+    }
+
+    let band = if let Some(shape) = floating_shapes.first() {
+        if !shape.is_wrap_top_and_bottom() {
+            return None;
+        }
+        let FloatingImageY::Absolute(y) = shape.y else {
+            return None;
+        };
+        Some((
+            y - shape.dist_top,
+            y + shape.size.height + shape.dist_bottom,
+        ))
+    } else {
+        None
+    }?;
+
+    let line_boxes_height = placed.line_box_height();
+    let content_bottom = current_y + style.space_before + line_boxes_height;
+    let paragraph_end = content_bottom + style.space_after;
+    let (band_start, band_end) = band;
+    if content_bottom > band_start || paragraph_end <= band_start || band_end <= current_y {
+        return None;
+    }
+
+    let moved_paragraph_height = style.space_before + line_boxes_height + style.space_after;
+    (band_end > current_y && band_end + moved_paragraph_height <= body_bottom).then_some(band_end)
 }
 
 fn has_absolute_wrap_float(floating_images: &[FloatingImage]) -> bool {
@@ -1859,6 +1998,57 @@ fn is_break_only_paragraph(block: &LayoutBlock) -> bool {
     )
 }
 
+fn table_rows_have_footnotes(rows: &[TableRowInput]) -> bool {
+    rows.iter()
+        .flat_map(|row| row.cells.iter())
+        .flat_map(|cell| cell.blocks.iter())
+        .any(layout_block_has_footnotes)
+}
+
+fn layout_block_has_footnotes(block: &LayoutBlock) -> bool {
+    match block {
+        LayoutBlock::Paragraph { footnotes, .. } => !footnotes.is_empty(),
+        LayoutBlock::Table { rows, .. } => table_rows_have_footnotes(rows),
+    }
+}
+
+/// Cross-column table slices may only reuse a physical page whose wrapping
+/// state can be reconstructed after the cursor returns to the column top.
+/// Pure overlays do not affect flow. Page-absolute TopAndBottom exclusions are
+/// the one supported wrapping case because the forward registry deliberately
+/// keeps them alive for all columns; side wraps and paragraph-relative bands
+/// retain the historical page-only table path.
+fn layout_block_has_unsupported_column_float(block: &LayoutBlock) -> bool {
+    let (floating_images, floating_shapes) = match block {
+        LayoutBlock::Paragraph {
+            floating_images,
+            floating_shapes,
+            ..
+        } => (floating_images, floating_shapes),
+        LayoutBlock::Table { float_info, .. } => return float_info.is_some(),
+    };
+
+    let image_is_unsupported = |image: &FloatingImage| {
+        let affects_flow =
+            image.wrap_mode.registers_as_wrap_float() || image.is_wrap_top_and_bottom();
+        affects_flow
+            && !(image.is_wrap_top_and_bottom() && matches!(image.y, FloatingImageY::Absolute(_)))
+    };
+    let shape_is_unsupported = |shape: &FloatingShape| {
+        let affects_flow =
+            shape.wrap_mode.registers_as_wrap_float() || shape.is_wrap_top_and_bottom();
+        affects_flow
+            && !(shape.is_wrap_top_and_bottom() && matches!(shape.y, FloatingImageY::Absolute(_)))
+    };
+
+    floating_images.iter().any(image_is_unsupported)
+        || floating_shapes.iter().any(shape_is_unsupported)
+}
+
+fn page_heights_match(a: Pt, b: Pt) -> bool {
+    (a - b).abs() <= Pt::new(0.01)
+}
+
 fn starts_with_inline_page_break(block: &LayoutBlock) -> bool {
     matches!(
         block,
@@ -2511,13 +2701,52 @@ pub(crate) fn layout_section_with_clearance_result(
                             state.current_col,
                             (state.bottom - state.page_top).max(Pt::ZERO),
                         );
-                        let placed = place_paragraph(
+                        let mut placed = place_paragraph(
                             chunk,
                             &constraints,
                             &effective_style,
                             ctx.default_line_height,
                             ctx.measure_text,
                         );
+
+                        let single_chunk = page_chunks.len() == 1 && col_chunks.len() == 1;
+                        if single_chunk
+                            && footnotes.is_empty()
+                            && effective_style.borders.is_none()
+                            && effective_style.shading.is_none()
+                            && effective_style.drop_cap.is_none()
+                        {
+                            if let Some(clearance_start) = wps_trailing_space_clearance_start(
+                                state.cursor_y,
+                                state.bottom,
+                                &effective_style,
+                                &placed,
+                                chunk,
+                                floating_images,
+                                floating_shapes,
+                            ) {
+                                drop(placed);
+                                state.cursor_y = clearance_start;
+                                para_start_y = clearance_start;
+                                effective_style.page_y = clearance_start;
+                                float::prune_floats(&mut state.page_floats, clearance_start);
+                                effective_style.page_floats = state.effective_floats_at_cursor(
+                                    blocks,
+                                    &relocated_absolute_float_blocks,
+                                    num_cols,
+                                    effective_style.space_before,
+                                    effective_style.page_x,
+                                    effective_style.page_content_width,
+                                );
+                                placed = place_paragraph(
+                                    chunk,
+                                    &constraints,
+                                    &effective_style,
+                                    ctx.default_line_height,
+                                    ctx.measure_text,
+                                );
+                            }
+                        }
 
                         // §17.3.1.14: a paragraph may break across a page
                         // boundary when keepLines is unset. Borders/shading, drop
@@ -2535,7 +2764,6 @@ pub(crate) fn layout_section_with_clearance_result(
                         // remainder against each column's own width
                         // (`emit_split_paragraph`), so unequal-width columns split
                         // correctly — no equal-width gate.
-                        let single_chunk = page_chunks.len() == 1 && col_chunks.len() == 1;
                         let can_split = paragraph_breakable(
                             &effective_style,
                             footnotes,
@@ -2981,6 +3209,7 @@ pub(crate) fn layout_section_with_clearance_result(
                             // attribute exists for tables.
                             wrap_text: float::WrapTextSide::BothSides,
                         });
+                        state.column_reactivation_unsafe = true;
                         // Suppress unused warning when `is_anchor` is no
                         // longer the discriminant for registration.
                         let _ = is_anchor;
@@ -3058,6 +3287,50 @@ pub(crate) fn layout_section_with_clearance_result(
                 // §17.4.49 / §17.4.1: split at row boundaries, repeat headers.
                 let available = state.bottom - state.cursor_y;
                 let section_page_index = state.page_index;
+                let starting_col = state.current_col;
+                let current_page_height = ctx.page_bounds(section_page_index).height();
+                let next_page_height = ctx.page_bounds(section_page_index + 1).height();
+                let following_page_height = ctx.page_bounds(section_page_index + 2).height();
+                float::prune_floats(&mut state.page_floats, state.cursor_y);
+                // A table can continue through the remaining columns of the
+                // same physical page only when page-wide state cannot change
+                // underneath an already-emitted earlier column.  Footnotes
+                // are rendered in one full-page strip, so any existing or
+                // table-owned note keeps the historical page-only path.  The
+                // equal-height guard also prevents an unsplittable row from
+                // being stranded in a short intermediate column when a later
+                // parity page would have more room.
+                let continue_across_columns = num_cols > 1
+                    && page_heights_match(state.column_top, state.page_top)
+                    && state.page_footnotes.is_empty()
+                    && state.page_floats.is_empty()
+                    && !state.column_reactivation_unsafe
+                    // A continuous predecessor may already have rendered and
+                    // cleared its page-wide notes while retaining the reduced
+                    // body bottom. Do not give later columns the unreduced
+                    // height in that case.
+                    && page_heights_match(
+                        state.bottom,
+                        ctx.page_bounds(state.page_index).bottom,
+                    )
+                    // Returning to a column top can revive old wrapping
+                    // regions. Only opt in when every flow-affecting float in
+                    // the remaining section is a page-absolute TopAndBottom
+                    // exclusion, the one kind retained by the per-page
+                    // registry above.
+                    && !blocks[state.page_start_block..]
+                        .iter()
+                        .any(layout_block_has_unsupported_column_float)
+                    // A later-column paragraph that first introduces a
+                    // page-wide footnote would retroactively shrink every
+                    // earlier column. Until the paginator can repack already
+                    // emitted slots, only use column flow when the remainder
+                    // of this section is recursively footnote-free.
+                    && !blocks[block_idx..]
+                        .iter()
+                        .any(layout_block_has_footnotes)
+                    && page_heights_match(current_page_height, next_page_height)
+                    && page_heights_match(next_page_height, following_page_height);
                 let slices = layout_table_paginated_with_page_heights(
                     rows,
                     col_widths,
@@ -3069,7 +3342,13 @@ pub(crate) fn layout_section_with_clearance_result(
                         available_height: available,
                         suppress_first_row_top: suppress_top,
                         page_height_for_slice: |slice_index| {
-                            ctx.page_bounds(section_page_index + slice_index).height()
+                            if continue_across_columns {
+                                let absolute_slot = starting_col + slice_index;
+                                let page_delta = absolute_slot / num_cols;
+                                ctx.page_bounds(section_page_index + page_delta).height()
+                            } else {
+                                ctx.page_bounds(section_page_index + slice_index).height()
+                            }
                         },
                         footnote_width: Some(content_width),
                         footnote_separator_height: FOOTNOTE_SEPARATOR_GAP,
@@ -3077,21 +3356,28 @@ pub(crate) fn layout_section_with_clearance_result(
                     },
                 );
 
-                // §17.4.28 / §17.4.51: compute table x position.
+                // §17.4.28 / §17.4.51: table width is stable, but the x
+                // position is resolved per flow region below because unequal
+                // columns have different origins and alignment boxes.
                 let table_width: Pt = col_widths.iter().copied().sum();
-                let table_x = table_x_offset(
-                    *alignment,
-                    *indent,
-                    table_width,
-                    content_width,
-                    config.margins.left,
-                );
 
                 for (slice_idx, slice) in slices.into_iter().enumerate() {
                     if slice_idx > 0 {
-                        // Continuation slice — start a new page.
-                        state.push_new_page(block_idx, &ctx, PageBreakCause::TableContinuation);
+                        if continue_across_columns && state.current_col + 1 < num_cols {
+                            state.current_col += 1;
+                            state.cursor_y = state.column_top;
+                        } else {
+                            state.push_new_page(block_idx, &ctx, PageBreakCause::TableContinuation);
+                        }
                     }
+                    let column = &config.columns[state.current_col];
+                    let table_x = table_x_offset(
+                        *alignment,
+                        *indent,
+                        table_width,
+                        column.width,
+                        col_x(state.current_col),
+                    );
                     let TableSlice {
                         commands,
                         size,
@@ -3251,6 +3537,76 @@ mod keep_next_chain_tests {
         )])])])
     }
 
+    fn top_and_bottom_owner(space_after: f32, wrap_mode: WrapMode) -> LayoutBlock {
+        let mut block = text_paragraph("owner", false, 10.0);
+        let LayoutBlock::Paragraph {
+            style,
+            floating_shapes,
+            ..
+        } = &mut block
+        else {
+            unreachable!();
+        };
+        style.space_before = Pt::new(5.0);
+        style.space_after = Pt::new(space_after);
+        floating_shapes.push(FloatingShape {
+            x: crate::render::layout::section::FloatingImageX::Absolute(Pt::ZERO),
+            y: FloatingImageY::Absolute(Pt::new(30.0)),
+            size: PtSize::new(Pt::new(180.0), Pt::new(10.0)),
+            rotation: crate::model::dimension::Dimension::new(0),
+            flip_h: false,
+            flip_v: false,
+            wrap_mode,
+            dist_top: Pt::ZERO,
+            dist_bottom: Pt::ZERO,
+            dist_left: Pt::ZERO,
+            dist_right: Pt::ZERO,
+            behind_doc: true,
+            relative_height: 0,
+            paths: Vec::new(),
+            fill: crate::render::layout::draw_command::ResolvedFill::None,
+            stroke: None,
+            effects: Vec::new(),
+            text_commands: Vec::new(),
+        });
+        block
+    }
+
+    fn text_y(page: &LayoutedPage, expected: &str) -> Pt {
+        page.commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Text { position, text, .. } if text.as_ref() == expected => {
+                    Some(position.y)
+                }
+                _ => None,
+            })
+            .expect("expected text command")
+    }
+
+    fn text_x(page: &LayoutedPage, expected: &str) -> Pt {
+        page.commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Text { position, text, .. } if text.as_ref() == expected => {
+                    Some(position.x)
+                }
+                _ => None,
+            })
+            .expect("expected text command")
+    }
+
+    fn text_location(pages: &[LayoutedPage], expected: &str) -> Option<(usize, Pt)> {
+        pages.iter().enumerate().find_map(|(page_idx, page)| {
+            page.commands.iter().find_map(|command| match command {
+                DrawCommand::Text { position, text, .. } if text.as_ref() == expected => {
+                    Some((page_idx, position.x))
+                }
+                _ => None,
+            })
+        })
+    }
+
     fn small_page_config() -> PageConfig {
         PageConfig {
             page_size: PtSize::new(Pt::new(200.0), Pt::new(100.0)),
@@ -3261,6 +3617,25 @@ mod keep_next_chain_tests {
                 x_offset: Pt::ZERO,
                 width: Pt::new(180.0),
             }],
+        }
+    }
+
+    fn two_column_page_config() -> PageConfig {
+        PageConfig {
+            page_size: PtSize::new(Pt::new(220.0), Pt::new(100.0)),
+            margins: PtEdgeInsets::new(Pt::new(10.0), Pt::new(10.0), Pt::new(10.0), Pt::new(10.0)),
+            header_margin: Pt::new(5.0),
+            footer_margin: Pt::new(5.0),
+            columns: vec![
+                ColumnGeometry {
+                    x_offset: Pt::ZERO,
+                    width: Pt::new(80.0),
+                },
+                ColumnGeometry {
+                    x_offset: Pt::new(110.0),
+                    width: Pt::new(80.0),
+                },
+            ],
         }
     }
 
@@ -3314,6 +3689,7 @@ mod keep_next_chain_tests {
         });
 
         assert!(!table_keep_next_sentinel(&floating));
+        assert!(layout_block_has_unsupported_column_float(&floating));
     }
 
     #[test]
@@ -3524,6 +3900,260 @@ mod keep_next_chain_tests {
         assert!(page_has_text(&pages[1], "bridge-b"));
         assert!(!page_has_text(&pages[2], "mid"));
         assert!(page_has_text(&pages[2], "terminal"));
+    }
+
+    #[test]
+    fn trailing_space_entering_owner_top_bottom_band_moves_single_line_below_it() {
+        let no_collision = layout_section(
+            &[top_and_bottom_owner(4.0, WrapMode::TopAndBottom)],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+        let collision = layout_section(
+            &[top_and_bottom_owner(15.0, WrapMode::TopAndBottom)],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+
+        assert_eq!(no_collision.len(), 1);
+        assert_eq!(collision.len(), 1);
+        assert_eq!(
+            text_y(&collision[0], "owner") - text_y(&no_collision[0], "owner"),
+            Pt::new(30.0),
+            "the paragraph box starts at the 40pt band bottom, preserving space_before once"
+        );
+    }
+
+    #[test]
+    fn trailing_space_does_not_clear_past_a_wrap_none_owner() {
+        let plain = layout_section(
+            &[top_and_bottom_owner(4.0, WrapMode::None)],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+        let large_after = layout_section(
+            &[top_and_bottom_owner(15.0, WrapMode::None)],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+
+        assert_eq!(text_y(&plain[0], "owner"), text_y(&large_after[0], "owner"));
+    }
+
+    #[test]
+    fn footnote_free_table_continues_in_the_next_column_before_a_new_page() {
+        let blocks = vec![
+            text_paragraph("filler", false, 50.0),
+            table(vec![
+                row(vec![cell(vec![text_paragraph("row-a", false, 25.0)])]),
+                row(vec![cell(vec![text_paragraph("row-b", false, 25.0)])]),
+            ]),
+        ];
+
+        let pages = layout_section(
+            &blocks,
+            &two_column_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 1);
+        assert!(text_x(&pages[0], "row-a") < Pt::new(100.0));
+        assert!(text_x(&pages[0], "row-b") > Pt::new(100.0));
+        assert!(text_y(&pages[0], "row-b") < text_y(&pages[0], "row-a"));
+    }
+
+    #[test]
+    fn table_with_a_footnote_keeps_the_historical_page_only_continuation() {
+        let mut noted = text_paragraph("row-a", false, 25.0);
+        let LayoutBlock::Paragraph { footnotes, .. } = &mut noted else {
+            unreachable!();
+        };
+        footnotes.push(LayoutFootnote {
+            paragraphs: vec![(Vec::new(), ParagraphStyle::default())],
+        });
+        let pages = layout_section(
+            &[
+                text_paragraph("filler", false, 50.0),
+                table(vec![
+                    row(vec![cell(vec![noted])]),
+                    row(vec![cell(vec![text_paragraph("row-b", false, 25.0)])]),
+                ]),
+            ],
+            &two_column_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        let row_b = text_location(&pages, "row-b").expect("row-b must be emitted");
+        assert_eq!(row_b.0, 1);
+        assert!(row_b.1 < Pt::new(100.0));
+    }
+
+    #[test]
+    fn table_before_a_later_footnote_also_keeps_page_only_continuation() {
+        let mut noted = text_paragraph("after-note", false, 10.0);
+        let LayoutBlock::Paragraph { footnotes, .. } = &mut noted else {
+            unreachable!();
+        };
+        footnotes.push(LayoutFootnote {
+            paragraphs: vec![(Vec::new(), ParagraphStyle::default())],
+        });
+        let pages = layout_section(
+            &[
+                text_paragraph("filler", false, 50.0),
+                table(vec![
+                    row(vec![cell(vec![text_paragraph("row-a", false, 25.0)])]),
+                    row(vec![cell(vec![text_paragraph("row-b", false, 25.0)])]),
+                ]),
+                noted,
+            ],
+            &two_column_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+
+        let row_b = text_location(&pages, "row-b").expect("row-b must be emitted");
+        assert_eq!(row_b.0, 1, "a later page-wide note forbids column slicing");
+        assert!(row_b.1 < Pt::new(100.0));
+    }
+
+    #[test]
+    fn table_continuing_from_the_last_column_uses_next_page_first_column() {
+        let mut column_break = paragraph(false, false);
+        let LayoutBlock::Paragraph { fragments, .. } = &mut column_break else {
+            unreachable!();
+        };
+        fragments.push(Fragment::ColumnBreak);
+        let pages = layout_section(
+            &[
+                column_break,
+                text_paragraph("filler", false, 40.0),
+                table(vec![
+                    row(vec![cell(vec![text_paragraph("row-a", false, 25.0)])]),
+                    row(vec![cell(vec![text_paragraph("row-b", false, 25.0)])]),
+                ]),
+            ],
+            &two_column_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(10.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        let row_a = text_location(&pages, "row-a").expect("row-a must be emitted");
+        let row_b = text_location(&pages, "row-b").expect("row-b must be emitted");
+        assert_eq!((row_a.0, row_b.0), (0, 1), "locations={row_a:?}/{row_b:?}");
+        assert!(row_a.1 > Pt::new(100.0));
+        assert!(row_b.1 < Pt::new(100.0));
+    }
+
+    #[test]
+    fn column_table_float_gate_only_accepts_absolute_top_bottom_exclusions() {
+        let absolute_top_bottom = top_and_bottom_owner(0.0, WrapMode::TopAndBottom);
+        assert!(!layout_block_has_unsupported_column_float(
+            &absolute_top_bottom
+        ));
+
+        let mut relative_top_bottom = top_and_bottom_owner(0.0, WrapMode::TopAndBottom);
+        let LayoutBlock::Paragraph {
+            floating_shapes, ..
+        } = &mut relative_top_bottom
+        else {
+            unreachable!();
+        };
+        floating_shapes[0].y = FloatingImageY::RelativeToParagraph(Pt::ZERO);
+        assert!(layout_block_has_unsupported_column_float(
+            &relative_top_bottom
+        ));
+
+        let absolute_side_wrap =
+            top_and_bottom_owner(0.0, WrapMode::Square(crate::model::WrapText::BothSides));
+        assert!(layout_block_has_unsupported_column_float(
+            &absolute_side_wrap
+        ));
+
+        let overlay = top_and_bottom_owner(0.0, WrapMode::None);
+        assert!(!layout_block_has_unsupported_column_float(&overlay));
+    }
+
+    #[test]
+    fn absolute_top_bottom_shape_reactivates_after_same_page_column_reset() {
+        let layout = |wrap_mode| {
+            let mut owner = top_and_bottom_owner(0.0, wrap_mode);
+            let LayoutBlock::Paragraph {
+                fragments, style, ..
+            } = &mut owner
+            else {
+                unreachable!();
+            };
+            fragments.clear();
+            style.space_before = Pt::ZERO;
+            style.space_after = Pt::ZERO;
+            let LayoutBlock::Paragraph {
+                floating_shapes, ..
+            } = &mut owner
+            else {
+                unreachable!();
+            };
+            floating_shapes[0].y = FloatingImageY::Absolute(Pt::new(40.0));
+
+            let mut filler = text_paragraph("filler", false, 10.0);
+            let LayoutBlock::Paragraph { style, .. } = &mut filler else {
+                unreachable!();
+            };
+            style.space_after = Pt::new(46.0);
+            let mut config = two_column_page_config();
+            config.page_size.height = Pt::new(120.0);
+
+            layout_section(
+                &[
+                    owner,
+                    filler,
+                    table(vec![
+                        row(vec![cell(vec![text_paragraph("row-a", false, 25.0)])]),
+                        row(vec![cell(vec![text_paragraph("row-b", false, 25.0)])]),
+                    ]),
+                    text_paragraph("after", false, 10.0),
+                ],
+                &config,
+                None,
+                Pt::ZERO,
+                Pt::new(10.0),
+                None,
+            )
+        };
+
+        let without_band = layout(WrapMode::None);
+        let with_band = layout(WrapMode::TopAndBottom);
+
+        assert_eq!(without_band.len(), 1);
+        assert_eq!(with_band.len(), 1);
+        assert!(text_x(&with_band[0], "row-b") > Pt::new(100.0));
+        assert!(
+            text_y(&with_band[0], "after") > text_y(&without_band[0], "after"),
+            "the page-absolute exclusion must remain active after returning to the column top"
+        );
     }
 }
 

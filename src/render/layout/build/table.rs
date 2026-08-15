@@ -116,6 +116,99 @@ fn reserve_cell_spacing(col_widths: Vec<Pt>, cell_spacing: Pt) -> Vec<Pt> {
     col_widths.into_iter().map(|w| w * scale).collect()
 }
 
+/// Replace a stale automatic grid only when every row supplies the same,
+/// complete direct-width grid.  `tcW` is merely a preferred width, so an
+/// isolated cell must not enlarge a column.  The narrow consensus below is the
+/// interoperable signal produced by WPS/ONLYOFFICE when every `tblGrid` entry
+/// is uniformly stale by one rounding/gutter amount:
+///
+/// * at least a 2x2 table;
+/// * every row covers every grid column with unmerged `dxa` cells;
+/// * each column repeats one identical preferred width in every row;
+/// * every preferred width grows its grid column; and
+/// * the per-column growth differs by at most one twip.
+///
+/// Validate into a temporary vector first so a malformed row can never leave a
+/// partially widened grid behind.
+fn apply_consensus_cell_width_grid(col_widths: &mut [Pt], rows: &[model::TableRow]) -> bool {
+    if col_widths.len() < 2 || rows.len() < 2 {
+        return false;
+    }
+
+    let mut preferred_twips = vec![None; col_widths.len()];
+    for row in rows {
+        if row.properties.grid_before != 0
+            || row.properties.grid_after != 0
+            || row.cells.len() != col_widths.len()
+        {
+            return false;
+        }
+        for (grid_col, cell) in row.cells.iter().enumerate() {
+            if cell.properties.grid_span.unwrap_or(1) != 1 {
+                return false;
+            }
+            let Some(model::TableMeasure::Twips(width)) = cell.properties.width else {
+                return false;
+            };
+            if width.raw() <= 0 {
+                return false;
+            }
+            match preferred_twips[grid_col] {
+                Some(previous) if previous != width.raw() => return false,
+                Some(_) => {}
+                None => preferred_twips[grid_col] = Some(width.raw()),
+            }
+        }
+    }
+
+    let preferred: Vec<Pt> = preferred_twips
+        .into_iter()
+        .map(|width| Pt::new(width.expect("all columns were visited") as f32 / 20.0))
+        .collect();
+    let mut min_growth = f32::INFINITY;
+    let mut max_growth = f32::NEG_INFINITY;
+    for (grid, preferred) in col_widths.iter().zip(&preferred) {
+        if *preferred <= *grid {
+            return false;
+        }
+        let growth = (*preferred - *grid).raw();
+        min_growth = min_growth.min(growth);
+        max_growth = max_growth.max(growth);
+    }
+    if max_growth - min_growth > 0.050_1 {
+        return false;
+    }
+
+    col_widths.copy_from_slice(&preferred);
+    true
+}
+
+fn resolve_table_indent(
+    explicit_indent: Option<model::TableMeasure>,
+    alignment: Option<model::Alignment>,
+    width: Option<model::TableMeasure>,
+    auto_tcw_widened: bool,
+    default_cell_left: crate::model::dimension::Dimension<crate::model::dimension::Twips>,
+) -> Pt {
+    if let Some(model::TableMeasure::Twips(tw)) = explicit_indent {
+        return Pt::from(tw);
+    }
+
+    let is_left_aligned = !matches!(
+        alignment,
+        Some(model::Alignment::Center) | Some(model::Alignment::End)
+    );
+    let is_full_width = matches!(
+        width,
+        Some(model::TableMeasure::Pct(pct)) if pct.raw() >= 5000
+    );
+    if is_left_aligned && (is_full_width || auto_tcw_widened) {
+        -Pt::from(default_cell_left)
+    } else {
+        Pt::ZERO
+    }
+}
+
 /// Recursively build a table: resolve styles, conditional formatting, and
 /// recurse into each cell's content blocks.
 pub(super) fn build_table(
@@ -185,10 +278,15 @@ pub(super) fn build_table(
     // Word scales grid column widths proportionally to match tblW in both
     // fixed and auto layouts. Only when tblW is auto/nil do we keep the raw
     // grid widths (no preferred width was specified).
-    let col_widths = if is_auto_width && !grid_cols.is_empty() {
-        grid_cols.clone()
+    let (col_widths, auto_tcw_widened) = if is_auto_width && !grid_cols.is_empty() {
+        let mut widths = grid_cols.clone();
+        let widened = apply_consensus_cell_width_grid(&mut widths, &t.rows);
+        (widths, widened)
     } else {
-        compute_column_widths(&grid_cols, num_cols, target_width)
+        (
+            compute_column_widths(&grid_cols, num_cols, target_width),
+            false,
+        )
     };
     // §17.4.44: cell spacing is carved out of the table's own width rather than
     // added to it — the spec calls it "the minimum amount of space which shall
@@ -364,22 +462,17 @@ pub(super) fn build_table(
         }
     });
 
-    // §17.4.51: table indentation from left margin.
-    // For full-width left-aligned tables, MS Word shifts the table left
-    // by the default cell margin so cell content aligns with paragraph text.
-    let is_full_width = matches!(
-        t.properties.width,
-        Some(model::TableMeasure::Pct(pct)) if pct.raw() >= 5000
-    );
-    let is_left_aligned = !matches!(
+    // §17.4.51: table indentation from left margin. Full-width tables and
+    // automatic tables whose stale grid was replaced by a complete repeated
+    // cell-width consensus extend left by the default cell margin so their
+    // *content* remains aligned with surrounding paragraphs.
+    let indent = resolve_table_indent(
+        t.properties.indent,
         t.properties.alignment,
-        Some(model::Alignment::Center) | Some(model::Alignment::End)
+        t.properties.width,
+        auto_tcw_widened,
+        default_cell_margins.left,
     );
-    let indent = match t.properties.indent {
-        Some(model::TableMeasure::Twips(tw)) => Pt::from(tw),
-        _ if is_full_width && is_left_aligned => -Pt::from(default_cell_margins.left),
-        _ => Pt::ZERO,
-    };
 
     BuiltTable {
         rows,
@@ -754,6 +847,153 @@ mod tests {
             float_info: None,
             style_id: None,
         }
+    }
+
+    fn width_cell(width_twips: i64, span: u32) -> model::TableCell {
+        model::TableCell {
+            properties: model::TableCellProperties {
+                width: Some(model::TableMeasure::Twips(Dimension::new(width_twips))),
+                grid_span: Some(span),
+                ..Default::default()
+            },
+            content: Vec::new(),
+        }
+    }
+
+    fn width_row(grid_before: u32, cells: Vec<model::TableCell>) -> model::TableRow {
+        model::TableRow {
+            properties: model::TableRowProperties {
+                grid_before,
+                ..Default::default()
+            },
+            cells,
+            rsids: Default::default(),
+            property_exceptions: None,
+        }
+    }
+
+    #[test]
+    fn auto_grid_uses_a_complete_repeated_consensus_cell_grid() {
+        let rows = vec![
+            width_row(0, vec![width_cell(2_438, 1), width_cell(2_438, 1)]),
+            width_row(0, vec![width_cell(2_438, 1), width_cell(2_438, 1)]),
+        ];
+        let mut widths = vec![Pt::new(102.25), Pt::new(102.30)];
+
+        assert!(apply_consensus_cell_width_grid(&mut widths, &rows));
+
+        assert_eq!(widths, vec![Pt::new(121.9), Pt::new(121.9)]);
+    }
+
+    #[test]
+    fn incomplete_or_spanned_cell_widths_do_not_change_the_grid() {
+        let rows = vec![
+            width_row(0, vec![width_cell(6_000, 2)]),
+            width_row(0, vec![width_cell(6_000, 2)]),
+        ];
+        let original = vec![Pt::new(100.0), Pt::new(60.0), Pt::new(40.0)];
+        let mut widths = original.clone();
+
+        assert!(!apply_consensus_cell_width_grid(&mut widths, &rows));
+
+        assert_eq!(widths, original);
+    }
+
+    #[test]
+    fn partial_or_nonuniform_cell_preferences_leave_the_grid_atomic() {
+        let cases = [
+            // One preferred column is smaller than its grid (en051 pattern).
+            vec![
+                width_row(0, vec![width_cell(2_677, 1), width_cell(2_057, 1)]),
+                width_row(0, vec![width_cell(2_677, 1), width_cell(2_057, 1)]),
+            ],
+            // Both grow, but by materially different amounts (en029 pattern).
+            vec![
+                width_row(0, vec![width_cell(1_596, 1), width_cell(1_596, 1)]),
+                width_row(0, vec![width_cell(1_596, 1), width_cell(1_596, 1)]),
+            ],
+        ];
+        let grids = [
+            vec![Pt::new(127.1), Pt::new(119.1)],
+            vec![Pt::new(78.45), Pt::new(77.95)],
+        ];
+
+        for (rows, original) in cases.into_iter().zip(grids) {
+            let mut widths = original.clone();
+            assert!(!apply_consensus_cell_width_grid(&mut widths, &rows));
+            assert_eq!(widths, original, "failure must not partially widen columns");
+        }
+    }
+
+    #[test]
+    fn a_single_row_or_single_column_is_not_a_consensus_grid() {
+        let mut two_columns = vec![Pt::new(100.0), Pt::new(100.0)];
+        assert!(!apply_consensus_cell_width_grid(
+            &mut two_columns,
+            &[width_row(
+                0,
+                vec![width_cell(2_100, 1), width_cell(2_100, 1)]
+            )]
+        ));
+
+        let mut one_column = vec![Pt::new(100.0)];
+        assert!(!apply_consensus_cell_width_grid(
+            &mut one_column,
+            &[
+                width_row(0, vec![width_cell(2_100, 1)]),
+                width_row(0, vec![width_cell(2_100, 1)])
+            ]
+        ));
+    }
+
+    #[test]
+    fn widened_auto_left_table_outdents_by_the_default_cell_margin() {
+        assert_eq!(
+            resolve_table_indent(
+                None,
+                None,
+                Some(model::TableMeasure::Auto),
+                true,
+                Dimension::new(108),
+            ),
+            Pt::new(-5.4)
+        );
+        assert_eq!(
+            resolve_table_indent(
+                None,
+                Some(model::Alignment::Center),
+                Some(model::TableMeasure::Auto),
+                true,
+                Dimension::new(108),
+            ),
+            Pt::ZERO,
+            "centered tables remain positioned as a unit"
+        );
+        assert_eq!(
+            resolve_table_indent(
+                None,
+                None,
+                Some(model::TableMeasure::Auto),
+                false,
+                Dimension::new(108),
+            ),
+            Pt::ZERO,
+            "an unchanged automatic grid keeps its historical origin"
+        );
+    }
+
+    #[test]
+    fn explicit_table_indent_wins_over_auto_grid_outdent() {
+        assert_eq!(
+            resolve_table_indent(
+                Some(model::TableMeasure::Twips(Dimension::new(240))),
+                None,
+                Some(model::TableMeasure::Auto),
+                true,
+                Dimension::new(108),
+            ),
+            Pt::new(12.0)
+        );
     }
 
     fn paragraph_style(block: &LayoutBlock) -> &ParagraphStyle {
