@@ -10,12 +10,12 @@
 
 use serde::Deserialize;
 
-use crate::docx::dimension::{Dimension, Emu};
+use crate::docx::dimension::{Dimension, Emu, SixtieThousandthDeg};
 use crate::docx::geometry::{EdgeInsets, Offset, Size};
 use crate::docx::model::{
     AnchorAlignment, AnchorPosition, AnchorProperties, AnchorRelativeFrom, ChartReference,
-    DocProperties, GraphicContent, GraphicFrameLocks, Image, ImagePlacement, RelId, TextWrap,
-    WrapPolygon, WrapText,
+    DocProperties, GraphicContent, GraphicFrameLocks, GroupTransform2D, Image, ImagePlacement,
+    RelId, TextWrap, WordProcessingGroup, WrapPolygon, WrapText,
 };
 use crate::docx::parse::primitives::units::{
     deserialize_nonnegative_dimension, deserialize_optional_nonnegative_dimension,
@@ -23,7 +23,7 @@ use crate::docx::parse::primitives::units::{
 
 use super::fill::AttrBool;
 use super::picture::PictureXml;
-use super::shape::WspXml;
+use super::shape::{ExtXml, OffXml, StBlackWhiteMode, WspXml};
 
 // ── Shared bits ───────────────────────────────────────────────────────────
 
@@ -145,8 +145,198 @@ pub(crate) struct GraphicDataXml {
     pub(crate) pic: Option<PictureXml>,
     #[serde(rename = "wsp", default)]
     pub(crate) wsp: Option<WspXml>,
+    #[serde(rename = "wgp", default)]
+    pub(crate) wgp: Option<WpgXml>,
     #[serde(rename = "chart", default)]
     pub(crate) chart: Option<ChartReferenceXml>,
+}
+
+/// §14.4 wpg:wgp. This first slice intentionally accepts only direct
+/// `wps:wsp` children. Other drawing children are represented explicitly so
+/// we can reject the group as a whole instead of silently drawing only a
+/// partial modern branch.
+#[derive(Deserialize)]
+pub(crate) struct WpgXml {
+    #[serde(rename = "$value", default)]
+    children: Vec<WpgChildXml>,
+}
+
+#[derive(Deserialize)]
+enum WpgChildXml {
+    #[serde(rename = "cNvGrpSpPr")]
+    NonVisual(IgnoredGroupChildXml),
+    #[serde(rename = "grpSpPr")]
+    Properties(GroupShapePropertiesXml),
+    #[serde(rename = "wsp")]
+    Shape(WspXml),
+    #[serde(rename = "grpSp")]
+    NestedGroup(IgnoredGroupChildXml),
+    #[serde(rename = "pic")]
+    Picture(IgnoredGroupChildXml),
+    #[serde(rename = "graphicFrame")]
+    GraphicFrame(IgnoredGroupChildXml),
+    #[serde(rename = "contentPart")]
+    ContentPart(IgnoredGroupChildXml),
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize, Default)]
+struct IgnoredGroupChildXml {}
+
+#[derive(Deserialize)]
+struct GroupShapePropertiesXml {
+    #[serde(rename = "@bwMode", default)]
+    black_white_mode: Option<StBlackWhiteMode>,
+    #[serde(rename = "$value", default)]
+    children: Vec<GroupShapePropertyChildXml>,
+}
+
+#[derive(Deserialize)]
+enum GroupShapePropertyChildXml {
+    #[serde(rename = "xfrm")]
+    Transform(GroupXfrmXml),
+    #[serde(other)]
+    Other,
+}
+
+/// §20.1.7.5 CT_GroupTransform2D — unlike ordinary `a:xfrm`, a group also
+/// defines the coordinate system used by its children.
+#[derive(Deserialize)]
+struct GroupXfrmXml {
+    #[serde(rename = "@rot", default)]
+    rotation: Option<Dimension<SixtieThousandthDeg>>,
+    #[serde(rename = "@flipH", default)]
+    flip_h: Option<AttrBool>,
+    #[serde(rename = "@flipV", default)]
+    flip_v: Option<AttrBool>,
+    #[serde(rename = "off", default)]
+    offset: Option<OffXml>,
+    #[serde(rename = "ext", default)]
+    extent: Option<ExtXml>,
+    #[serde(rename = "chOff", default)]
+    child_offset: Option<OffXml>,
+    #[serde(rename = "chExt", default)]
+    child_extent: Option<ExtXml>,
+}
+
+impl WpgXml {
+    fn into_direct_group(
+        self,
+        ctx: &mut crate::docx::parse::body::ConvertCtx,
+    ) -> Option<WordProcessingGroup> {
+        let mut transform = None;
+        let mut shapes = Vec::new();
+        let mut unsupported = false;
+
+        for child in self.children {
+            match child {
+                WpgChildXml::NonVisual(_) => {}
+                WpgChildXml::Properties(properties) if transform.is_none() => {
+                    match properties.into_direct_transform() {
+                        Some(value) => transform = Some(value),
+                        None => unsupported = true,
+                    }
+                }
+                WpgChildXml::Shape(shape) => shapes.push(shape),
+                WpgChildXml::Properties(_)
+                | WpgChildXml::NestedGroup(_)
+                | WpgChildXml::Picture(_)
+                | WpgChildXml::GraphicFrame(_)
+                | WpgChildXml::ContentPart(_)
+                | WpgChildXml::Other => unsupported = true,
+            }
+        }
+        if unsupported || shapes.is_empty() {
+            return None;
+        }
+
+        let shapes: Vec<_> = shapes
+            .into_iter()
+            .map(|shape| shape.into_model(ctx))
+            .collect();
+        // This first slice is geometry-only. Text bodies and child transforms
+        // need composed command transforms that the direct-group carrier does
+        // not yet provide. They remain structurally rejected and therefore
+        // retain the renderer's historical Anchor branch selection.
+        if shapes.iter().any(|shape| {
+            !shape.txbx_content.is_empty()
+                || shape
+                    .shape_properties
+                    .as_ref()
+                    .and_then(|properties| properties.transform)
+                    .is_some_and(|child| {
+                        child.rotation.is_some_and(|rotation| rotation.raw() != 0)
+                            || child.flip_h.unwrap_or(false)
+                            || child.flip_v.unwrap_or(false)
+                    })
+        }) {
+            return None;
+        }
+
+        Some(WordProcessingGroup {
+            transform: transform?,
+            shapes,
+        })
+    }
+}
+
+impl GroupShapePropertiesXml {
+    fn into_direct_transform(self) -> Option<GroupTransform2D> {
+        if !matches!(self.black_white_mode, None | Some(StBlackWhiteMode::Auto)) {
+            return None;
+        }
+        let mut transform = None;
+        for child in self.children {
+            match child {
+                GroupShapePropertyChildXml::Transform(value) if transform.is_none() => {
+                    transform = Some(value)
+                }
+                GroupShapePropertyChildXml::Transform(_) | GroupShapePropertyChildXml::Other => {
+                    return None
+                }
+            }
+        }
+        transform?.into_direct_transform()
+    }
+}
+
+impl GroupXfrmXml {
+    fn into_direct_transform(self) -> Option<GroupTransform2D> {
+        let offset = self.offset?;
+        let extent = self.extent?;
+        let child_offset = self.child_offset?;
+        let child_extent = self.child_extent?;
+
+        // Root-level group transforms with a separate offset/extent or a
+        // rotation/flip need a composed affine matrix. Keep this slice exact:
+        // the output and child grids must coincide, while wp:extent supplies
+        // the final scale (including the common one-EMU producer rounding).
+        if offset.x.raw() != 0
+            || offset.y.raw() != 0
+            || self.rotation.is_some_and(|rotation| rotation.raw() != 0)
+            || self.flip_h.is_some_and(|flip| flip.0)
+            || self.flip_v.is_some_and(|flip| flip.0)
+            || extent.cx.raw() <= 0
+            || extent.cy.raw() <= 0
+            || child_extent.cx.raw() <= 0
+            || child_extent.cy.raw() <= 0
+            || extent.cx != child_extent.cx
+            || extent.cy != child_extent.cy
+        {
+            return None;
+        }
+
+        Some(GroupTransform2D {
+            rotation: self.rotation,
+            flip_h: self.flip_h.map(|flip| flip.0),
+            flip_v: self.flip_v.map(|flip| flip.0),
+            offset: Offset::new(offset.x, offset.y),
+            extent: Size::new(extent.cx, extent.cy),
+            child_offset: Offset::new(child_offset.x, child_offset.y),
+            child_extent: Size::new(child_extent.cx, child_extent.cy),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -165,6 +355,9 @@ impl GraphicXml {
             Some(GraphicContent::Picture(pic.into()))
         } else if let Some(wsp) = data.wsp {
             Some(GraphicContent::WordProcessingShape(wsp.into_model(ctx)))
+        } else if let Some(wgp) = data.wgp {
+            wgp.into_direct_group(ctx)
+                .map(GraphicContent::WordProcessingGroup)
         } else {
             data.chart.and_then(|chart| {
                 let rel_id = chart.rel_id.filter(|rel_id| !rel_id.is_empty())?;
@@ -684,7 +877,7 @@ mod tests {
 
     fn parse_inline(xml: &str) -> Image {
         let wrapped = format!(
-            r#"<wrap xmlns:wp="urn:wp" xmlns:a="urn:a" xmlns:r="urn:r" xmlns:pic="urn:pic" xmlns:wps="urn:wps" xmlns:w="urn:w">{}</wrap>"#,
+            r#"<wrap xmlns:wp="urn:wp" xmlns:a="urn:a" xmlns:r="urn:r" xmlns:pic="urn:pic" xmlns:wps="urn:wps" xmlns:wpg="urn:wpg" xmlns:w="urn:w">{}</wrap>"#,
             xml
         );
         #[derive(Deserialize)]
@@ -698,7 +891,7 @@ mod tests {
 
     fn parse_anchor(xml: &str) -> Image {
         let wrapped = format!(
-            r#"<wrap xmlns:wp="urn:wp" xmlns:a="urn:a" xmlns:r="urn:r" xmlns:pic="urn:pic" xmlns:wps="urn:wps" xmlns:w="urn:w">{}</wrap>"#,
+            r#"<wrap xmlns:wp="urn:wp" xmlns:a="urn:a" xmlns:r="urn:r" xmlns:pic="urn:pic" xmlns:wps="urn:wps" xmlns:wpg="urn:wpg" xmlns:w="urn:w">{}</wrap>"#,
             xml
         );
         #[derive(Deserialize)]
@@ -733,6 +926,95 @@ mod tests {
         assert_eq!(img.doc_properties.name, "image1");
         assert!(matches!(img.placement, ImagePlacement::Inline { .. }));
         assert!(matches!(img.graphic, Some(GraphicContent::Picture(_))));
+    }
+
+    #[test]
+    fn anchored_direct_wpg_preserves_transform_and_shape_order() {
+        let img = parse_anchor(
+            r#"<anchor simplePos="0" relativeHeight="7" behindDoc="1" locked="0" allowOverlap="1">
+                <simplePos x="0" y="0"/>
+                <positionH relativeFrom="page"><posOffset>-100</posOffset></positionH>
+                <positionV relativeFrom="page"><posOffset>-200</posOffset></positionV>
+                <extent cx="2481787" cy="5436933"/>
+                <wrapNone/>
+                <docPr id="7" name="direct group"/>
+                <graphic><graphicData>
+                    <wpg:wgp>
+                        <wpg:cNvGrpSpPr/>
+                        <wpg:grpSpPr bwMode="auto"><a:xfrm>
+                            <a:off x="0" y="0"/><a:ext cx="2481786" cy="5436932"/>
+                            <a:chOff x="0" y="0"/><a:chExt cx="2481786" cy="5436932"/>
+                        </a:xfrm></wpg:grpSpPr>
+                        <wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="54855"/><a:ext cx="1666873" cy="1666873"/></a:xfrm><a:prstGeom prst="donut"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp>
+                        <wps:wsp><wps:spPr><a:xfrm><a:off x="1418162" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="donut"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp>
+                    </wpg:wgp>
+                </graphicData></graphic>
+            </anchor>"#,
+        );
+
+        let Some(GraphicContent::WordProcessingGroup(group)) = img.graphic else {
+            panic!("expected direct Word Processing Group");
+        };
+        assert_eq!(group.shapes.len(), 2);
+        assert_eq!(group.transform.child_extent.width.raw(), 2_481_786);
+        assert_eq!(group.transform.child_extent.height.raw(), 5_436_932);
+        let first = group.shapes[0]
+            .shape_properties
+            .as_ref()
+            .and_then(|properties| properties.transform)
+            .and_then(|transform| transform.offset)
+            .expect("first child transform");
+        let second = group.shapes[1]
+            .shape_properties
+            .as_ref()
+            .and_then(|properties| properties.transform)
+            .and_then(|transform| transform.offset)
+            .expect("second child transform");
+        assert_eq!((first.x.raw(), first.y.raw()), (0, 54_855));
+        assert_eq!((second.x.raw(), second.y.raw()), (1_418_162, 0));
+    }
+
+    #[test]
+    fn nested_wpg_is_rejected_as_a_whole() {
+        let img = parse_anchor(
+            r#"<anchor simplePos="0" relativeHeight="1" behindDoc="0" locked="0" allowOverlap="1">
+                <simplePos x="0" y="0"/>
+                <positionH relativeFrom="page"><posOffset>0</posOffset></positionH>
+                <positionV relativeFrom="page"><posOffset>0</posOffset></positionV>
+                <extent cx="1000" cy="1000"/><wrapNone/><docPr id="23" name="nested group"/>
+                <graphic><graphicData><wpg:wgp>
+                    <wpg:cNvGrpSpPr/>
+                    <wpg:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/><a:chOff x="0" y="0"/><a:chExt cx="1000" cy="1000"/></a:xfrm></wpg:grpSpPr>
+                    <wpg:grpSp><wpg:cNvGrpSpPr/></wpg:grpSp>
+                    <wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp>
+                </wpg:wgp></graphicData></graphic>
+            </anchor>"#,
+        );
+        assert!(
+            img.graphic.is_none(),
+            "partial nested groups must not render"
+        );
+    }
+
+    #[test]
+    fn wpg_group_level_visuals_are_rejected_as_a_whole() {
+        let img = parse_anchor(
+            r#"<anchor simplePos="0" relativeHeight="1" behindDoc="0" locked="0" allowOverlap="1">
+                <simplePos x="0" y="0"/>
+                <positionH relativeFrom="page"><posOffset>0</posOffset></positionH>
+                <positionV relativeFrom="page"><posOffset>0</posOffset></positionV>
+                <extent cx="1000" cy="1000"/><wrapNone/><docPr id="24" name="styled group"/>
+                <graphic><graphicData><wpg:wgp>
+                    <wpg:cNvGrpSpPr/>
+                    <wpg:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/><a:chOff x="0" y="0"/><a:chExt cx="1000" cy="1000"/></a:xfrm><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></wpg:grpSpPr>
+                    <wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp>
+                </wpg:wgp></graphicData></graphic>
+            </anchor>"#,
+        );
+        assert!(
+            img.graphic.is_none(),
+            "group-level visuals need inheritance support before the modern branch is live"
+        );
     }
 
     #[test]

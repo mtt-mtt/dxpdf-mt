@@ -134,6 +134,13 @@ pub enum GraphicContent {
     Picture(Picture),
     /// §14.5 wps:wsp: Word Processing Shape.
     WordProcessingShape(WordProcessingShape),
+    /// §14.4 wpg:wgp: a direct Word Processing Group.
+    ///
+    /// The first supported slice deliberately contains only direct `wps:wsp`
+    /// children. Nested groups, pictures, and graphic frames remain
+    /// unsupported until their transforms can be composed without dropping
+    /// content; they are never partially emitted as this variant.
+    WordProcessingGroup(WordProcessingGroup),
     /// §21.2.2.27 c:chart: relationship to a DrawingML chart part.
     Chart(ChartReference),
 }
@@ -141,6 +148,30 @@ pub enum GraphicContent {
 #[derive(Clone, Debug)]
 pub struct ChartReference {
     pub rel_id: RelId,
+}
+
+/// §14.4 wpg:wgp — a shape-only Word Processing Group.
+#[derive(Clone, Debug)]
+pub struct WordProcessingGroup {
+    /// Root group transform. The supported direct-group slice requires the
+    /// root output and child coordinate systems to be complete and unrotated.
+    pub transform: GroupTransform2D,
+    /// Direct child shapes in source order (also their z-order).
+    pub shapes: Vec<WordProcessingShape>,
+}
+
+/// §20.1.7.5 CT_GroupTransform2D.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupTransform2D {
+    pub rotation: Option<Dimension<SixtieThousandthDeg>>,
+    pub flip_h: Option<bool>,
+    pub flip_v: Option<bool>,
+    /// Group offset and extent in its parent coordinate system.
+    pub offset: Offset<Emu>,
+    pub extent: Size<Emu>,
+    /// Coordinate system used by direct children.
+    pub child_offset: Offset<Emu>,
+    pub child_extent: Size<Emu>,
 }
 
 /// §14.5 wps:wsp — a Word Processing Shape.

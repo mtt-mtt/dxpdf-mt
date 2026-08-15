@@ -89,7 +89,8 @@ fn document(run_body: &str) -> String {
             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
             xmlns:v="urn:schemas-microsoft-com:vml"
-            xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+            xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+            xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup">
   <w:body>
     <w:p><w:r>{run_body}</w:r></w:p>
   </w:body>
@@ -231,6 +232,37 @@ fn inline_wpg_group() -> String {
          </wp:inline>
        </w:drawing>"#
         .to_string()
+}
+
+/// A direct, geometry-only WPG anchor. This is the safe subset used by the
+/// ONLYOFFICE header decoration: the root and child grids coincide and every
+/// drawable child is a direct `wps:wsp`.
+fn anchored_direct_wpg_group() -> String {
+    r#"<w:drawing>
+         <wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0"
+                    relativeHeight="7" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">
+           <wp:simplePos x="0" y="0"/>
+           <wp:positionH relativeFrom="page"><wp:posOffset>127000</wp:posOffset></wp:positionH>
+           <wp:positionV relativeFrom="page"><wp:posOffset>254000</wp:posOffset></wp:positionV>
+           <wp:extent cx="1270000" cy="635000"/><wp:wrapNone/><wp:docPr id="7" name="DirectGroup"/>
+           <a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup">
+             <wpg:wgp>
+               <wpg:cNvGrpSpPr/>
+               <wpg:grpSpPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="635000"/><a:chOff x="0" y="0"/><a:chExt cx="1270000" cy="635000"/></a:xfrm></wpg:grpSpPr>
+               <wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></wps:spPr></wps:wsp>
+               <wps:wsp><wps:spPr><a:xfrm><a:off x="635000" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="ED7D31"/></a:solidFill></wps:spPr></wps:wsp>
+             </wpg:wgp>
+           </a:graphicData></a:graphic>
+         </wp:anchor>
+       </w:drawing>"#
+        .to_string()
+}
+
+/// A structurally valid direct group whose preset has no geometry generator.
+/// The parser can preserve it, but the MCE Choice must not become live until
+/// every child can actually be drawn.
+fn anchored_unrenderable_wpg_group() -> String {
+    anchored_direct_wpg_group().replace("prst=\"rect\"", "prst=\"star12\"")
 }
 
 /// An `<mc:AlternateContent>` with one Choice declaring `requires`.
@@ -392,6 +424,14 @@ fn a_meetable_choice_with_nothing_drawable_still_yields_to_the_fallback() {
     );
 }
 
+fn nonempty_path_count(pages: &[LayoutedPage]) -> usize {
+    pages
+        .iter()
+        .flat_map(|page| page.commands.iter())
+        .filter(|command| matches!(command, DrawCommand::Path { paths, .. } if !paths.is_empty()))
+        .count()
+}
+
 /// A supported inline picture is owned by the fragment collector. Selecting
 /// the Choice must make every part of the VML fallback inert, otherwise the
 /// fallback rect and label are rendered alongside the picture.
@@ -413,6 +453,44 @@ fn an_inline_wpg_group_still_yields_to_the_fallback() {
     let pages = layout(&alternate_content(
         "wpg",
         &inline_wpg_group(),
+        &vml_rect("Fallback"),
+    ));
+
+    assert_eq!(image_count(&pages), 0);
+    assert!(path_count(&pages) >= 1, "the fallback rect is live");
+    assert_eq!(text_count(&pages, "Fallback"), 1);
+}
+
+#[test]
+fn an_anchored_direct_wpg_group_draws_each_child_and_suppresses_fallback() {
+    let pages = layout(&alternate_content(
+        "wpg",
+        &anchored_direct_wpg_group(),
+        &vml_rect("Fallback"),
+    ));
+
+    assert_eq!(nonempty_path_count(&pages), 2, "two direct WPS children");
+    assert_eq!(text_count(&pages, "Fallback"), 0, "fallback stays inert");
+}
+
+#[test]
+fn an_anchored_unrenderable_wpg_group_yields_to_the_fallback() {
+    let pages = layout(&alternate_content(
+        "wpg",
+        &anchored_unrenderable_wpg_group(),
+        &vml_rect("Fallback"),
+    ));
+
+    assert_eq!(image_count(&pages), 0);
+    assert!(path_count(&pages) >= 1, "the fallback rect is live");
+    assert_eq!(text_count(&pages, "Fallback"), 1);
+}
+
+#[test]
+fn a_mislabeled_anchored_unrenderable_wpg_group_still_yields_to_the_fallback() {
+    let pages = layout(&alternate_content(
+        "wps",
+        &anchored_unrenderable_wpg_group(),
         &vml_rect("Fallback"),
     ));
 

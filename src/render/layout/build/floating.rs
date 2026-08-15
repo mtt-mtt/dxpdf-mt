@@ -240,7 +240,11 @@ fn find_anchor_shapes<'a>(
                 if matches!(img.placement, ImagePlacement::Anchor(_))
                     && matches!(
                         img.graphic,
-                        Some(GraphicContent::WordProcessingShape(_) | GraphicContent::Chart(_))
+                        Some(
+                            GraphicContent::WordProcessingShape(_)
+                                | GraphicContent::WordProcessingGroup(_)
+                                | GraphicContent::Chart(_)
+                        )
                     ) =>
             {
                 out.push(img);
@@ -282,12 +286,13 @@ pub(super) fn extract_floating_shapes(
     // paragraph-relative offset (most visible with callout bubbles).  Keep
     // independent VML-only shapes eligible; suppress only this duplicate
     // fallback case.
-    let has_text_shape = shape_imgs.iter().any(|img| {
-        matches!(
-            img.graphic.as_ref(),
-            Some(GraphicContent::WordProcessingShape(wsp))
-                if !wsp.txbx_content.is_empty()
-        )
+    let has_text_shape = shape_imgs.iter().any(|img| match img.graphic.as_ref() {
+        Some(GraphicContent::WordProcessingShape(wsp)) => !wsp.txbx_content.is_empty(),
+        Some(GraphicContent::WordProcessingGroup(group)) => group
+            .shapes
+            .iter()
+            .any(|shape| !shape.txbx_content.is_empty()),
+        _ => false,
     });
     let mut shapes = Vec::new();
     for img in shape_imgs {
@@ -302,6 +307,14 @@ pub(super) fn extract_floating_shapes(
             ShapeAnchorClass::PageAnchored => !anchors_to_paragraph(anchor),
         };
         if !class_match {
+            continue;
+        }
+        if let Some(GraphicContent::WordProcessingGroup(group)) = img.graphic.as_ref() {
+            if let Some(group_shape) =
+                build_direct_word_processing_group(img, group, anchor, ctx, state, frame)
+            {
+                shapes.push(group_shape);
+            }
             continue;
         }
         if let Some(GraphicContent::Chart(reference)) = img.graphic.as_ref() {
@@ -352,82 +365,23 @@ pub(super) fn extract_floating_shapes(
             _ => continue,
         };
         let shape_props = wsp.shape_properties.as_ref();
-        let geometry = match shape_props.and_then(|p| p.geometry.as_ref()) {
-            Some(g) => g,
-            None => continue, // No geometry → nothing to draw.
-        };
-
         let w = Pt::from(img.extent.width);
         let h = Pt::from(img.extent.height);
         let outer_extent = PtSize::new(w, h);
         let extent = wps_top_and_bottom_extent(anchor, outer_extent, shape_props);
-
-        let (shape_path, used_geometry_fallback) = match build_geometry(geometry, extent) {
-            Some(p) => (p, false),
-            None if !wsp.txbx_content.is_empty() => {
-                // Keep the text body even when a decorative preset (for
-                // example WedgeRectCallout in thesis templates) has no
-                // geometry generator yet.  Dropping the whole shape here
-                // loses user-visible instructions and placeholders; a
-                // bounding rectangle is a safe geometry fallback because
-                // the text layout remains shape-local and the original
-                // fill/line resolution still decides whether it is visible.
-                (fallback_text_box_shape_path(extent), true)
-            }
-            None => continue, // Unimplemented preset or empty geometry.
+        let Some(built) = build_word_processing_shape_local(wsp, extent, ctx, state) else {
+            continue;
         };
-
-        let visuals = resolve_shape_visuals(
-            shape_props,
-            wsp.style_line_ref.as_ref(),
-            wsp.style_effect_ref.as_ref(),
-            wsp.style_fill_ref.as_ref(),
-            ctx.resolved.theme.as_ref(),
-        );
-
-        // §20.1.7.6 transform attributes (rotation/flip) live on the shape's
-        // `spPr/xfrm`; anchor position is independent.
-        let (rotation, flip_h, flip_v) = shape_props
-            .and_then(|p| p.transform.as_ref())
-            .map(|t| {
-                (
-                    t.rotation
-                        .unwrap_or_else(|| crate::model::dimension::Dimension::new(0)),
-                    t.flip_h.unwrap_or(false),
-                    t.flip_v.unwrap_or(false),
-                )
-            })
-            .unwrap_or((crate::model::dimension::Dimension::new(0), false, false));
-
         let (x, y) = resolve_anchor_position(anchor, w, h, state, frame);
         let wrap_distance = effective_wrap_distance(anchor);
-
-        // §17.17.1: lay out the shape's text-box content (`wps:txbx`) into
-        // shape-local Pt commands. Both paragraph- and page-anchored shapes
-        // benefit from the typed sub-layout — the consumer shifts the
-        // commands by the shape's resolved origin (whether `RelativeToParagraph`
-        // or `Absolute`), so text always lands on the shape's fill.
-        let text_commands = build_shape_text_commands(wsp, extent, ctx, state);
-
-        let stroke = if used_geometry_fallback && visuals.stroke.is_none() {
-            Some(crate::render::layout::draw_command::ResolvedStroke {
-                width: Pt::new(0.75),
-                color: crate::render::resolve::drawing_color::Rgba::BLACK,
-                dash: crate::render::layout::draw_command::ResolvedDashPattern::Solid,
-                cap: crate::render::layout::draw_command::ResolvedLineCap::Butt,
-                join: crate::render::layout::draw_command::ResolvedLineJoin::Round,
-            })
-        } else {
-            visuals.stroke
-        };
 
         shapes.push(FloatingShape {
             x,
             y,
             size: extent,
-            rotation,
-            flip_h,
-            flip_v,
+            rotation: built.rotation,
+            flip_h: built.flip_h,
+            flip_v: built.flip_v,
             wrap_mode: crate::render::layout::section::WrapMode::from_model(&anchor.wrap),
             dist_top: Pt::from(wrap_distance.top),
             dist_bottom: Pt::from(wrap_distance.bottom),
@@ -435,11 +389,11 @@ pub(super) fn extract_floating_shapes(
             dist_right: Pt::from(wrap_distance.right),
             behind_doc: anchor.behind_text,
             relative_height: anchor.relative_height,
-            paths: shape_path.paths,
-            fill: visuals.fill,
-            stroke,
-            effects: visuals.effects,
-            text_commands,
+            paths: built.paths,
+            fill: built.fill,
+            stroke: built.stroke,
+            effects: built.effects,
+            text_commands: built.text_commands,
         });
     }
 
@@ -452,6 +406,230 @@ pub(super) fn extract_floating_shapes(
     }
 
     shapes
+}
+
+struct BuiltWordProcessingShape {
+    rotation: crate::model::dimension::Dimension<crate::model::dimension::SixtieThousandthDeg>,
+    flip_h: bool,
+    flip_v: bool,
+    paths: Vec<crate::render::resolve::shape_geometry::SubPath>,
+    fill: crate::render::layout::draw_command::ResolvedFill,
+    stroke: Option<crate::render::layout::draw_command::ResolvedStroke>,
+    effects: Vec<crate::render::layout::draw_command::ResolvedEffect>,
+    text_commands: Vec<crate::render::layout::draw_command::DrawCommand>,
+}
+
+/// Build one WPS child's geometry and text in a caller-provided local box.
+/// Both ordinary anchored shapes and direct WPG children use this so their
+/// fill/stroke/theme/text behavior cannot drift.
+fn build_word_processing_shape_local(
+    wsp: &crate::model::WordProcessingShape,
+    extent: PtSize,
+    ctx: &BuildContext,
+    state: &BuildState,
+) -> Option<BuiltWordProcessingShape> {
+    let shape_props = wsp.shape_properties.as_ref();
+    let geometry = shape_props.and_then(|properties| properties.geometry.as_ref())?;
+    let (shape_path, used_geometry_fallback) = match build_geometry(geometry, extent) {
+        Some(path) => (path, false),
+        None if !wsp.txbx_content.is_empty() => (fallback_text_box_shape_path(extent), true),
+        None => return None,
+    };
+
+    let visuals = resolve_shape_visuals(
+        shape_props,
+        wsp.style_line_ref.as_ref(),
+        wsp.style_effect_ref.as_ref(),
+        wsp.style_fill_ref.as_ref(),
+        ctx.resolved.theme.as_ref(),
+    );
+    let (rotation, flip_h, flip_v) = shape_props
+        .and_then(|properties| properties.transform.as_ref())
+        .map(|transform| {
+            (
+                transform
+                    .rotation
+                    .unwrap_or_else(|| crate::model::dimension::Dimension::new(0)),
+                transform.flip_h.unwrap_or(false),
+                transform.flip_v.unwrap_or(false),
+            )
+        })
+        .unwrap_or((crate::model::dimension::Dimension::new(0), false, false));
+    let stroke = if used_geometry_fallback && visuals.stroke.is_none() {
+        Some(crate::render::layout::draw_command::ResolvedStroke {
+            width: Pt::new(0.75),
+            color: crate::render::resolve::drawing_color::Rgba::BLACK,
+            dash: crate::render::layout::draw_command::ResolvedDashPattern::Solid,
+            cap: crate::render::layout::draw_command::ResolvedLineCap::Butt,
+            join: crate::render::layout::draw_command::ResolvedLineJoin::Round,
+        })
+    } else {
+        visuals.stroke
+    };
+
+    Some(BuiltWordProcessingShape {
+        rotation,
+        flip_h,
+        flip_v,
+        paths: shape_path.paths,
+        fill: visuals.fill,
+        stroke,
+        effects: visuals.effects,
+        text_commands: build_shape_text_commands(wsp, extent, ctx, state),
+    })
+}
+
+/// Flatten a direct, unrotated WPG into one atomic floating carrier. Child
+/// paths stay in document order and are shifted by the carrier as a unit, so
+/// behindDoc and relativeHeight continue to apply to the complete group.
+fn build_direct_word_processing_group(
+    image: &crate::model::Image,
+    group: &crate::model::WordProcessingGroup,
+    anchor: &crate::model::AnchorProperties,
+    ctx: &BuildContext,
+    state: &BuildState,
+    frame: AnchorFrame,
+) -> Option<FloatingShape> {
+    use crate::render::layout::draw_command::{DrawCommand, ResolvedFill};
+
+    if !direct_word_processing_group_is_drawable(image, group) {
+        return None;
+    }
+    let outer_extent = PtSize::new(Pt::from(image.extent.width), Pt::from(image.extent.height));
+    if outer_extent.width <= Pt::ZERO || outer_extent.height <= Pt::ZERO {
+        return None;
+    }
+    let mut commands = Vec::new();
+
+    for child in &group.shapes {
+        let transform = child.shape_properties.as_ref()?.transform?;
+        let (local_origin, local_extent) =
+            direct_group_child_rect(group.transform, outer_extent, transform)?;
+        let built = build_word_processing_shape_local(child, local_extent, ctx, state)?;
+        commands.push(DrawCommand::Path {
+            origin: local_origin,
+            rotation: built.rotation,
+            flip_h: built.flip_h,
+            flip_v: built.flip_v,
+            extent: local_extent,
+            paths: built.paths,
+            fill: built.fill,
+            stroke: built.stroke,
+            effects: built.effects,
+        });
+        for mut command in built.text_commands {
+            command.shift(local_origin.x, local_origin.y);
+            commands.push(command);
+        }
+    }
+
+    let (x, y) = resolve_anchor_position(
+        anchor,
+        outer_extent.width,
+        outer_extent.height,
+        state,
+        frame,
+    );
+    let wrap_distance = effective_wrap_distance(anchor);
+    Some(FloatingShape {
+        x,
+        y,
+        size: outer_extent,
+        rotation: crate::model::dimension::Dimension::new(0),
+        flip_h: false,
+        flip_v: false,
+        wrap_mode: crate::render::layout::section::WrapMode::from_model(&anchor.wrap),
+        dist_top: Pt::from(wrap_distance.top),
+        dist_bottom: Pt::from(wrap_distance.bottom),
+        dist_left: Pt::from(wrap_distance.left),
+        dist_right: Pt::from(wrap_distance.right),
+        behind_doc: anchor.behind_text,
+        relative_height: anchor.relative_height,
+        paths: Vec::new(),
+        fill: ResolvedFill::None,
+        stroke: None,
+        effects: Vec::new(),
+        text_commands: commands,
+    })
+}
+
+/// Whether the direct WPG slice can produce every child command without
+/// silently dropping the selected MCE branch. Keep this predicate independent
+/// of theme/media state so branch selection and the actual builder agree.
+pub(in crate::render::layout) fn direct_word_processing_group_is_drawable(
+    image: &crate::model::Image,
+    group: &crate::model::WordProcessingGroup,
+) -> bool {
+    let outer_extent = PtSize::new(Pt::from(image.extent.width), Pt::from(image.extent.height));
+    outer_extent.width > Pt::ZERO
+        && outer_extent.height > Pt::ZERO
+        && !group.shapes.is_empty()
+        && group.shapes.iter().all(|child| {
+            if !child.txbx_content.is_empty() {
+                return false;
+            }
+            let Some(properties) = child.shape_properties.as_ref() else {
+                return false;
+            };
+            if matches!(
+                properties.fill.as_ref(),
+                Some(crate::model::DrawingFill::Group)
+            ) {
+                return false;
+            }
+            let Some(transform) = properties.transform else {
+                return false;
+            };
+            if transform
+                .rotation
+                .is_some_and(|rotation| rotation.raw() != 0)
+                || transform.flip_h.unwrap_or(false)
+                || transform.flip_v.unwrap_or(false)
+            {
+                return false;
+            }
+            let Some((_, extent)) =
+                direct_group_child_rect(group.transform, outer_extent, transform)
+            else {
+                return false;
+            };
+            properties
+                .geometry
+                .as_ref()
+                .and_then(|geometry| build_geometry(geometry, extent))
+                .is_some()
+        })
+}
+
+fn direct_group_child_rect(
+    group: crate::model::GroupTransform2D,
+    outer_extent: PtSize,
+    child: crate::model::Transform2D,
+) -> Option<(PtOffset, PtSize)> {
+    let child_grid_width = Pt::from(group.child_extent.width);
+    let child_grid_height = Pt::from(group.child_extent.height);
+    let offset = child.offset?;
+    let extent = child.extent?;
+    if child_grid_width <= Pt::ZERO
+        || child_grid_height <= Pt::ZERO
+        || extent.width.raw() <= 0
+        || extent.height.raw() <= 0
+    {
+        return None;
+    }
+
+    let scale_x = outer_extent.width.raw() / child_grid_width.raw();
+    let scale_y = outer_extent.height.raw() / child_grid_height.raw();
+    Some((
+        PtOffset::new(
+            (Pt::from(offset.x) - Pt::from(group.child_offset.x)) * scale_x,
+            (Pt::from(offset.y) - Pt::from(group.child_offset.y)) * scale_y,
+        ),
+        PtSize::new(
+            Pt::from(extent.width) * scale_x,
+            Pt::from(extent.height) * scale_y,
+        ),
+    ))
 }
 
 fn fallback_text_box_shape_path(
@@ -2154,13 +2332,13 @@ fn overflow_keeps(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_vml_absolute_position, wps_top_and_bottom_extent};
-    use crate::model::dimension::Dimension;
+    use super::{direct_group_child_rect, find_vml_absolute_position, wps_top_and_bottom_extent};
+    use crate::model::dimension::{Dimension, Emu};
     use crate::model::geometry::{EdgeInsets, Size};
     use crate::model::{
         AlternateContent, AnchorPosition, AnchorProperties, AnchorRelativeFrom, DocProperties,
-        GraphicContent, Image, ImagePlacement, Inline, McChoice, McRequires, ShapeProperties,
-        TextWrap, Transform2D, WordProcessingShape,
+        GraphicContent, GroupTransform2D, Image, ImagePlacement, Inline, McChoice, McRequires,
+        ShapeProperties, TextWrap, Transform2D, WordProcessingShape,
     };
     use crate::render::dimension::Pt;
     use crate::render::geometry::PtSize;
@@ -2235,6 +2413,33 @@ mod tests {
             live_mc_branch(&ac_with_wps_choice()),
             McBranch::Choice(_)
         ));
+    }
+
+    #[test]
+    fn a_structurally_rejected_wpg_keeps_existing_anchor_selection() {
+        let mut unsupported = anchored_wps_image();
+        unsupported.graphic = None;
+        let wpg = AlternateContent {
+            choices: vec![McChoice {
+                requires: vec![McRequires::Wpg],
+                content: vec![Inline::Image(Box::new(unsupported.clone()))],
+            }],
+            fallback: Some(vec![Inline::InstrText("fallback".into())]),
+        };
+        // A rejected nested/group-picture WPG has no model variant on which
+        // the direct-group preflight can run. Keep the long-standing anchor
+        // selection here: routing such groups into the still-partial VML group
+        // flow can be a larger fidelity regression than emitting neither.
+        assert!(matches!(live_mc_branch(&wpg), McBranch::Choice(_)));
+
+        let ordinary = AlternateContent {
+            choices: vec![McChoice {
+                requires: vec![McRequires::Wps],
+                content: vec![Inline::Image(Box::new(unsupported))],
+            }],
+            fallback: Some(vec![Inline::InstrText("fallback".into())]),
+        };
+        assert!(matches!(live_mc_branch(&ordinary), McBranch::Choice(_)));
     }
 
     #[test]
@@ -3851,5 +4056,48 @@ mod tests {
             );
             assert_eq!(shape.stroke.is_some(), stroked != Some(false));
         }
+    }
+
+    #[test]
+    fn direct_wpg_child_rect_normalizes_the_group_grid_to_wp_extent() {
+        let group = GroupTransform2D {
+            rotation: None,
+            flip_h: None,
+            flip_v: None,
+            offset: crate::model::geometry::Offset::new(Dimension::new(0), Dimension::new(0)),
+            extent: Size::new(Dimension::new(2_481_786), Dimension::new(5_436_932)),
+            child_offset: crate::model::geometry::Offset::new(Dimension::new(0), Dimension::new(0)),
+            child_extent: Size::new(Dimension::new(2_481_786), Dimension::new(5_436_932)),
+        };
+        let child = Transform2D {
+            rotation: None,
+            flip_h: None,
+            flip_v: None,
+            offset: Some(crate::model::geometry::Offset::new(
+                Dimension::new(0),
+                Dimension::new(54_855),
+            )),
+            extent: Some(Size::new(
+                Dimension::new(1_666_873),
+                Dimension::new(1_666_873),
+            )),
+        };
+        let outer = PtSize::new(
+            Pt::from(Dimension::<Emu>::new(2_481_787)),
+            Pt::from(Dimension::<Emu>::new(5_436_933)),
+        );
+        let (origin, extent) =
+            direct_group_child_rect(group, outer, child).expect("direct child maps");
+        let page_x = Pt::from(Dimension::<Emu>::new(-851_845)) + origin.x;
+        let page_y = Pt::from(Dimension::<Emu>::new(-180_038)) + origin.y;
+
+        assert_x(page_x.raw(), -67.074, "first donut left");
+        assert_x(page_y.raw(), -9.857, "first donut top");
+        assert_x((page_x + extent.width).raw(), 64.176, "first donut right");
+        assert_x(
+            (page_y + extent.height).raw(),
+            121.393,
+            "first donut bottom",
+        );
     }
 }

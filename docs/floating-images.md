@@ -143,7 +143,7 @@ element rather than of who asked:
 | Walker | On `Choice` | On `Fallback` |
 |---|---|---|
 | `find_anchor_images` (DrawingML pictures) | recurse into the live Choice | recurse into the Fallback |
-| `find_anchor_shapes` (`wps:wsp` shapes) | ” | ” |
+| `find_anchor_shapes` (`wps:wsp` shapes and supported direct `wpg:wgp` groups) | ” | ” |
 | `extract_vml_floating_images` (VML images) | ” | ” |
 | `extract_vml_primitive_shapes` (VML rects) | ” | ” |
 | `fragment::collect` (inline content) | collect inline pictures; anchors naturally skip | collect |
@@ -193,6 +193,27 @@ Coverage is `tests/mce_branch_selection.rs` (page-level, against inline
 fixtures) plus the `live_mc_branch` and fragment-collector unit tests. The
 inline-picture case is pinned separately from inline `wps:wsp` and `wpg`
 groups so widening Choice support cannot strand their still-required fallback.
+
+### Direct anchored Word Processing Groups
+
+Anchored `wpg:wgp` groups are rendered when every drawable child is a direct,
+geometry-only `wps:wsp` with no `txbxContent` or child rotation/flip, the root
+has no group-level visuals or nested group/picture/graphic-frame children, and
+its unrotated output and child
+extents describe the same coordinate grid. Inherited `grpFill`, missing
+transforms, and unsupported geometry prevent a parsed direct group from being
+emitted; runtime geometry failures leave MCE's fallback live. Structurally
+rejected text-bearing, transformed, nested, picture, or group-visual variants
+retain the existing anchor branch selection until VML group layout is complete.
+The outer `wp:extent` normalizes the accepted grid (including common one-EMU
+producer rounding); each child
+offset/extent is mapped into one atomic floating carrier. Child paths stay in
+source order, while the carrier owns the outer wrap mode, `behindDoc`, and
+`relativeHeight`.
+
+Nested groups require recursive affine composition and are rejected as a
+whole rather than partially painted. Inline groups still have no fragment
+renderer and continue to use their VML fallback.
 
 ## Shape Text Bodies — §20.1.2.1.1 / §20.1.10.60
 

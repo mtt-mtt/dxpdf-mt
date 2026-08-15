@@ -125,6 +125,11 @@ fn rewrite_in_image(image: &mut Image, remap: &HashMap<RelId, RelId>) {
             GraphicContent::WordProcessingShape(wsp) => {
                 rewrite_in_word_processing_shape(wsp, remap);
             }
+            GraphicContent::WordProcessingGroup(group) => {
+                for shape in &mut group.shapes {
+                    rewrite_in_word_processing_shape(shape, remap);
+                }
+            }
             GraphicContent::Chart(chart) => {
                 if let Some(new_id) = remap.get(&chart.rel_id) {
                     chart.rel_id = new_id.clone();
@@ -273,7 +278,7 @@ fn rewrite_in_hyperlink_target(target: &mut HyperlinkTarget, remap: &HashMap<Rel
 mod tests {
     use super::*;
     use crate::model::dimension::Dimension;
-    use crate::model::geometry::{EdgeInsets, Size};
+    use crate::model::geometry::{EdgeInsets, Offset, Size};
     use crate::model::*;
 
     fn remap_one(from: &str, to: &str) -> HashMap<RelId, RelId> {
@@ -600,6 +605,50 @@ mod tests {
         };
         let blip = blip_fill.blip.as_ref().unwrap();
         assert_eq!(blip.embed.as_ref().unwrap().as_str(), "synth_shape_fill");
+    }
+
+    #[test]
+    fn rewrites_relationships_inside_direct_word_processing_groups() {
+        let mut image = shape_with_text(vec![], Some(shape_props_with_blip_fill("rId1")));
+        let Some(GraphicContent::WordProcessingShape(child)) = image.graphic.take() else {
+            panic!("shape fixture");
+        };
+        image.graphic = Some(GraphicContent::WordProcessingGroup(WordProcessingGroup {
+            transform: GroupTransform2D {
+                rotation: None,
+                flip_h: None,
+                flip_v: None,
+                offset: Offset::new(Dimension::new(0), Dimension::new(0)),
+                extent: Size::new(Dimension::new(100), Dimension::new(100)),
+                child_offset: Offset::new(Dimension::new(0), Dimension::new(0)),
+                child_extent: Size::new(Dimension::new(100), Dimension::new(100)),
+            },
+            shapes: vec![child],
+        }));
+        let mut blocks = vec![paragraph_with_image(image)];
+
+        rewrite_part_rels_in_blocks(&mut blocks, &remap_one("rId1", "group_fill"));
+
+        let Block::Paragraph(paragraph) = &blocks[0] else {
+            panic!();
+        };
+        let Inline::Image(image) = &paragraph.content[0] else {
+            panic!();
+        };
+        let Some(GraphicContent::WordProcessingGroup(group)) = &image.graphic else {
+            panic!();
+        };
+        let Some(DrawingFill::Blip(fill)) = group.shapes[0]
+            .shape_properties
+            .as_ref()
+            .and_then(|properties| properties.fill.as_ref())
+        else {
+            panic!();
+        };
+        assert_eq!(
+            fill.blip.as_ref().unwrap().embed.as_ref().unwrap().as_str(),
+            "group_fill"
+        );
     }
 
     #[test]

@@ -56,10 +56,12 @@ pub(crate) enum McBranch<'a> {
 /// The test is **content-based**, not a `Requires` namespace check: a Choice
 /// may declare a namespace we nominally support and still hold nothing this
 /// renderer turns into geometry, and the honest question is whether we will
-/// actually draw it. What counts is either an *anchor* — preserving the
-/// renderer's established floating-object behaviour — or an inline DrawingML
-/// picture. Inline `wps:wsp` shapes and `wpg` groups are not layout fragments,
-/// so they must continue to yield to their VML fallback.
+/// actually draw it. Anchored graphics preserve the renderer's established
+/// floating-object behaviour. A parsed direct WPG additionally passes the same
+/// all-children preflight used by its builder, so a modern branch whose geometry
+/// cannot be emitted does not suppress a usable VML fallback. Inline `wps:wsp`
+/// shapes and `wpg` groups are not layout fragments and continue to yield to
+/// that fallback.
 ///
 /// Recurses through `Hyperlink`/`Field` wrappers and nested elements. §M.1.2's
 /// content model for a branch is `drawing | pict`, so a nested
@@ -72,7 +74,12 @@ pub(crate) fn live_mc_branch(ac: &crate::model::AlternateContent) -> McBranch<'_
     fn is_drawable(inlines: &[Inline]) -> bool {
         inlines.iter().any(|inline| match inline {
             Inline::Image(img) => match img.placement {
-                ImagePlacement::Anchor(_) => true,
+                ImagePlacement::Anchor(_) => match &img.graphic {
+                    Some(GraphicContent::WordProcessingGroup(group)) => {
+                        build::floating::direct_word_processing_group_is_drawable(img, group)
+                    }
+                    Some(_) | None => true,
+                },
                 ImagePlacement::Inline { .. } => {
                     matches!(&img.graphic, Some(GraphicContent::Picture(_)))
                 }
@@ -86,7 +93,11 @@ pub(crate) fn live_mc_branch(ac: &crate::model::AlternateContent) -> McBranch<'_
         })
     }
 
-    if let Some(choice) = ac.choices.iter().find(|c| is_drawable(&c.content)) {
+    if let Some(choice) = ac
+        .choices
+        .iter()
+        .find(|choice| is_drawable(&choice.content))
+    {
         McBranch::Choice(&choice.content)
     } else {
         match ac.fallback {
