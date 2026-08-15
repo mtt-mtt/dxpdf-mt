@@ -14,6 +14,7 @@ mod donut;
 mod ellipse;
 mod line;
 mod rect;
+mod wedge_ellipse_callout;
 mod wedge_rect_callout;
 
 use crate::model::{PresetGeometryDef, PresetShapeType};
@@ -32,6 +33,7 @@ pub fn build_preset(def: &PresetGeometryDef, extent: PtSize) -> Option<ShapePath
         PresetShapeType::AccentCallout1 => Some(accent_callout::build(def, extent, 2)),
         PresetShapeType::AccentCallout2 => Some(accent_callout::build(def, extent, 3)),
         PresetShapeType::AccentCallout3 => Some(accent_callout::build(def, extent, 4)),
+        PresetShapeType::WedgeEllipseCallout => Some(wedge_ellipse_callout::build(def, extent)),
         PresetShapeType::WedgeRectCallout => Some(wedge_rect_callout::build(def, extent)),
         _ => {
             log::warn!(
@@ -86,6 +88,15 @@ mod tests {
     fn donut_dispatches() {
         let p = build_preset(
             &def(PresetShapeType::Donut),
+            PtSize::new(Pt::new(20.0), Pt::new(20.0)),
+        );
+        assert!(p.is_some());
+    }
+
+    #[test]
+    fn wedge_ellipse_callout_dispatches() {
+        let p = build_preset(
+            &def(PresetShapeType::WedgeEllipseCallout),
             PtSize::new(Pt::new(20.0), Pt::new(20.0)),
         );
         assert!(p.is_some());
