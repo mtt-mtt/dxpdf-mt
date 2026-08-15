@@ -3,7 +3,8 @@
 use crate::render::dimension::Pt;
 
 use crate::render::layout::cell::{
-    intrinsic_rotated_cell_extent, layout_cell, layout_rotated_cell, CellLayout,
+    intrinsic_rotated_cell_extent, layout_cell, layout_cell_with_left_border_inset,
+    layout_rotated_cell, CellLayout,
 };
 
 use super::borders::{
@@ -320,10 +321,11 @@ pub(super) fn measure_table_rows(
                     )
                 }
             } else {
-                layout_cell(
+                layout_cell_with_left_border_inset(
                     &cell.blocks,
                     layout_w,
                     &cell.margins,
+                    extra_left,
                     default_line_height,
                     measure_text,
                 )

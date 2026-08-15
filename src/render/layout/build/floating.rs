@@ -37,6 +37,27 @@ pub(super) enum AnchorFrame {
     Stack,
 }
 
+/// Provenance carried alongside the pre-existing fallback coordinate frame.
+///
+/// A cell paragraph cannot replace its legacy `Page`/`Stack` frame wholesale:
+/// styleless and styled cells historically use different frames, and one
+/// paragraph can contain both eligible and ineligible anchors. The cell bit is
+/// therefore consulted separately for every DrawingML anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AnchorContext {
+    pub(super) legacy_frame: AnchorFrame,
+    pub(super) in_cell: bool,
+}
+
+impl AnchorContext {
+    fn legacy(legacy_frame: AnchorFrame) -> Self {
+        Self {
+            legacy_frame,
+            in_cell: false,
+        }
+    }
+}
+
 /// Filter applied at extraction time so a shape's vertical anchor type can
 /// route it through the correct frame.
 ///
@@ -171,6 +192,15 @@ pub(super) fn extract_floating_images(
     state: &BuildState,
     frame: AnchorFrame,
 ) -> Vec<FloatingImage> {
+    extract_floating_images_in_context(para, ctx, state, AnchorContext::legacy(frame))
+}
+
+pub(super) fn extract_floating_images_in_context(
+    para: &Paragraph,
+    ctx: &BuildContext,
+    state: &BuildState,
+    anchor_context: AnchorContext,
+) -> Vec<FloatingImage> {
     use crate::model::ImagePlacement;
 
     let mut anchor_imgs = Vec::new();
@@ -195,7 +225,7 @@ pub(super) fn extract_floating_images(
 
         let w = Pt::from(img.extent.width);
         let h = Pt::from(img.extent.height);
-        let (x, y) = resolve_anchor_position(anchor, w, h, state, frame);
+        let (x, y) = resolve_anchor_position(anchor, w, h, state, anchor_context);
         let wrap_distance = effective_wrap_distance(anchor);
 
         images.push(FloatingImage {
@@ -217,7 +247,13 @@ pub(super) fn extract_floating_images(
     // VML primitives that resolve to images (`<v:image>` or
     // `<v:shape type="#_x0000_t75">` carrying `<v:imagedata>`) ride
     // through the same `FloatingImage` channel as DrawingML images.
-    extract_vml_floating_images(&para.content, state, frame, ctx, &mut images);
+    extract_vml_floating_images(
+        &para.content,
+        state,
+        anchor_context.legacy_frame,
+        ctx,
+        &mut images,
+    );
 
     images
 }
@@ -273,6 +309,16 @@ pub(super) fn extract_floating_shapes(
     frame: AnchorFrame,
     restrict: ShapeAnchorClass,
 ) -> Vec<FloatingShape> {
+    extract_floating_shapes_in_context(para, ctx, state, AnchorContext::legacy(frame), restrict)
+}
+
+pub(super) fn extract_floating_shapes_in_context(
+    para: &Paragraph,
+    ctx: &BuildContext,
+    state: &mut BuildState,
+    anchor_context: AnchorContext,
+    restrict: ShapeAnchorClass,
+) -> Vec<FloatingShape> {
     use crate::model::{GraphicContent, ImagePlacement};
 
     let mut shape_imgs = Vec::new();
@@ -311,7 +357,7 @@ pub(super) fn extract_floating_shapes(
         }
         if let Some(GraphicContent::WordProcessingGroup(group)) = img.graphic.as_ref() {
             if let Some(group_shape) =
-                build_direct_word_processing_group(img, group, anchor, ctx, state, frame)
+                build_direct_word_processing_group(img, group, anchor, ctx, state, anchor_context)
             {
                 shapes.push(group_shape);
             }
@@ -332,7 +378,7 @@ pub(super) fn extract_floating_shapes(
             if commands.is_empty() {
                 continue;
             }
-            let (x, y) = resolve_anchor_position(anchor, w, h, state, frame);
+            let (x, y) = resolve_anchor_position(anchor, w, h, state, anchor_context);
             let wrap_distance = effective_wrap_distance(anchor);
             // Reuse the floating-shape carrier for a flat group of chart-local
             // commands. The empty outer path paints nothing; `text_commands`
@@ -372,7 +418,7 @@ pub(super) fn extract_floating_shapes(
         let Some(built) = build_word_processing_shape_local(wsp, extent, ctx, state) else {
             continue;
         };
-        let (x, y) = resolve_anchor_position(anchor, w, h, state, frame);
+        let (x, y) = resolve_anchor_position(anchor, w, h, state, anchor_context);
         let wrap_distance = effective_wrap_distance(anchor);
 
         shapes.push(FloatingShape {
@@ -402,7 +448,13 @@ pub(super) fn extract_floating_shapes(
     // We append them here so both DrawingML and VML floats live in one
     // ordered list passed downstream.
     if !has_text_shape {
-        extract_vml_primitive_shapes(&para.content, state, frame, ctx, &mut shapes);
+        extract_vml_primitive_shapes(
+            &para.content,
+            state,
+            anchor_context.legacy_frame,
+            ctx,
+            &mut shapes,
+        );
     }
 
     shapes
@@ -488,7 +540,7 @@ fn build_direct_word_processing_group(
     anchor: &crate::model::AnchorProperties,
     ctx: &BuildContext,
     state: &BuildState,
-    frame: AnchorFrame,
+    anchor_context: AnchorContext,
 ) -> Option<FloatingShape> {
     use crate::render::layout::draw_command::{DrawCommand, ResolvedFill};
 
@@ -528,7 +580,7 @@ fn build_direct_word_processing_group(
         outer_extent.width,
         outer_extent.height,
         state,
-        frame,
+        anchor_context,
     );
     let wrap_distance = effective_wrap_distance(anchor);
     Some(FloatingShape {
@@ -1209,10 +1261,12 @@ fn resolve_anchor_position(
     content_w: Pt,
     content_h: Pt,
     state: &BuildState,
-    frame: AnchorFrame,
+    anchor_context: AnchorContext,
 ) -> (FloatingImageX, FloatingImageY) {
-    let x = resolve_anchor_x(anchor, content_w, state, frame);
-    let y = resolve_anchor_y(anchor, content_h, state, frame);
+    let x = resolve_anchor_x_in_context(anchor, content_w, state, anchor_context);
+    // P20 is horizontal-only. Cell provenance must not change the established
+    // paragraph-relative Stack behavior on the vertical axis.
+    let y = resolve_anchor_y(anchor, content_h, state, anchor_context.legacy_frame);
     (x, y)
 }
 
@@ -1403,15 +1457,41 @@ fn horizontal_region(
 /// [`FloatingImageX::from_pages`]. An anchor that uses neither channel produces
 /// two equal readings and collapses back to `Absolute`, which is why a
 /// single-sided document carries no deferral at all.
+#[cfg(test)]
 fn resolve_anchor_x(
     anchor: &crate::model::AnchorProperties,
     content_w: Pt,
     state: &BuildState,
     frame: AnchorFrame,
 ) -> FloatingImageX {
-    use crate::model::{AnchorAlignment, AnchorPosition};
+    resolve_anchor_x_in_context(anchor, content_w, state, AnchorContext::legacy(frame))
+}
 
-    let geom = FrameGeometry::new(&state.page_config, frame);
+fn resolve_anchor_x_in_context(
+    anchor: &crate::model::AnchorProperties,
+    content_w: Pt,
+    state: &BuildState,
+    anchor_context: AnchorContext,
+) -> FloatingImageX {
+    use crate::model::{AnchorAlignment, AnchorPosition, AnchorRelativeFrom};
+
+    // WPS-compatible, deliberately exact gate. `simplePos=true`, alignments,
+    // every non-page reference, false/missing layoutInCell, VML, and anchors
+    // outside an eligible ordinary cell retain their legacy Page/Stack path.
+    if anchor_context.in_cell
+        && anchor.layout_in_cell == Some(true)
+        && anchor.use_simple_pos != Some(true)
+    {
+        if let AnchorPosition::Offset {
+            relative_from: AnchorRelativeFrom::Page,
+            offset,
+        } = anchor.horizontal_position
+        {
+            return FloatingImageX::CellBorderOffset(Pt::from(offset));
+        }
+    }
+
+    let geom = FrameGeometry::new(&state.page_config, anchor_context.legacy_frame);
 
     let at = |parity: PageParity| -> Pt {
         match &anchor.horizontal_position {
@@ -3467,7 +3547,9 @@ mod tests {
     // The default page is US Letter with 1in margins: 612 x 792pt, text area
     // 72..540. Every expectation below is written against those numbers.
 
-    use super::resolve_anchor_x;
+    use super::{
+        resolve_anchor_position, resolve_anchor_x, resolve_anchor_x_in_context, AnchorContext,
+    };
 
     /// One inch in EMU — the unit `wp:posOffset` is expressed in.
     const INCH: i64 = 914400;
@@ -3505,6 +3587,18 @@ mod tests {
     /// not `inside`/`outside`.
     fn x_of(anchor: &AnchorProperties, frame: AnchorFrame) -> f32 {
         x_on(anchor, frame, PageParity::Odd)
+    }
+
+    fn cell_x(anchor: &AnchorProperties, legacy_frame: AnchorFrame) -> FloatingImageX {
+        resolve_anchor_x_in_context(
+            anchor,
+            Pt::new(100.0),
+            &default_state(),
+            AnchorContext {
+                legacy_frame,
+                in_cell: true,
+            },
+        )
     }
 
     fn assert_x(got: f32, expected: f32, what: &str) {
@@ -3550,6 +3644,100 @@ mod tests {
             0.0,
             "72pt page coordinate minus the 72pt margin the caller re-adds",
         );
+    }
+
+    #[test]
+    fn cell_page_offset_preserves_the_authored_border_relative_value() {
+        let mut anchor = h_offset(AnchorRelativeFrom::Page, INCH);
+        anchor.layout_in_cell = Some(true);
+
+        for legacy_frame in [AnchorFrame::Page, AnchorFrame::Stack] {
+            assert_eq!(
+                cell_x(&anchor, legacy_frame),
+                FloatingImageX::CellBorderOffset(Pt::new(72.0)),
+                "styled and styleless cells share the exact positive path"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_gate_preserves_styled_and_styleless_legacy_fallbacks() {
+        for layout_in_cell in [None, Some(false)] {
+            let mut anchor = h_offset(AnchorRelativeFrom::Page, INCH);
+            anchor.layout_in_cell = layout_in_cell;
+
+            assert_eq!(
+                cell_x(&anchor, AnchorFrame::Stack),
+                FloatingImageX::Absolute(Pt::ZERO),
+                "styled cell keeps its Stack fallback"
+            );
+            assert_eq!(
+                cell_x(&anchor, AnchorFrame::Page),
+                FloatingImageX::Absolute(Pt::new(72.0)),
+                "styleless cell keeps its Page fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn simple_pos_true_page_align_and_other_references_stay_legacy() {
+        let mut simple = h_offset(AnchorRelativeFrom::Page, INCH);
+        simple.layout_in_cell = Some(true);
+        simple.use_simple_pos = Some(true);
+
+        let mut aligned = h_align(AnchorRelativeFrom::Page, AnchorAlignment::Left);
+        aligned.layout_in_cell = Some(true);
+
+        let mut column = h_offset(AnchorRelativeFrom::Column, INCH);
+        column.layout_in_cell = Some(true);
+
+        for anchor in [&simple, &aligned, &column] {
+            for legacy_frame in [AnchorFrame::Page, AnchorFrame::Stack] {
+                assert_eq!(
+                    cell_x(anchor, legacy_frame),
+                    resolve_anchor_x(anchor, Pt::new(100.0), &default_state(), legacy_frame),
+                    "non-exact cell input must stay on its legacy frame"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_cell_anchors_are_gated_individually_and_y_is_unchanged() {
+        let mut hit = h_offset(AnchorRelativeFrom::Page, INCH);
+        hit.layout_in_cell = Some(true);
+        let mut false_value = hit.clone();
+        false_value.layout_in_cell = Some(false);
+        let mut column = h_offset(AnchorRelativeFrom::Column, INCH);
+        column.layout_in_cell = Some(true);
+
+        let context = AnchorContext {
+            legacy_frame: AnchorFrame::Stack,
+            in_cell: true,
+        };
+        assert!(matches!(
+            resolve_anchor_x_in_context(&hit, Pt::new(100.0), &default_state(), context),
+            FloatingImageX::CellBorderOffset(_)
+        ));
+        for anchor in [&false_value, &column] {
+            assert!(matches!(
+                resolve_anchor_x_in_context(anchor, Pt::new(100.0), &default_state(), context),
+                FloatingImageX::Absolute(_)
+            ));
+        }
+
+        let state = default_state();
+        let (_, cell_y) =
+            resolve_anchor_position(&hit, Pt::new(100.0), Pt::new(50.0), &state, context);
+        let legacy_y = resolve_anchor_y(&hit, Pt::new(50.0), &state, AnchorFrame::Stack);
+        let same_y = match (cell_y, legacy_y) {
+            (FloatingImageY::Absolute(a), FloatingImageY::Absolute(b))
+            | (FloatingImageY::RelativeToParagraph(a), FloatingImageY::RelativeToParagraph(b)) => {
+                a == b
+            }
+            _ => false,
+        };
+        assert!(same_y, "P20 must not alter the vertical axis");
     }
 
     /// A margin-relative offset needs no compensation: the frame origin
@@ -4013,6 +4201,48 @@ mod tests {
             shape.x,
             FloatingImageX::Absolute(Pt::new(8.0)),
             "80pt page x minus the 72pt margin"
+        );
+    }
+
+    #[test]
+    fn in_cell_vml_shape_keeps_the_legacy_stack_frame() {
+        use crate::model::{Pict, VmlPrimitive, VmlRect};
+
+        let paragraph = crate::model::Paragraph {
+            style_id: None,
+            properties: crate::model::ParagraphProperties::default(),
+            mark_run_properties: None,
+            content: vec![Inline::Pict(Pict {
+                shape_type: None,
+                primitives: vec![VmlPrimitive::Rect(VmlRect {
+                    common: vml_rect(80.0, 0.0, 10.0, 10.0),
+                })],
+            })],
+            rsids: crate::model::ParagraphRevisionIds::default(),
+        };
+        let resolved = empty_resolved();
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+        let mut state = default_state();
+        let shapes = super::extract_floating_shapes_in_context(
+            &paragraph,
+            &ctx,
+            &mut state,
+            AnchorContext {
+                legacy_frame: AnchorFrame::Stack,
+                in_cell: true,
+            },
+            super::ShapeAnchorClass::All,
+        );
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(
+            shapes[0].x,
+            FloatingImageX::Absolute(Pt::new(8.0)),
+            "VML must not enter the DrawingML cell-border path"
         );
     }
 

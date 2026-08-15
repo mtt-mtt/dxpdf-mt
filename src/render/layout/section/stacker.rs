@@ -82,6 +82,49 @@ pub fn stack_blocks(
     measure_text: super::super::paragraph::MeasureTextFn<'_>,
     parity: PageParity,
 ) -> StackResult {
+    stack_blocks_impl(
+        blocks,
+        content_width,
+        default_line_height,
+        measure_text,
+        parity,
+        None,
+    )
+}
+
+/// Cell-only entry point. `content_left_inset` is the physical distance from
+/// the cell border to this stack's origin and is the only context allowed to
+/// consume [`super::types::FloatingImageX::CellBorderOffset`].
+pub(crate) fn stack_cell_blocks(
+    blocks: &[LayoutBlock],
+    content_width: Pt,
+    default_line_height: Pt,
+    measure_text: super::super::paragraph::MeasureTextFn<'_>,
+    parity: PageParity,
+    content_left_inset: Pt,
+) -> StackResult {
+    stack_blocks_impl(
+        blocks,
+        content_width,
+        default_line_height,
+        measure_text,
+        parity,
+        Some(content_left_inset),
+    )
+}
+
+fn stack_blocks_impl(
+    blocks: &[LayoutBlock],
+    content_width: Pt,
+    default_line_height: Pt,
+    measure_text: super::super::paragraph::MeasureTextFn<'_>,
+    parity: PageParity,
+    cell_content_left_inset: Option<Pt>,
+) -> StackResult {
+    let resolve_x = |x: super::types::FloatingImageX| match cell_content_left_inset {
+        Some(inset) => x.resolve_in_cell(parity, inset),
+        None => x.resolve(parity),
+    };
     let constraints = super::super::BoxConstraints::tight_width(content_width, Pt::INFINITY);
     let mut commands = Vec::new();
     let mut cursor_y = Pt::ZERO;
@@ -150,7 +193,7 @@ pub fn stack_blocks(
                         };
                         commands.push(DrawCommand::Image {
                             rect: PtRect::from_xywh(
-                                fi.x.resolve(parity),
+                                resolve_x(fi.x),
                                 img_y,
                                 fi.size.width,
                                 fi.size.height,
@@ -174,7 +217,7 @@ pub fn stack_blocks(
                         });
                     } else if fi.wrap_mode.registers_as_wrap_float() {
                         page_floats.push(float::ActiveFloat {
-                            page_x: fi.x.resolve(parity) - fi.dist_left,
+                            page_x: resolve_x(fi.x) - fi.dist_left,
                             page_y_start: y_start,
                             page_y_end: y_end,
                             width: fi.size.width + fi.dist_left + fi.dist_right,
@@ -212,7 +255,7 @@ pub fn stack_blocks(
                         };
                         commands.push(DrawCommand::Path {
                             origin: crate::render::geometry::PtOffset::new(
-                                fs.x.resolve(parity),
+                                resolve_x(fs.x),
                                 shape_y,
                             ),
                             rotation: fs.rotation,
@@ -240,7 +283,7 @@ pub fn stack_blocks(
                         });
                     } else {
                         page_floats.push(float::ActiveFloat {
-                            page_x: fs.x.resolve(parity) - fs.dist_left,
+                            page_x: resolve_x(fs.x) - fs.dist_left,
                             page_y_start: y_start,
                             page_y_end: y_end,
                             width: fs.size.width + fs.dist_left + fs.dist_right,
@@ -339,7 +382,7 @@ pub fn stack_blocks(
                     };
                     commands.push(DrawCommand::Image {
                         rect: PtRect::from_xywh(
-                            fi.x.resolve(parity),
+                            resolve_x(fi.x),
                             img_y,
                             fi.size.width,
                             fi.size.height,
@@ -369,10 +412,7 @@ pub fn stack_blocks(
                         FloatingImageY::RelativeToParagraph(offset) => para_content_top + offset,
                     };
                     commands.push(DrawCommand::Path {
-                        origin: crate::render::geometry::PtOffset::new(
-                            fs.x.resolve(parity),
-                            shape_y,
-                        ),
+                        origin: crate::render::geometry::PtOffset::new(resolve_x(fs.x), shape_y),
                         rotation: fs.rotation,
                         flip_h: fs.flip_h,
                         flip_v: fs.flip_v,
@@ -387,7 +427,7 @@ pub fn stack_blocks(
                     // command is in shape-local coords; shift by the shape's
                     // resolved page origin.
                     for mut cmd in fs.text_commands.iter().cloned() {
-                        cmd.shift(fs.x.resolve(parity), shape_y);
+                        cmd.shift(resolve_x(fs.x), shape_y);
                         commands.push(cmd);
                     }
                 }
@@ -456,11 +496,13 @@ pub fn stack_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::dimension::Dimension;
     use crate::model::ImageFormat;
     use crate::model::WrapText;
-    use crate::render::geometry::PtSize;
+    use crate::render::geometry::{PtRect, PtSize};
     use crate::render::layout::paragraph::ParagraphStyle;
-    use crate::render::layout::section::{FloatingImage, FloatingImageX, WrapMode};
+    use crate::render::layout::section::{FloatingImage, FloatingImageX, FloatingShape, WrapMode};
+    use crate::render::resolve::color::RgbColor;
     use crate::render::resolve::images::MediaEntry;
     use std::rc::Rc;
 
@@ -551,6 +593,43 @@ mod tests {
         }
     }
 
+    fn shape_para(shape: FloatingShape) -> LayoutBlock {
+        LayoutBlock::Paragraph {
+            fragments: vec![],
+            style: ParagraphStyle::default(),
+            page_break_before: false,
+            footnotes: vec![],
+            floating_images: vec![],
+            floating_shapes: vec![shape],
+        }
+    }
+
+    fn shape(wrap_mode: WrapMode, x: FloatingImageX) -> FloatingShape {
+        FloatingShape {
+            x,
+            y: FloatingImageY::RelativeToParagraph(Pt::ZERO),
+            size: PtSize::new(Pt::new(20.0), Pt::new(10.0)),
+            rotation: Dimension::new(0),
+            flip_h: false,
+            flip_v: false,
+            wrap_mode,
+            dist_top: Pt::ZERO,
+            dist_bottom: Pt::ZERO,
+            dist_left: Pt::ZERO,
+            dist_right: Pt::ZERO,
+            behind_doc: false,
+            relative_height: 0,
+            paths: vec![],
+            fill: crate::render::layout::draw_command::ResolvedFill::None,
+            stroke: None,
+            effects: vec![],
+            text_commands: vec![DrawCommand::Rect {
+                rect: PtRect::from_xywh(Pt::new(1.0), Pt::new(2.0), Pt::new(3.0), Pt::new(4.0)),
+                color: RgbColor::BLACK,
+            }],
+        }
+    }
+
     fn styled(space_before: f32, space_after: f32, style_id: Option<&str>) -> ParagraphStyle {
         ParagraphStyle {
             space_before: Pt::new(space_before),
@@ -587,6 +666,48 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn image_xs(result: &StackResult) -> Vec<f32> {
+        result
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Image { rect, .. } => Some(rect.origin.x.raw()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cell_stack_resolves_every_image_wrap_mode_from_the_border_origin() {
+        for mode in [
+            WrapMode::None,
+            WrapMode::Square(WrapText::BothSides),
+            WrapMode::Tight(WrapText::BothSides),
+            WrapMode::Through(WrapText::BothSides),
+            WrapMode::TopAndBottom,
+        ] {
+            let mut anchored = image(10.0, mode, FloatingImageY::RelativeToParagraph(Pt::ZERO));
+            anchored.x = FloatingImageX::CellBorderOffset(Pt::new(100.0));
+            let result = stack_cell_blocks(
+                &[para(ParagraphStyle::default(), vec![anchored])],
+                Pt::new(400.0),
+                Pt::new(LINE),
+                None,
+                PageParity::Odd,
+                Pt::new(7.5),
+            );
+            assert_eq!(image_xs(&result), vec![92.5], "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "escaped cell-aware stack layout")]
+    fn ordinary_stack_rejects_a_leaked_cell_border_offset() {
+        let mut anchored = top_bottom(10.0);
+        anchored.x = FloatingImageX::CellBorderOffset(Pt::new(100.0));
+        let _ = stack(&[para(ParagraphStyle::default(), vec![anchored])]);
     }
 
     fn text_ys(result: &StackResult) -> Vec<f32> {
@@ -838,6 +959,77 @@ mod tests {
         let mut i = image(60.0, wrap, FloatingImageY::RelativeToParagraph(Pt::ZERO));
         i.size = crate::render::geometry::PtSize::new(Pt::new(width), Pt::new(60.0));
         i
+    }
+
+    #[test]
+    fn cell_wrap_registration_and_visible_x_share_the_same_resolved_origin() {
+        for mode in [
+            WrapMode::Square(WrapText::BothSides),
+            WrapMode::Tight(WrapText::BothSides),
+            WrapMode::Through(WrapText::BothSides),
+        ] {
+            let mut cell_image = sized_image(50.0, mode);
+            cell_image.x = FloatingImageX::CellBorderOffset(Pt::new(40.0));
+            let cell = stack_cell_blocks(
+                &[wide_para(vec![cell_image])],
+                Pt::new(400.0),
+                Pt::new(LINE),
+                None,
+                PageParity::Odd,
+                Pt::new(10.0),
+            );
+
+            let mut expected_image = sized_image(50.0, mode);
+            expected_image.x = FloatingImageX::Absolute(Pt::new(30.0));
+            let expected = stack(&[wide_para(vec![expected_image])]);
+
+            assert_eq!(image_xs(&cell), image_xs(&expected), "visible x, {mode:?}");
+            assert_eq!(
+                text_xs(&cell),
+                text_xs(&expected),
+                "ActiveFloat x, {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_shape_path_text_and_wrap_share_the_same_resolved_origin() {
+        for mode in [
+            WrapMode::None,
+            WrapMode::Square(WrapText::BothSides),
+            WrapMode::Tight(WrapText::BothSides),
+            WrapMode::Through(WrapText::BothSides),
+        ] {
+            let cell = stack_cell_blocks(
+                &[shape_para(shape(
+                    mode,
+                    FloatingImageX::CellBorderOffset(Pt::new(40.0)),
+                ))],
+                Pt::new(400.0),
+                Pt::new(LINE),
+                None,
+                PageParity::Odd,
+                Pt::new(10.0),
+            );
+            let expected = stack(&[shape_para(shape(
+                mode,
+                FloatingImageX::Absolute(Pt::new(30.0)),
+            ))]);
+
+            let command_xs = |result: &StackResult| {
+                result
+                    .commands
+                    .iter()
+                    .filter_map(|command| match command {
+                        DrawCommand::Path { origin, .. } => Some(origin.x),
+                        DrawCommand::Rect { rect, .. } => Some(rect.origin.x),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(command_xs(&cell), command_xs(&expected), "mode={mode:?}");
+            assert_eq!(command_xs(&cell), vec![Pt::new(30.0), Pt::new(31.0)]);
+        }
     }
 
     /// Regression: a `wrapNone` image was registered as an active wrap float,

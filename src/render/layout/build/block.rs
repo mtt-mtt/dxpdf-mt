@@ -14,7 +14,10 @@ use super::convert::{
     paragraph_style_from_props, populate_image_data, populate_underline_metrics,
     resolve_indentation, resolve_paragraph_defaults,
 };
-use super::floating::{extract_floating_images, AnchorFrame};
+use super::floating::{
+    extract_floating_images_in_context, extract_floating_shapes_in_context, AnchorContext,
+    AnchorFrame,
+};
 use super::table::build_table;
 use super::{BuildContext, BuildState};
 
@@ -70,7 +73,9 @@ pub(super) fn build_block(
     pending_dropcap: &mut Option<DropCapInfo>,
 ) -> Option<LayoutBlock> {
     match block {
-        Block::Paragraph(p) => build_paragraph_block(p, ctx, state, pending_dropcap, None, None),
+        Block::Paragraph(p) => {
+            build_paragraph_block(p, ctx, state, pending_dropcap, None, None, false)
+        }
         Block::Table(t) => {
             let built = build_table(t, available_width, ctx, state);
             Some(LayoutBlock::Table {
@@ -100,6 +105,7 @@ pub(super) fn build_paragraph_block(
     pending_dropcap: &mut Option<DropCapInfo>,
     table_style: Option<&ResolvedStyle>,
     cond: Option<&CellConditionalFormatting>,
+    cell_anchor_origin_enabled: bool,
 ) -> Option<LayoutBlock> {
     let (mut fragments, mut merged_props, paragraph_font_size) =
         build_fragments(p, ctx, state, table_style, cond);
@@ -324,17 +330,24 @@ pub(super) fn build_paragraph_block(
     // paragraph. Table cells emit their commands through `stack_blocks`,
     // which shifts them into page coordinates, so anchors inside a cell use
     // the stack frame. Body paragraphs emit in page-absolute coordinates.
-    let frame = if table_style.is_some() {
+    let legacy_frame = if table_style.is_some() {
         AnchorFrame::Stack
     } else {
         AnchorFrame::Page
     };
-    let floating_images = extract_floating_images(p, ctx, state, frame);
-    let floating_shapes = super::floating::extract_floating_shapes(
+    let anchor_context = AnchorContext {
+        legacy_frame,
+        // `cond` is the structural cell signal. Explicit textDirection cells
+        // pass `false` from the table builder so physical/logical left insets
+        // cannot be confused in the new exact path.
+        in_cell: cond.is_some() && cell_anchor_origin_enabled,
+    };
+    let floating_images = extract_floating_images_in_context(p, ctx, state, anchor_context);
+    let floating_shapes = extract_floating_shapes_in_context(
         p,
         ctx,
         state,
-        frame,
+        anchor_context,
         super::floating::ShapeAnchorClass::All,
     );
 
@@ -686,8 +699,9 @@ mod tests {
         let resolved = empty_resolved();
         with_ctx(&resolved, |ctx, state| {
             let mut pending = None;
-            let block = build_paragraph_block(&para(vec![]), ctx, state, &mut pending, None, None)
-                .expect("empty paragraph still lays out");
+            let block =
+                build_paragraph_block(&para(vec![]), ctx, state, &mut pending, None, None, false)
+                    .expect("empty paragraph still lays out");
             let LayoutBlock::Paragraph { fragments, .. } = block else {
                 panic!("expected a paragraph block");
             };
@@ -733,6 +747,7 @@ mod tests {
                 &mut pending,
                 None,
                 None,
+                false,
             )
             .expect("lays out");
             let LayoutBlock::Paragraph { fragments, .. } = block else {
@@ -765,6 +780,7 @@ mod tests {
                 &mut pending,
                 None,
                 None,
+                false,
             )
             .expect("lays out");
             let LayoutBlock::Paragraph { style, .. } = block else {
@@ -792,7 +808,7 @@ mod tests {
 
             let mut pending = None;
             assert!(
-                build_paragraph_block(&cap, ctx, state, &mut pending, None, None).is_none(),
+                build_paragraph_block(&cap, ctx, state, &mut pending, None, None, false).is_none(),
                 "the drop-cap paragraph itself produces no block"
             );
             let held = pending
@@ -808,6 +824,7 @@ mod tests {
                 &mut pending,
                 None,
                 None,
+                false,
             )
             .expect("lays out");
             let LayoutBlock::Paragraph { style, .. } = next else {

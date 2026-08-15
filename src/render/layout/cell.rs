@@ -7,7 +7,9 @@
 use crate::render::dimension::Pt;
 use crate::render::geometry::PtEdgeInsets;
 
-use super::section::{stack_blocks, CellLine, LayoutBlock, LayoutFootnote, PageParity};
+use super::section::{
+    stack_blocks, stack_cell_blocks, CellLine, LayoutBlock, LayoutFootnote, PageParity,
+};
 use crate::model::TextDirection;
 
 /// A footnote reference positioned in cell-box coordinates.
@@ -48,6 +50,46 @@ pub fn layout_cell(
     default_line_height: Pt,
     measure_text: super::paragraph::MeasureTextFn<'_>,
 ) -> CellLayout {
+    layout_cell_impl(
+        blocks,
+        cell_width,
+        margins,
+        default_line_height,
+        measure_text,
+        None,
+    )
+}
+
+/// Lay out an ordinary (unrotated) cell while preserving its physical border
+/// origin for `layoutInCell` drawings. `extra_left` is the portion of the
+/// resolved left border wider than the cell's left margin; table emission adds
+/// it back after this cell-local layout.
+pub(crate) fn layout_cell_with_left_border_inset(
+    blocks: &[LayoutBlock],
+    cell_width: Pt,
+    margins: &PtEdgeInsets,
+    extra_left: Pt,
+    default_line_height: Pt,
+    measure_text: super::paragraph::MeasureTextFn<'_>,
+) -> CellLayout {
+    layout_cell_impl(
+        blocks,
+        cell_width,
+        margins,
+        default_line_height,
+        measure_text,
+        Some(margins.left + extra_left),
+    )
+}
+
+fn layout_cell_impl(
+    blocks: &[LayoutBlock],
+    cell_width: Pt,
+    margins: &PtEdgeInsets,
+    default_line_height: Pt,
+    measure_text: super::paragraph::MeasureTextFn<'_>,
+    cell_content_left_inset: Option<Pt>,
+) -> CellLayout {
     let content_width = (cell_width - margins.horizontal()).max(Pt::ZERO);
 
     // §20.4.3.1: a cell is measured before its table is paginated — a row can
@@ -57,13 +99,23 @@ pub fn layout_cell(
     // reading. That is the Tier-0 the page and header paths no longer need;
     // removing it here means making cell measurement page-aware, which is a
     // far larger change than the anchor resolution itself.
-    let result = stack_blocks(
-        blocks,
-        content_width,
-        default_line_height,
-        measure_text,
-        PageParity::Odd,
-    );
+    let result = match cell_content_left_inset {
+        Some(inset) => stack_cell_blocks(
+            blocks,
+            content_width,
+            default_line_height,
+            measure_text,
+            PageParity::Odd,
+            inset,
+        ),
+        None => stack_blocks(
+            blocks,
+            content_width,
+            default_line_height,
+            measure_text,
+            PageParity::Odd,
+        ),
+    };
 
     // Shift all commands by cell margins.
     let commands = result
@@ -388,6 +440,62 @@ mod tests {
 
         // Should wrap to 2 lines → height = 28
         assert_eq!(result.content_height.raw(), 28.0);
+    }
+
+    #[test]
+    fn cell_border_anchor_cancels_padding_and_excess_left_border_inset() {
+        use crate::model::ImageFormat;
+        use crate::render::geometry::PtSize;
+        use crate::render::layout::section::{
+            FloatingImage, FloatingImageX, FloatingImageY, WrapMode,
+        };
+        use crate::render::resolve::images::MediaEntry;
+
+        for margin_left in [0.0, 5.4, 12.0] {
+            let image = FloatingImage {
+                image_data: MediaEntry {
+                    data: std::sync::Arc::from(&b""[..]),
+                    format: ImageFormat::Png,
+                },
+                size: PtSize::new(Pt::new(10.0), Pt::new(10.0)),
+                src_rect: None,
+                x: FloatingImageX::CellBorderOffset(Pt::new(40.0)),
+                y: FloatingImageY::RelativeToParagraph(Pt::ZERO),
+                wrap_mode: WrapMode::None,
+                dist_top: Pt::ZERO,
+                dist_bottom: Pt::ZERO,
+                dist_left: Pt::ZERO,
+                dist_right: Pt::ZERO,
+                behind_doc: false,
+                relative_height: 0,
+            };
+            let block = LayoutBlock::Paragraph {
+                fragments: vec![],
+                style: ParagraphStyle::default(),
+                page_break_before: false,
+                footnotes: vec![],
+                floating_images: vec![image],
+                floating_shapes: vec![],
+            };
+            let margins = PtEdgeInsets::new(Pt::ZERO, Pt::ZERO, Pt::ZERO, Pt::new(margin_left));
+            let extra_left = Pt::new(7.0);
+            let result = layout_cell_with_left_border_inset(
+                &[block],
+                Pt::new(100.0),
+                &margins,
+                extra_left,
+                Pt::new(14.0),
+                None,
+            );
+            let Some(DrawCommand::Image { rect, .. }) = result.commands.first() else {
+                panic!("expected the anchored image")
+            };
+            assert_eq!(
+                rect.origin.x + extra_left,
+                Pt::new(40.0),
+                "margin={margin_left}: table emission adds extra_left back"
+            );
+        }
     }
 
     #[test]

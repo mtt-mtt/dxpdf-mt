@@ -176,6 +176,11 @@ pub enum FloatingImageX {
     Absolute(Pt),
     /// Mirrored — which reading applies depends on the page's [`PageParity`].
     PageParity { odd: Pt, even: Pt },
+    /// Authored offset from the nearest table-cell border.
+    ///
+    /// This value is deliberately unresolved until cell layout knows the
+    /// physical content inset. It must never escape into a page/header stack.
+    CellBorderOffset(Pt),
 }
 
 impl FloatingImageX {
@@ -201,6 +206,21 @@ impl FloatingImageX {
                 PageParity::Odd => odd,
                 PageParity::Even => even,
             },
+            Self::CellBorderOffset(_) => {
+                panic!("cell-border-relative floating x escaped cell-aware stack layout")
+            }
+        }
+    }
+
+    /// Resolve an x carried by a table-cell stack.
+    ///
+    /// `content_left_inset` is the physical distance from the cell border to
+    /// the stack origin (cell margin plus any excess left-border width). The
+    /// later cell/table shifts add the same inset back exactly once.
+    pub(super) fn resolve_in_cell(self, parity: PageParity, content_left_inset: Pt) -> Pt {
+        match self {
+            Self::CellBorderOffset(offset) => offset - content_left_inset,
+            other => other.resolve(parity),
         }
     }
 }
@@ -440,5 +460,20 @@ mod tests {
         }
         assert_eq!(WrapMode::None.wrap_text(), WrapText::BothSides);
         assert_eq!(WrapMode::TopAndBottom.wrap_text(), WrapText::BothSides);
+    }
+
+    #[test]
+    fn cell_border_offset_is_resolved_only_by_cell_layout() {
+        let x = FloatingImageX::CellBorderOffset(Pt::new(40.0));
+        assert_eq!(
+            x.resolve_in_cell(PageParity::Odd, Pt::new(7.5)),
+            Pt::new(32.5)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "escaped cell-aware stack layout")]
+    fn generic_x_resolver_rejects_cell_border_offsets() {
+        let _ = FloatingImageX::CellBorderOffset(Pt::new(40.0)).resolve(PageParity::Odd);
     }
 }

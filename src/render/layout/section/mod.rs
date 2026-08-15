@@ -15,6 +15,7 @@ pub use layout::layout_section;
 #[cfg(test)]
 pub(crate) use layout::layout_section_with_clearance;
 pub(crate) use layout::{layout_section_with_clearance_result, SectionStart};
+pub(crate) use stacker::stack_cell_blocks;
 pub use stacker::{stack_blocks, CellLine, StackResult};
 pub use types::*;
 

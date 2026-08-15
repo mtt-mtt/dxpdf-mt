@@ -547,6 +547,17 @@ fn normalize_row_uniform_vertical_insets(cells: &mut [TableCellInput]) {
     }
 }
 
+fn cell_anchor_origin_enabled(text_direction: Option<model::TextDirection>) -> bool {
+    // Explicit normal-flow lrTb uses the same physical-left origin as the
+    // absent/default direction. All vertical/rotated directions remain on
+    // the legacy path: those cells lay out against logical margins while an
+    // anchor dx is expressed from a physical edge.
+    matches!(
+        text_direction,
+        None | Some(model::TextDirection::LeftToRightTopToBottom)
+    )
+}
+
 /// Build a single table cell: resolve content blocks, margins, shading, borders.
 fn build_table_cell(
     cell: &TableCell,
@@ -666,8 +677,15 @@ fn build_table_cell(
     let content_width = (inner_width - border_inset_h).max(Pt::ZERO);
 
     // Recurse into cell content blocks.
-    let cell_blocks =
-        build_cell_blocks(&cell.content, table_style, cond, content_width, ctx, state);
+    let cell_blocks = build_cell_blocks(
+        &cell.content,
+        table_style,
+        cond,
+        content_width,
+        cell_anchor_origin_enabled(text_direction),
+        ctx,
+        state,
+    );
 
     TableCellInput {
         blocks: cell_blocks,
@@ -697,6 +715,7 @@ fn build_cell_blocks(
     table_style: Option<&ResolvedStyle>,
     cond: &CellConditionalFormatting,
     inner_width: Pt,
+    cell_anchor_origin_enabled: bool,
     ctx: &BuildContext,
     state: &mut BuildState,
 ) -> Vec<LayoutBlock> {
@@ -723,6 +742,7 @@ fn build_cell_blocks(
                     &mut pending_dropcap,
                     table_style,
                     Some(cond),
+                    cell_anchor_origin_enabled,
                 ) {
                     // §17.3.1.45: character-level breaking is opt-in for
                     // space-delimited words. East Asian text is already split
@@ -813,6 +833,23 @@ mod tests {
     use crate::model::geometry::PartialEdgeInsets;
     use crate::render::layout::paragraph::ParagraphStyle;
     use crate::render::layout::table::{CellVAlign, TableCellInput};
+
+    #[test]
+    fn only_default_and_explicit_normal_flow_use_the_cell_anchor_origin_path() {
+        assert!(cell_anchor_origin_enabled(None));
+        assert!(cell_anchor_origin_enabled(Some(
+            model::TextDirection::LeftToRightTopToBottom
+        )));
+        for direction in [
+            model::TextDirection::TopToBottomRightToLeft,
+            model::TextDirection::BottomToTopLeftToRight,
+            model::TextDirection::LeftToRightTopToBottomRotated,
+            model::TextDirection::TopToBottomRightToLeftRotated,
+            model::TextDirection::TopToBottomLeftToRightRotated,
+        ] {
+            assert!(!cell_anchor_origin_enabled(Some(direction)));
+        }
+    }
 
     fn paragraph_with_spacing(
         before: f32,
