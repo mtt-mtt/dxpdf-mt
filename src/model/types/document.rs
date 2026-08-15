@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::color::Color;
 use super::content::Block;
 use super::drawing::ImageFormat;
 use super::identifiers::{NoteId, RelId};
@@ -10,12 +11,26 @@ use super::numbering::NumberingDefinitions;
 use super::section::SectionProperties;
 use super::settings::DocumentSettings;
 use super::styles::StyleSheet;
-use super::theme::Theme;
+use super::theme::{Theme, ThemeColorIndex};
+
+/// §17.2.1: the solid-color portion of a document-wide page background.
+///
+/// `color` is the cached/fallback color. A valid theme reference takes
+/// precedence at resolve time; tint/shade retain their byte form because
+/// WordprocessingML uses a different transform convention from DrawingML.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DocumentBackground {
+    pub color: Color,
+    pub theme_color: Option<ThemeColorIndex>,
+    pub theme_tint: Option<u8>,
+    pub theme_shade: Option<u8>,
+}
 
 /// The fully parsed and resolved DOCX document.
 #[derive(Clone, Debug)]
 pub struct Document {
     pub settings: DocumentSettings,
+    pub background: Option<DocumentBackground>,
     pub theme: Option<Theme>,
     /// Style definitions from `word/styles.xml`, with `basedOn` references intact.
     pub styles: StyleSheet,

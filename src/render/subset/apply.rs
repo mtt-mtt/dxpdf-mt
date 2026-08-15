@@ -464,6 +464,7 @@ mod tests {
 
     fn page_with_text(text: &str, family: &str) -> LayoutedPage {
         LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),

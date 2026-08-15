@@ -1,6 +1,8 @@
 //! Color resolution — Color::Auto to RGB, theme color index to RGB.
 
-use crate::model::{Color, ThemeColorIndex, ThemeColorScheme};
+use crate::model::{Color, DocumentBackground, Theme, ThemeColorIndex, ThemeColorScheme};
+
+use super::drawing_color::{hsl_to_rgb, rgba_to_hsl, Rgba};
 
 /// Resolved RGB color (0xRRGGBB).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +44,55 @@ pub fn resolve_color(color: Color, context: ColorContext) -> RgbColor {
 /// Resolve a theme color index to RGB via the color scheme.
 pub fn resolve_theme_color(index: ThemeColorIndex, scheme: &ThemeColorScheme) -> RgbColor {
     rgb_from_u32(scheme.resolve(index))
+}
+
+/// Resolve the solid-color page background selected for print-layout output.
+///
+/// The cached `w:color` is the fallback. A usable `w:themeColor` overrides it,
+/// and its byte tint/shade is applied to HSL luminance using WordprocessingML
+/// semantics. When both transforms are present Word uses tint.
+pub fn resolve_document_background(
+    background: Option<&DocumentBackground>,
+    theme: Option<&Theme>,
+    display_background_shape: bool,
+) -> Option<RgbColor> {
+    if !display_background_shape {
+        return None;
+    }
+    let background = background?;
+    let cached = resolve_color(background.color, ColorContext::Background);
+
+    let (Some(theme_index), Some(theme)) = (background.theme_color, theme) else {
+        return Some(cached);
+    };
+    let theme_color = resolve_theme_color(theme_index, &theme.color_scheme);
+    Some(if let Some(tint) = background.theme_tint {
+        apply_word_luminance_transform(theme_color, tint, true)
+    } else if let Some(shade) = background.theme_shade {
+        apply_word_luminance_transform(theme_color, shade, false)
+    } else {
+        theme_color
+    })
+}
+
+/// WordprocessingML tint/shade transforms the HSL luminance by a byte factor.
+/// `tint=true`: `L' = 1 - (1-L)*f`; shade: `L' = L*f`.
+fn apply_word_luminance_transform(color: RgbColor, raw: u8, tint: bool) -> RgbColor {
+    let rgba = Rgba {
+        r: color.r as f32 / 255.0,
+        g: color.g as f32 / 255.0,
+        b: color.b as f32 / 255.0,
+        a: 1.0,
+    };
+    let (h, s, l) = rgba_to_hsl(rgba);
+    let factor = raw as f32 / 255.0;
+    let transformed_l = if tint {
+        1.0 - (1.0 - l) * factor
+    } else {
+        l * factor
+    };
+    let (r, g, b) = hsl_to_rgb(h, s, transformed_l);
+    rgb_from_u32(Rgba { r, g, b, a: 1.0 }.to_rgb24())
 }
 
 /// Convert a packed u32 (0xRRGGBB) to RgbColor.
@@ -154,6 +205,96 @@ mod tests {
                 g: 0x63,
                 b: 0xC1
             }
+        );
+    }
+
+    #[test]
+    fn document_background_requires_both_background_and_display_policy() {
+        let background = DocumentBackground {
+            color: Color::Rgb(0x123456),
+            theme_color: None,
+            theme_tint: None,
+            theme_shade: None,
+        };
+        assert_eq!(resolve_document_background(None, None, true), None);
+        assert_eq!(
+            resolve_document_background(Some(&background), None, false),
+            None
+        );
+        assert_eq!(
+            resolve_document_background(Some(&background), None, true),
+            Some(rgb_from_u32(0x123456))
+        );
+    }
+
+    #[test]
+    fn document_background_resolves_onlyoffice_theme_tint() {
+        let background = DocumentBackground {
+            color: Color::Rgb(0xDEADBE),
+            theme_color: Some(ThemeColorIndex::Accent5),
+            theme_tint: Some(0x66),
+            theme_shade: None,
+        };
+        let theme = Theme {
+            color_scheme: ThemeColorScheme {
+                accent5: 0x4472C4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_document_background(Some(&background), Some(&theme), true),
+            Some(rgb_from_u32(0xB4C7E7))
+        );
+    }
+
+    #[test]
+    fn document_background_theme_shade_and_tint_precedence_match_word() {
+        let theme = Theme {
+            color_scheme: ThemeColorScheme {
+                accent2: 0xC0504D,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let shaded = DocumentBackground {
+            color: Color::WHITE,
+            theme_color: Some(ThemeColorIndex::Accent2),
+            theme_tint: None,
+            theme_shade: Some(0xBF),
+        };
+        let got = resolve_document_background(Some(&shaded), Some(&theme), true).unwrap();
+        let word = rgb_from_u32(0x943634);
+        assert!(
+            got.r.abs_diff(word.r) <= 1
+                && got.g.abs_diff(word.g) <= 1
+                && got.b.abs_diff(word.b) <= 1,
+            "floating-point HSL conversion must stay within one byte of Word: {got:?}"
+        );
+
+        let tint_wins = DocumentBackground {
+            theme_tint: Some(0xFF),
+            theme_shade: Some(0x00),
+            ..shaded
+        };
+        assert_eq!(
+            resolve_document_background(Some(&tint_wins), Some(&theme), true),
+            Some(rgb_from_u32(0xC0504D)),
+            "themeTint wins when both attributes are present"
+        );
+    }
+
+    #[test]
+    fn document_background_missing_theme_uses_cached_color_without_transform() {
+        let background = DocumentBackground {
+            color: Color::Rgb(0xB4C7E7),
+            theme_color: Some(ThemeColorIndex::Accent5),
+            theme_tint: Some(0x00),
+            theme_shade: None,
+        };
+        assert_eq!(
+            resolve_document_background(Some(&background), None, true),
+            Some(rgb_from_u32(0xB4C7E7))
         );
     }
 }

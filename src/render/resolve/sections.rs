@@ -107,6 +107,7 @@ mod tests {
     fn empty_doc() -> Document {
         Document {
             settings: DocumentSettings::default(),
+            background: None,
             theme: None,
             styles: StyleSheet::default(),
             numbering: NumberingDefinitions::default(),

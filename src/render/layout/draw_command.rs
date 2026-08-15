@@ -371,6 +371,9 @@ pub struct LayeredDrawCommand {
 /// A fully laid-out page — ready for painting.
 #[derive(Debug, Clone)]
 pub struct LayoutedPage {
+    /// §17.2.1 solid document background. Painted across the full physical
+    /// page before every `behindDoc` and ordinary draw command.
+    pub page_background: Option<RgbColor>,
     /// §20.4.2.3 `behindDoc=true` floating visuals.
     ///
     /// These commands are kept separate until painting so an object anchored
@@ -387,6 +390,7 @@ pub struct LayoutedPage {
 impl LayoutedPage {
     pub fn new(page_size: PtSize) -> Self {
         Self {
+            page_background: None,
             behind_doc_commands: Vec::new(),
             commands: Vec::new(),
             page_size,
@@ -478,6 +482,7 @@ mod tests {
     #[test]
     fn layouted_page_new() {
         let page = LayoutedPage::new(PtSize::new(Pt::new(612.0), Pt::new(792.0)));
+        assert!(page.page_background.is_none());
         assert!(page.behind_doc_commands.is_empty());
         assert!(page.commands.is_empty());
         assert_eq!(page.page_size.width.raw(), 612.0);

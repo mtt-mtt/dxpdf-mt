@@ -569,6 +569,13 @@ pub fn layout_document(
         all_pages.push(LayoutedPage::new(PageConfig::default().page_size));
     }
 
+    // §17.2.1 applies to every physical page, including parity separators,
+    // endnote pages, and the empty-document fallback. Assign after pagination
+    // so each page keeps its own dimensions while sharing one resolved color.
+    for page in &mut all_pages {
+        page.page_background = resolved.page_background;
+    }
+
     all_pages
 }
 
@@ -692,6 +699,7 @@ mod tests {
     fn empty_doc() -> Document {
         Document {
             settings: DocumentSettings::default(),
+            background: None,
             theme: None,
             styles: StyleSheet::default(),
             numbering: NumberingDefinitions::default(),
@@ -885,6 +893,25 @@ mod tests {
         assert_eq!(resolved.sections.len(), 1);
         assert_eq!(pages.len(), 1);
         assert!(pages[0].commands.is_empty());
+    }
+
+    #[test]
+    fn resolve_and_layout_applies_background_to_empty_physical_page() {
+        let mut doc = empty_doc();
+        doc.settings.display_background_shape = true;
+        doc.background = Some(DocumentBackground {
+            color: Color::Rgb(0xB4C7E7),
+            theme_color: None,
+            theme_tint: None,
+            theme_shade: None,
+        });
+
+        let (_, pages) = resolve_and_layout(doc);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].page_background,
+            Some(crate::render::resolve::color::rgb_from_u32(0xB4C7E7))
+        );
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub struct DocumentSettings {
     pub default_tab_stop: Dimension<Twips>,
     /// Whether even/odd headers/footers are enabled.
     pub even_and_odd_headers: bool,
+    /// §17.15.1.20: display the document background in print-layout view.
+    /// Omitted settings resolve to `false`.
+    pub display_background_shape: bool,
     /// §17.15.3.1: apply the active section's document-grid line pitch to
     /// paragraphs inside table cells as well as body paragraphs.
     pub adjust_line_height_in_table: bool,
@@ -34,6 +37,7 @@ impl Default for DocumentSettings {
             // tabs for any consumer that reads this field.
             default_tab_stop: Dimension::new(720),
             even_and_odd_headers: false,
+            display_background_shape: false,
             adjust_line_height_in_table: false,
             do_not_wrap_text_with_punct: false,
             character_spacing_control: CharacterSpacingControl::DoNotCompress,
@@ -69,6 +73,7 @@ mod tests {
     fn remaining_defaults() {
         let s = DocumentSettings::default();
         assert!(!s.even_and_odd_headers);
+        assert!(!s.display_background_shape);
         assert!(!s.adjust_line_height_in_table);
         assert!(!s.do_not_wrap_text_with_punct);
         assert_eq!(

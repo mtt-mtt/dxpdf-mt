@@ -16,6 +16,7 @@ use dxpdf::render::resolve_and_layout;
 fn empty_document() -> Document {
     Document {
         settings: DocumentSettings::default(),
+        background: None,
         theme: None,
         styles: StyleSheet::default(),
         numbering: NumberingDefinitions::default(),

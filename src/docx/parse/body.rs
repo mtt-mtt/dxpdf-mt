@@ -11,19 +11,34 @@
 use crate::docx::error::Result;
 use crate::docx::model::*;
 use crate::docx::parse::body_schema::*;
+use crate::docx::parse::primitives::{HexColor, UcharHexNumber};
 use crate::docx::parse::serde_xml::from_xml;
 use crate::docx::whitespace_workaround::restore_whitespace_sentinels;
 use std::collections::HashMap;
 
 /// Parse `w:document > w:body`, returning blocks and final section properties.
 pub fn parse_body(data: &[u8]) -> Result<(Vec<Block>, SectionProperties)> {
+    let (_, blocks, final_section) = parse_main_document(data)?;
+    Ok((blocks, final_section))
+}
+
+/// Parse the main document part, including root-level metadata that does not
+/// belong to `w:body`. Kept crate-private so the long-standing `parse_body`
+/// helper retains its public return shape for focused parser tests.
+pub(crate) fn parse_main_document(
+    data: &[u8],
+) -> Result<(Option<DocumentBackground>, Vec<Block>, SectionProperties)> {
     if data.is_empty() {
-        return Ok((Vec::new(), SectionProperties::default()));
+        return Ok((None, Vec::new(), SectionProperties::default()));
     }
     let doc: DocXml = from_xml(data)?;
     let mut ctx = ConvertCtx::new();
     let (blocks, final_section) = convert_container(doc.body.children, &mut ctx);
-    Ok((blocks, final_section.unwrap_or_default()))
+    Ok((
+        doc.background.map(Into::into),
+        blocks,
+        final_section.unwrap_or_default(),
+    ))
 }
 
 /// Parse a body-level XML part (header, footer, footnote body, etc.) into blocks.
@@ -41,10 +56,81 @@ pub fn parse_blocks(data: &[u8]) -> Result<Vec<Block>> {
 
 use serde::Deserialize;
 
-/// Thin wrapper for `<w:document>` — just extracts `<w:body>`.
+/// Thin wrapper for `<w:document>`.
 #[derive(Deserialize)]
 struct DocXml {
+    #[serde(default)]
+    background: Option<BackgroundXml>,
     body: BlockContainerXml,
+}
+
+/// §17.2.1 `CT_Background`. Drawing/VML child effects remain a later tier;
+/// this schema intentionally captures the solid-color attributes only.
+#[derive(Deserialize)]
+struct BackgroundXml {
+    #[serde(rename = "@color", default)]
+    color: Option<HexColor>,
+    #[serde(rename = "@themeColor", default)]
+    theme_color: Option<StThemeColor>,
+    #[serde(rename = "@themeTint", default)]
+    theme_tint: Option<UcharHexNumber>,
+    #[serde(rename = "@themeShade", default)]
+    theme_shade: Option<UcharHexNumber>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum StThemeColor {
+    Dark1,
+    Light1,
+    Dark2,
+    Light2,
+    Accent1,
+    Accent2,
+    Accent3,
+    Accent4,
+    Accent5,
+    Accent6,
+    Hyperlink,
+    FollowedHyperlink,
+    Background1,
+    Text1,
+    Background2,
+    Text2,
+    None,
+}
+
+impl StThemeColor {
+    /// Resolve the default Word color-scheme mapping. Documents in the
+    /// regression set either use this mapping or address accent slots directly.
+    fn index(self) -> Option<ThemeColorIndex> {
+        Some(match self {
+            Self::Dark1 | Self::Text1 => ThemeColorIndex::Dark1,
+            Self::Light1 | Self::Background1 => ThemeColorIndex::Light1,
+            Self::Dark2 | Self::Text2 => ThemeColorIndex::Dark2,
+            Self::Light2 | Self::Background2 => ThemeColorIndex::Light2,
+            Self::Accent1 => ThemeColorIndex::Accent1,
+            Self::Accent2 => ThemeColorIndex::Accent2,
+            Self::Accent3 => ThemeColorIndex::Accent3,
+            Self::Accent4 => ThemeColorIndex::Accent4,
+            Self::Accent5 => ThemeColorIndex::Accent5,
+            Self::Accent6 => ThemeColorIndex::Accent6,
+            Self::Hyperlink => ThemeColorIndex::Hyperlink,
+            Self::FollowedHyperlink => ThemeColorIndex::FollowedHyperlink,
+            Self::None => return None,
+        })
+    }
+}
+
+impl From<BackgroundXml> for DocumentBackground {
+    fn from(value: BackgroundXml) -> Self {
+        Self {
+            color: value.color.map(Into::into).unwrap_or(Color::Auto),
+            theme_color: value.theme_color.and_then(StThemeColor::index),
+            theme_tint: value.theme_tint.map(|value| value.0),
+            theme_shade: value.theme_shade.map(|value| value.0),
+        }
+    }
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────
@@ -594,6 +680,68 @@ fn hex_rsid(s: Option<&str>) -> Option<RevisionSaveId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_root_document_background_attributes() {
+        let xml = br#"<w:document xmlns:w="w">
+            <w:background w:color="B4C7E7" w:themeColor="accent5"
+                          w:themeTint="66" w:themeShade="33"/>
+            <w:body/>
+        </w:document>"#;
+        let (background, blocks, _) = parse_main_document(xml).unwrap();
+
+        assert!(blocks.is_empty());
+        assert_eq!(
+            background,
+            Some(DocumentBackground {
+                color: Color::Rgb(0xB4C7E7),
+                theme_color: Some(ThemeColorIndex::Accent5),
+                theme_tint: Some(0x66),
+                theme_shade: Some(0x33),
+            })
+        );
+    }
+
+    #[test]
+    fn root_background_theme_aliases_and_none_are_normalized() {
+        let parse = |theme: &str| {
+            let xml = format!(
+                r#"<w:document xmlns:w="w"><w:background w:themeColor="{theme}"/><w:body/></w:document>"#
+            );
+            parse_main_document(xml.as_bytes())
+                .unwrap()
+                .0
+                .unwrap()
+                .theme_color
+        };
+
+        assert_eq!(parse("background1"), Some(ThemeColorIndex::Light1));
+        assert_eq!(parse("text1"), Some(ThemeColorIndex::Dark1));
+        assert_eq!(parse("background2"), Some(ThemeColorIndex::Light2));
+        assert_eq!(parse("text2"), Some(ThemeColorIndex::Dark2));
+        assert_eq!(parse("none"), None);
+    }
+
+    #[test]
+    fn main_document_without_background_preserves_body_api() {
+        let xml = br#"<w:document xmlns:w="w"><w:body><w:p/></w:body></w:document>"#;
+        let (background, main_blocks, _) = parse_main_document(xml).unwrap();
+        let (body_blocks, _) = parse_body(xml).unwrap();
+
+        assert!(background.is_none());
+        assert_eq!(main_blocks.len(), 1);
+        assert_eq!(body_blocks.len(), 1);
+    }
+
+    #[test]
+    fn root_background_tolerates_unimplemented_child_effects() {
+        let xml = br#"<w:document xmlns:w="w" xmlns:v="v">
+            <w:background w:color="112233"><v:background id="later-tier"/></w:background>
+            <w:body/>
+        </w:document>"#;
+        let background = parse_main_document(xml).unwrap().0.unwrap();
+        assert_eq!(background.color, Color::Rgb(0x112233));
+    }
 
     /// Collect all rendered text from a converted inline sequence, recursing
     /// into hyperlinks and fields.

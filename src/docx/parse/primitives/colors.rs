@@ -5,6 +5,7 @@
 //!   choices where "auto" is spec-legal.
 //! - [`RgbHexU32`] — ST_HexColorRGB (§20.1.10.41): strictly a 6-digit RGB hex.
 //!   Used where the spec disallows "auto".
+//! - [`UcharHexNumber`] — ST_UcharHexNumber: strictly two hex digits.
 //!
 //! Both fail deserialization on malformed input (strict per plan §Decisions).
 
@@ -75,6 +76,26 @@ impl<'de> Deserialize<'de> for RgbHexU32 {
     }
 }
 
+/// OOXML `ST_UcharHexNumber`: one unsigned byte written as exactly two hex
+/// digits. WordprocessingML uses it for theme tint/shade values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UcharHexNumber(pub u8);
+
+impl<'de> Deserialize<'de> for UcharHexNumber {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() == 2 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Ok(Self(
+                u8::from_str_radix(&s, 16).expect("two hex digits always fit in u8"),
+            ))
+        } else {
+            Err(serde::de::Error::custom(
+                "expected an exactly 2-digit unsigned hex value",
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +110,12 @@ mod tests {
     struct RgbVal {
         #[serde(rename = "@val")]
         val: RgbHexU32,
+    }
+
+    #[derive(Deserialize)]
+    struct UcharVal {
+        #[serde(rename = "@val")]
+        val: UcharHexNumber,
     }
 
     #[test]
@@ -154,5 +181,16 @@ mod tests {
         // The exact 6-digit form still parses.
         let v: RgbVal = quick_xml::de::from_str(r#"<x val="0A0B0C"/>"#).unwrap();
         assert_eq!(v.val.0, 0x0A0B0C);
+    }
+
+    #[test]
+    fn uchar_hex_number_is_exactly_two_digits() {
+        let v: UcharVal = quick_xml::de::from_str(r#"<x val="66"/>"#).unwrap();
+        assert_eq!(v.val, UcharHexNumber(0x66));
+
+        for bad in ["6", "066", "GG", "+6", " 6"] {
+            let xml = format!(r#"<x val="{bad}"/>"#);
+            assert!(quick_xml::de::from_str::<UcharVal>(&xml).is_err());
+        }
     }
 }

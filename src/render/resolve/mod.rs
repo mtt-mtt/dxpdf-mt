@@ -32,6 +32,9 @@ use self::styles::ResolvedStyle;
 /// font families collected, image RelIds extracted.
 #[derive(Debug)]
 pub struct ResolvedDocument {
+    /// §17.2.1 document-wide solid page background, already gated by
+    /// `displayBackgroundShape` and resolved against the theme.
+    pub page_background: Option<color::RgbColor>,
     /// Sections with their blocks, page geometry, and header/footer content.
     pub sections: Vec<ResolvedSection>,
     /// Fully resolved styles (basedOn chains walked, doc defaults applied).
@@ -110,6 +113,7 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
     // one.
     let Document {
         settings,
+        background,
         theme,
         styles,
         numbering,
@@ -126,8 +130,14 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
     let resolved_styles = styles::resolve_styles(&styles, theme.as_ref());
     let resolved_numbering = numbering::resolve_numbering(&numbering, &resolved_styles);
     let sections = sections::resolve_sections(body, final_section, &headers, &footers);
+    let page_background = color::resolve_document_background(
+        background.as_ref(),
+        theme.as_ref(),
+        settings.display_background_shape,
+    );
 
     ResolvedDocument {
+        page_background,
         sections,
         styles: resolved_styles,
         numbering: resolved_numbering,
@@ -161,6 +171,7 @@ mod tests {
     fn empty_doc() -> Document {
         Document {
             settings: DocumentSettings::default(),
+            background: None,
             theme: None,
             styles: StyleSheet::default(),
             numbering: NumberingDefinitions::default(),
@@ -208,6 +219,24 @@ mod tests {
         assert!(resolved.font_families.is_empty());
         assert!(resolved.media.is_empty());
         assert!(resolved.theme.is_none());
+        assert!(resolved.page_background.is_none());
+    }
+
+    #[test]
+    fn resolve_carries_displayed_page_background() {
+        let mut doc = empty_doc();
+        doc.settings.display_background_shape = true;
+        doc.background = Some(DocumentBackground {
+            color: Color::Rgb(0xB4C7E7),
+            theme_color: None,
+            theme_tint: None,
+            theme_shade: None,
+        });
+
+        assert_eq!(
+            resolve(doc).page_background,
+            Some(color::rgb_from_u32(0xB4C7E7))
+        );
     }
 
     #[test]

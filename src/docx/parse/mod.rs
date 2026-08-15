@@ -173,7 +173,7 @@ pub fn parse_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Document
 
     // Phase 3: Parse document body
     let doc_data = package.require_part(&doc_path)?;
-    let (mut body_blocks, final_section) = body::parse_body(doc_data)?;
+    let (background, mut body_blocks, final_section) = body::parse_main_document(doc_data)?;
 
     // Phase 4: Parse headers and footers
     let mut headers = HashMap::new();
@@ -235,6 +235,7 @@ pub fn parse_with_limits(data: &[u8], limits: &PackageLimits) -> Result<Document
     // Phase 6: Assemble
     Ok(Document {
         settings: doc_settings,
+        background,
         theme,
         styles: style_sheet,
         numbering: numbering_defs,

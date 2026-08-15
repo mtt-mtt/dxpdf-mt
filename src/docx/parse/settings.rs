@@ -21,6 +21,8 @@ struct SettingsXml {
     default_tab_stop: Option<DimensionVal<Twips>>,
     #[serde(rename = "evenAndOddHeaders", default)]
     even_and_odd_headers: Option<OnOff>,
+    #[serde(rename = "displayBackgroundShape", default)]
+    display_background_shape: Option<OnOff>,
     #[serde(rename = "characterSpacingControl", default)]
     character_spacing_control: Option<CharacterSpacingControlXml>,
     #[serde(default)]
@@ -96,6 +98,9 @@ impl From<SettingsXml> for DocumentSettings {
         if let Some(OnOff(on)) = x.even_and_odd_headers {
             s.even_and_odd_headers = on;
         }
+        if let Some(OnOff(on)) = x.display_background_shape {
+            s.display_background_shape = on;
+        }
         if let Some(control) = x.character_spacing_control {
             s.character_spacing_control = control.val.into();
         }
@@ -140,6 +145,20 @@ mod tests {
 
         let omitted = parse_settings(br#"<settings><compat/></settings>"#).unwrap();
         assert!(!omitted.adjust_line_height_in_table);
+    }
+
+    #[test]
+    fn parses_display_background_shape_on_off_and_omitted() {
+        let enabled = parse_settings(br#"<settings><displayBackgroundShape/></settings>"#).unwrap();
+        assert!(enabled.display_background_shape);
+
+        let disabled =
+            parse_settings(br#"<settings><displayBackgroundShape val="false"/></settings>"#)
+                .unwrap();
+        assert!(!disabled.display_background_shape);
+
+        let omitted = parse_settings(br#"<settings/>"#).unwrap();
+        assert!(!omitted.display_background_shape);
     }
 
     #[test]

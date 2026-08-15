@@ -10,6 +10,6 @@ pub mod st_enums;
 pub mod toggles;
 pub mod units;
 
-pub use colors::{HexColor, RgbHexU32};
+pub use colors::{HexColor, RgbHexU32, UcharHexNumber};
 pub(crate) use toggles::last_toggle;
 pub use toggles::{AttrBool, OnOff};

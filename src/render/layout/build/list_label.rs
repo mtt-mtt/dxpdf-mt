@@ -644,6 +644,7 @@ mod tests {
         let mut numbering = HashMap::new();
         numbering.insert(NumId::new(7), levels);
         ResolvedDocument {
+            page_background: None,
             sections: Vec::new(),
             styles: HashMap::new(),
             numbering,

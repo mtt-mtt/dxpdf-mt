@@ -2055,6 +2055,7 @@ mod tests {
     fn empty_resolved() -> ResolvedDocument {
         use std::collections::HashMap;
         ResolvedDocument {
+            page_background: None,
             sections: Vec::new(),
             styles: HashMap::new(),
             numbering: HashMap::new(),

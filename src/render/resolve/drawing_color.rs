@@ -353,7 +353,7 @@ fn hsl_to_rgba(h: f32, s: f32, l: f32) -> Rgba {
 }
 
 /// HSL → RGB. All inputs and outputs in [0, 1].
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+pub(super) fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s <= 0.0 {
         return (l, l, l);
     }
@@ -389,7 +389,7 @@ fn hue_to_channel(p: f32, q: f32, mut t: f32) -> f32 {
 }
 
 /// RGB → HSL. All inputs and outputs in [0, 1].
-fn rgba_to_hsl(c: Rgba) -> (f32, f32, f32) {
+pub(super) fn rgba_to_hsl(c: Rgba) -> (f32, f32, f32) {
     let max = c.r.max(c.g).max(c.b);
     let min = c.r.min(c.g).min(c.b);
     let l = (max + min) / 2.0;

@@ -241,6 +241,13 @@ fn render_page(
     options: &RenderOptions,
     character_spacing_control: crate::model::CharacterSpacingControl,
 ) {
+    // §17.2.1: fill the entire physical page before `behindDoc` objects and
+    // ordinary content. This is page state rather than a synthetic draw
+    // command, so it never enters font/image subset collection.
+    if let Some(background) = page.page_background {
+        canvas.clear(to_color4f(background));
+    }
+
     // Destructure into disjoint `&mut` field bindings — same borrow semantics as
     // the individual caches, so the paint body below is unchanged.
     let PaintState {
@@ -1043,6 +1050,7 @@ mod tests {
     fn render_text_command_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
@@ -1069,6 +1077,7 @@ mod tests {
     fn render_text_with_char_spacing_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
@@ -1095,6 +1104,7 @@ mod tests {
     fn render_empty_text_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
@@ -1136,6 +1146,7 @@ mod tests {
             PathVerb::Close,
         ];
         let page = LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Path {
                 origin: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
@@ -1181,6 +1192,7 @@ mod tests {
         use crate::render::resolve::shape_geometry::{PathVerb, SubPath};
 
         let page = LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Path {
                 origin: PtOffset::new(Pt::new(50.0), Pt::new(50.0)),
@@ -1222,6 +1234,7 @@ mod tests {
     fn render_unicode_text_produces_pdf() {
         let registry = test_registry();
         let page = LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Text {
                 position: PtOffset::new(Pt::new(72.0), Pt::new(100.0)),
@@ -1292,6 +1305,7 @@ mod tests {
             format: ImageFormat::Png,
         };
         let page = || LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Image {
                 rect: rect(72.0, 72.0),
@@ -1328,6 +1342,7 @@ mod tests {
             format: ImageFormat::Png,
         };
         let page = || LayoutedPage {
+            page_background: None,
             behind_doc_commands: vec![],
             commands: vec![DrawCommand::Image {
                 rect: rect(72.0, 72.0),
