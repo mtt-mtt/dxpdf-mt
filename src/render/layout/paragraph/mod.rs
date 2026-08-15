@@ -375,6 +375,101 @@ impl PlacedParagraph<'_> {
         self.line_heights[i]
     }
 
+    /// Baseline extent of the final line for the narrow page-fit compatibility
+    /// case where Word ignores trailing Auto leading and glyph descent at a
+    /// page boundary.
+    ///
+    /// This is deliberately conservative: only a plain, visible text line
+    /// under ordinary Auto spacing qualifies. Explicit breaks, inline objects,
+    /// links, annotations, underlines, paragraph decorations and non-Auto rules
+    /// keep using the full resolved line box.
+    pub(crate) fn final_line_baseline_fit_height(&self, i: usize) -> Option<Pt> {
+        let LineSpacingRule::Auto(multiplier) = self.style.line_spacing else {
+            return None;
+        };
+        if i + 1 != self.line_placements.len()
+            // The controlled WPS behavior is specifically the removal of
+            // additional proportional Auto leading. At 1.0 the multiplier
+            // adds none, and changing fit would only broaden glyph-descent
+            // handling without supporting evidence.
+            || multiplier <= 1.0
+            || self.style.drop_cap.is_some()
+            || self.style.shading.is_some()
+            || self.style.borders.is_some()
+            || self
+                .style
+                .tabs
+                .iter()
+                .any(|tab| matches!(tab.alignment, crate::model::TabAlignment::Bar))
+        {
+            return None;
+        }
+
+        let placement = &self.line_placements[i];
+        if placement.line.has_break {
+            return None;
+        }
+
+        let natural_height = if placement.line.height > Pt::ZERO {
+            placement.line.height
+        } else {
+            self.default_line_height
+        };
+        let (text_height, auto_text_height) =
+            line_spacing_text_heights(&placement.line, self.default_line_height);
+        let resolved_line_height = resolve_line_height_with_auto_text(
+            natural_height,
+            text_height,
+            auto_text_height,
+            &self.style.line_spacing,
+            self.style.auto_fit,
+        );
+        if resolved_line_height <= natural_height {
+            return None;
+        }
+        let baseline_ascent = resolved_text_baseline_ascent(
+            placement.line.ascent,
+            natural_height,
+            resolved_line_height,
+            &self.style.line_spacing,
+        );
+
+        let mut lowest_baseline = Pt::ZERO;
+        let mut has_visible_text = false;
+        for fragment in &self.fragments[placement.line.start..placement.line.end] {
+            match fragment {
+                Fragment::Text {
+                    text,
+                    font,
+                    border,
+                    shading,
+                    hyperlink_url,
+                    baseline_offset,
+                    is_footnote_ref,
+                    ..
+                } => {
+                    if hyperlink_url.is_some()
+                        || *is_footnote_ref
+                        || font.underline
+                        || border.is_some()
+                        || shading.is_some()
+                    {
+                        return None;
+                    }
+                    if !text.chars().any(|ch| !ch.is_whitespace()) {
+                        continue;
+                    }
+                    has_visible_text = true;
+                    let baseline = baseline_ascent + *baseline_offset;
+                    lowest_baseline = lowest_baseline.max(baseline);
+                }
+                _ => return None,
+            }
+        }
+
+        has_visible_text.then_some(placement.clearance_before + lowest_baseline.max(Pt::ZERO))
+    }
+
     /// Total vertical extent occupied by fitted line boxes, including any
     /// per-line float clearance but excluding paragraph before/after spacing.
     pub(crate) fn line_box_height(&self) -> Pt {

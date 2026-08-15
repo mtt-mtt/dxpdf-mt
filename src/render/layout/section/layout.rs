@@ -1787,12 +1787,13 @@ fn emit_split_paragraph<'doc>(
         // §17.6.4: a fresh column offers full height, like a fresh page.
         let at_page_top = state.at_full_column_top();
         let avail = (state.bottom - state.cursor_y).max(Pt::ZERO);
-        // §17.3.1.24/§17.3.1.33: space_after and the bottom border space are
-        // only spent once, on the segment carrying the paragraph's last line.
-        let trailing_extra = cont_style.space_after + placed.bottom_border_space();
-
         // Count how many of this placement's lines fit, charging space_before
-        // (first segment only, §17.3.1.33) and the trailing spacing on the last.
+        // (first segment only, §17.3.1.33). Word does not use space_after to
+        // decide whether the final visible line may remain at a page boundary;
+        // emission still preserves it so the following block advances normally.
+        // A plain Auto text line may also use its lowest baseline instead of
+        // trailing line-box leading and glyph descent. Borders and every
+        // non-plain line remain conservative.
         let mut used = if first_segment {
             cont_style.space_before
         } else {
@@ -1800,9 +1801,17 @@ fn emit_split_paragraph<'doc>(
         };
         let mut n_fit = 0;
         for i in 0..total {
-            let mut needed = used + placed.line_height(i);
-            if i + 1 == total {
-                needed += trailing_extra;
+            let is_final_line = i + 1 == total;
+            let fit_height = if is_final_line && footnotes.is_empty() {
+                placed
+                    .final_line_baseline_fit_height(i)
+                    .unwrap_or_else(|| placed.line_height(i))
+            } else {
+                placed.line_height(i)
+            };
+            let mut needed = used + fit_height;
+            if is_final_line {
+                needed += placed.bottom_border_space();
             }
             if needed > avail {
                 break;
@@ -3493,6 +3502,56 @@ mod keep_next_chain_tests {
         }
     }
 
+    fn auto_three_line_paragraph(space_after: f32) -> LayoutBlock {
+        let mut block = text_paragraph("one ", false, 14.0);
+        let LayoutBlock::Paragraph {
+            fragments, style, ..
+        } = &mut block
+        else {
+            unreachable!();
+        };
+        fragments.push(match &fragments[0] {
+            Fragment::Text { .. } => {
+                let mut fragment = fragments[0].clone();
+                let Fragment::Text { text, .. } = &mut fragment else {
+                    unreachable!();
+                };
+                *text = "two ".into();
+                fragment
+            }
+            _ => unreachable!(),
+        });
+        fragments.push(match &fragments[0] {
+            Fragment::Text { .. } => {
+                let mut fragment = fragments[0].clone();
+                let Fragment::Text { text, .. } = &mut fragment else {
+                    unreachable!();
+                };
+                *text = "three".into();
+                fragment
+            }
+            _ => unreachable!(),
+        });
+        for fragment in fragments.iter_mut() {
+            let Fragment::Text {
+                width,
+                trimmed_width,
+                metrics,
+                ..
+            } = fragment
+            else {
+                unreachable!();
+            };
+            *width = Pt::new(100.0);
+            *trimmed_width = Pt::new(100.0);
+            metrics.leading = Pt::ZERO;
+        }
+        style.line_spacing = LineSpacingRule::Auto(1.15);
+        style.space_after = Pt::new(space_after);
+        style.widow_control = true;
+        block
+    }
+
     fn cell(blocks: Vec<LayoutBlock>) -> TableCellInput {
         TableCellInput {
             blocks,
@@ -3951,6 +4010,283 @@ mod keep_next_chain_tests {
         );
 
         assert_eq!(text_y(&plain[0], "owner"), text_y(&large_after[0], "owner"));
+    }
+
+    #[test]
+    fn final_auto_text_baseline_can_fit_without_charging_space_after() {
+        let pages = layout_section(
+            &[
+                text_paragraph("filler", false, 37.8),
+                auto_three_line_paragraph(0.0),
+                text_paragraph("next", false, 10.0),
+            ],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        for expected in ["one ", "two ", "three"] {
+            assert!(
+                page_has_text(&pages[0], expected),
+                "{expected:?} stays on page 1"
+            );
+        }
+        assert!(page_has_text(&pages[1], "next"));
+    }
+
+    #[test]
+    fn final_auto_text_baseline_that_exceeds_the_page_still_moves_whole() {
+        let pages = layout_section(
+            &[
+                text_paragraph("filler", false, 37.9),
+                auto_three_line_paragraph(0.0),
+            ],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert!(!page_has_text(&pages[0], "one "));
+        assert!(page_has_text(&pages[1], "one "));
+    }
+
+    #[test]
+    fn final_auto_text_baseline_does_not_charge_glyph_descent() {
+        let mut paragraph = auto_three_line_paragraph(0.0);
+        let LayoutBlock::Paragraph { fragments, .. } = &mut paragraph else {
+            unreachable!();
+        };
+        let Fragment::Text { metrics, .. } = &mut fragments[2] else {
+            unreachable!();
+        };
+        metrics.descent = Pt::new(4.2);
+
+        let pages = layout_section(
+            &[text_paragraph("filler", false, 37.8), paragraph],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 1);
+        for expected in ["one ", "two ", "three"] {
+            assert!(
+                page_has_text(&pages[0], expected),
+                "{expected:?} stays on page 1 even though its glyph descent crosses the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn space_after_does_not_decide_whether_the_final_line_fits() {
+        let layout = |space_after| {
+            let mut paragraph = auto_three_line_paragraph(space_after);
+            let LayoutBlock::Paragraph { style, .. } = &mut paragraph else {
+                unreachable!();
+            };
+            style.line_spacing = LineSpacingRule::Exact(Pt::new(14.0));
+            layout_section(
+                &[
+                    text_paragraph("filler", false, 38.0),
+                    paragraph,
+                    text_paragraph("next", false, 10.0),
+                ],
+                &small_page_config(),
+                None,
+                Pt::ZERO,
+                Pt::new(14.0),
+                None,
+            )
+        };
+        let no_after = layout(0.0);
+        let large_after = layout(50.0);
+
+        for pages in [&no_after, &large_after] {
+            assert_eq!(pages.len(), 2);
+            for expected in ["one ", "two ", "three"] {
+                assert!(
+                    page_has_text(&pages[0], expected),
+                    "{expected:?} stays on page 1"
+                );
+            }
+            assert!(page_has_text(&pages[1], "next"));
+        }
+        assert_eq!(
+            text_y(&no_after[1], "next"),
+            text_y(&large_after[1], "next"),
+            "trailing space is discarded at the physical page boundary"
+        );
+    }
+
+    #[test]
+    fn exact_spacing_keeps_the_full_final_line_box_for_page_fit() {
+        let mut paragraph = auto_three_line_paragraph(0.0);
+        let LayoutBlock::Paragraph { style, .. } = &mut paragraph else {
+            unreachable!();
+        };
+        style.line_spacing = LineSpacingRule::Exact(Pt::new(16.1));
+        let pages = layout_section(
+            &[text_paragraph("filler", false, 33.0), paragraph],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert!(!page_has_text(&pages[0], "one "));
+        assert!(page_has_text(&pages[1], "one "));
+    }
+
+    #[test]
+    fn auto_one_keeps_the_full_final_line_box_for_page_fit() {
+        let mut paragraph = auto_three_line_paragraph(0.0);
+        let LayoutBlock::Paragraph { style, .. } = &mut paragraph else {
+            unreachable!();
+        };
+        style.line_spacing = LineSpacingRule::Auto(1.0);
+        let pages = layout_section(
+            &[text_paragraph("filler", false, 40.0), paragraph],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert!(!page_has_text(&pages[0], "one "));
+        assert!(page_has_text(&pages[1], "one "));
+    }
+
+    #[test]
+    fn natural_only_final_text_keeps_the_full_line_box_for_page_fit() {
+        let mut paragraph = auto_three_line_paragraph(0.0);
+        let LayoutBlock::Paragraph { fragments, .. } = &mut paragraph else {
+            unreachable!();
+        };
+        let Fragment::Text { font, .. } = &mut fragments[2] else {
+            unreachable!();
+        };
+        Rc::make_mut(font).auto_line_spacing =
+            crate::render::layout::fragment::AutoLineSpacingContribution::NaturalOnly;
+        let pages = layout_section(
+            &[text_paragraph("filler", false, 34.0), paragraph],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert!(!page_has_text(&pages[0], "one "));
+        assert!(page_has_text(&pages[1], "one "));
+    }
+
+    #[test]
+    fn underlined_final_auto_text_keeps_the_full_line_box_for_page_fit() {
+        let mut paragraph = auto_three_line_paragraph(0.0);
+        let LayoutBlock::Paragraph { fragments, .. } = &mut paragraph else {
+            unreachable!();
+        };
+        let Fragment::Text { font, .. } = &mut fragments[2] else {
+            unreachable!();
+        };
+        Rc::make_mut(font).underline = true;
+        let pages = layout_section(
+            &[text_paragraph("filler", false, 33.0), paragraph],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert!(!page_has_text(&pages[0], "one "));
+        assert!(page_has_text(&pages[1], "one "));
+    }
+
+    #[test]
+    fn a_footnote_on_an_earlier_line_disables_final_line_baseline_admission() {
+        let mut paragraph = auto_three_line_paragraph(0.0);
+        let LayoutBlock::Paragraph {
+            fragments,
+            footnotes,
+            ..
+        } = &mut paragraph
+        else {
+            unreachable!();
+        };
+        let Fragment::Text {
+            is_footnote_ref, ..
+        } = &mut fragments[0]
+        else {
+            unreachable!();
+        };
+        *is_footnote_ref = true;
+        footnotes.push(LayoutFootnote {
+            paragraphs: vec![(Vec::new(), ParagraphStyle::default())],
+        });
+        let pages = layout_section(
+            &[text_paragraph("filler", false, 33.0), paragraph],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert!(!page_has_text(&pages[0], "one "));
+        assert!(page_has_text(&pages[1], "one "));
+    }
+
+    #[test]
+    fn final_auto_text_baseline_uses_the_lowest_visible_run() {
+        let mut paragraph = auto_three_line_paragraph(0.0);
+        let LayoutBlock::Paragraph { fragments, .. } = &mut paragraph else {
+            unreachable!();
+        };
+        let mut lower_run = fragments[2].clone();
+        let Fragment::Text {
+            text,
+            width,
+            trimmed_width,
+            baseline_offset,
+            ..
+        } = &mut lower_run
+        else {
+            unreachable!();
+        };
+        *text = " lower".into();
+        *width = Pt::new(20.0);
+        *trimmed_width = Pt::new(20.0);
+        *baseline_offset = Pt::new(0.1);
+        fragments.push(lower_run);
+
+        let pages = layout_section(
+            &[text_paragraph("filler", false, 37.8), paragraph],
+            &small_page_config(),
+            None,
+            Pt::ZERO,
+            Pt::new(14.0),
+            None,
+        );
+
+        assert_eq!(pages.len(), 2);
+        assert!(!page_has_text(&pages[0], "one "));
+        assert!(page_has_text(&pages[1], "one "));
     }
 
     #[test]
