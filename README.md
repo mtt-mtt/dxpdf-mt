@@ -10,6 +10,8 @@ dxpdf is an open-source, standalone DOCX-to-PDF conversion engine written in Rus
 
 Built by [nerdy.pro](https://nerdy.pro).
 
+[中文项目介绍](PROJECT_INTRODUCTION.zh-CN.md)
+
 This repository is the `mtt-mtt` compatibility and production-hardening branch
 of the upstream MIT-licensed project. It preserves upstream attribution and
 tracks additional Word/OOXML compatibility work. Until this repository creates
@@ -147,9 +149,32 @@ dxpdf.convert_file("input.docx", "output.pdf")
 pdf_bytes = dxpdf.convert(open("input.docx", "rb").read(), image_dpi=300)
 dxpdf.convert_file("input.docx", "output.pdf", image_dpi=300)
 
-# Use controlled fonts without installing them into the operating system
+# Add one or more process-local font directories. Earlier paths win.
 dxpdf.convert_file("input.docx", "output.pdf", font_dir="core-fonts")
+dxpdf.convert_file(
+    "input.docx",
+    "output.pdf",
+    font_dir=["customer-fonts", "company-fonts"],
+)
+
+# Or copy fonts once into dxpdf's per-user directory. Future conversions find
+# them automatically; no operating-system font installation is required.
+print(dxpdf.user_fonts_path())
+print(dxpdf.font_search_paths())
 ```
+
+Python conversions search fonts in this order: fonts embedded in the DOCX,
+the `font_dir` argument, directories listed in `DXPDF_FONT_DIR` (separated by
+the platform path separator), the per-user dxpdf font directory, fonts bundled
+inside the wheel, system fonts, then dxpdf's substitution/default fallbacks.
+All external fonts remain process-local. dxpdf never installs or modifies
+operating-system fonts.
+
+The development wheel currently contains the font-directory structure and
+license manifest but no general document fonts. Open fonts will be added only
+after their license and provenance records are audited. You can copy your own
+licensed `.ttf`, `.otf`, or `.ttc` files into `dxpdf.user_fonts_path()` without
+changing the package.
 
 ## Supported DOCX Features
 

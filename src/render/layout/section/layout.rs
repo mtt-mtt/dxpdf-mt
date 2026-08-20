@@ -475,6 +475,7 @@ impl<'doc> PageLayoutState<'doc> {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum PageFootnote<'doc> {
     Borrowed(
         &'doc [super::super::fragment::Fragment],
@@ -1143,6 +1144,7 @@ fn table_aware_prefix_already_admitted(block_idx: usize, admitted_through: usize
 /// for a keepNext chain longer than one page.  Before the first bridge, every
 /// unsupported condition returns `None` so the established paragraph/table
 /// predictor remains authoritative.
+#[allow(clippy::too_many_arguments)]
 fn measure_table_aware_keep_next_prefix(
     blocks: &[LayoutBlock],
     start: usize,

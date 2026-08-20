@@ -128,6 +128,7 @@ pub struct GraphicFrameLocks {
 }
 
 /// Content type inside a:graphicData.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum GraphicContent {
     /// §19.3.1.37: picture.

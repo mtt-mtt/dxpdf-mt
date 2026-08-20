@@ -97,6 +97,12 @@ jobs:
           args: --release --out dist --features python
           target: ${{ matrix.target.triple }}
 
+      - name: Install and verify mixed Python package
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall dist/*.whl
+          python scripts/verify_python_package.py dist/*.whl
+
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.target.label }}

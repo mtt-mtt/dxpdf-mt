@@ -15,7 +15,7 @@
 //! leakage is possible.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -120,7 +120,8 @@ struct PackagedFontFace {
     face_index: usize,
 }
 
-/// A reusable, process-local collection of fonts loaded from a directory.
+/// A reusable, process-local collection of fonts loaded from one or more
+/// directories.
 ///
 /// Loading is intentionally separate from [`FontRegistry`]: a server can read
 /// a large controlled font pack once, then cheaply install cloned Skia
@@ -128,7 +129,7 @@ struct PackagedFontFace {
 /// installed into the host operating system.
 #[derive(Clone, Debug)]
 pub struct FontPack {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     files_scanned: usize,
     files_loaded: usize,
     invalid_files: usize,
@@ -142,14 +143,50 @@ impl FontPack {
     /// names resolve deterministically on every host. Unreadable directories
     /// and files are errors; files Skia cannot decode are counted and skipped.
     pub fn load_dir(font_mgr: &FontMgr, root: impl AsRef<Path>) -> io::Result<Self> {
-        let root = root.as_ref().to_path_buf();
+        Self::load_dirs(font_mgr, [root])
+    }
+
+    /// Recursively load fonts from multiple roots in priority order.
+    ///
+    /// Roots earlier in the iterator win when multiple files provide the same
+    /// family and style. Traversal remains deterministic within each root,
+    /// and overlapping roots do not load the same file twice.
+    pub fn load_dirs<I, P>(font_mgr: &FontMgr, roots: I) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let roots: Vec<PathBuf> = roots
+            .into_iter()
+            .map(|root| root.as_ref().to_path_buf())
+            .collect();
+        if roots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one font path is required",
+            ));
+        }
+
         let mut paths = Vec::new();
-        collect_font_paths(&root, &mut paths)?;
-        paths.sort_by(|a, b| {
-            a.to_string_lossy()
-                .to_lowercase()
-                .cmp(&b.to_string_lossy().to_lowercase())
-        });
+        let mut seen_paths = HashSet::new();
+        for root in &roots {
+            let mut root_paths = Vec::new();
+            collect_font_paths(root, &mut root_paths)?;
+            root_paths.sort_by(|a, b| {
+                a.to_string_lossy()
+                    .to_lowercase()
+                    .cmp(&b.to_string_lossy().to_lowercase())
+            });
+            for path in root_paths {
+                let identity = fs::canonicalize(&path)
+                    .unwrap_or_else(|_| path.clone())
+                    .to_string_lossy()
+                    .to_lowercase();
+                if seen_paths.insert(identity) {
+                    paths.push(path);
+                }
+            }
+        }
 
         let mut files_loaded = 0usize;
         let mut invalid_files = 0usize;
@@ -181,7 +218,7 @@ impl FontPack {
         }
 
         Ok(Self {
-            root,
+            roots,
             files_scanned: paths.len(),
             files_loaded,
             invalid_files,
@@ -190,7 +227,11 @@ impl FontPack {
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.roots[0]
+    }
+
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
     }
 
     pub fn files_scanned(&self) -> usize {
@@ -624,6 +665,8 @@ impl FontRegistry {
 
     fn install_font_pack(&mut self, font_pack: &FontPack) {
         let mut output_unsafe_faces = 0usize;
+        let mut first_usable_face = None;
+        let mut preferred_carlito = None;
         for face in &font_pack.faces {
             // Skia's PDF backend currently serializes CFF-flavoured OTF faces
             // as a malformed TrueType FontFile2 stream on Windows. Loading
@@ -650,14 +693,19 @@ impl FontRegistry {
                 .push((face.style, entry.clone()));
             self.typefaces
                 .get_mut()
-                .insert(TypefaceKey::new(&face.family, face.style), entry.clone());
-            if self.packaged_fallback.is_none()
-                || (face.family.eq_ignore_ascii_case("Carlito")
-                    && face.style == FontStyle::normal())
+                .entry(TypefaceKey::new(&face.family, face.style))
+                .or_insert_with(|| entry.clone());
+            if first_usable_face.is_none() {
+                first_usable_face = Some(entry.clone());
+            }
+            if preferred_carlito.is_none()
+                && face.family.eq_ignore_ascii_case("Carlito")
+                && face.style == FontStyle::normal()
             {
-                self.packaged_fallback = Some(entry);
+                preferred_carlito = Some(entry);
             }
         }
+        self.packaged_fallback = preferred_carlito.or(first_usable_face);
         for faces in self.packaged_typefaces.values_mut() {
             faces.sort_by_key(|(style, _)| {
                 (
@@ -668,8 +716,8 @@ impl FontRegistry {
             });
         }
         log::info!(
-            "loaded controlled font pack '{}' ({} files, {} faces, {} families, {} invalid, {} CFF faces excluded from PDF output)",
-            font_pack.root().display(),
+            "loaded controlled font pack from {} root(s) ({} files, {} faces, {} families, {} invalid, {} CFF faces excluded from PDF output)",
+            font_pack.roots().len(),
             font_pack.files_loaded(),
             font_pack.face_count(),
             font_pack.family_count(),
@@ -1474,6 +1522,51 @@ mod tests {
             TypefaceId::from(&resolved.typeface),
             TypefaceId::from(&pack.faces[0].typeface)
         );
+    }
+
+    #[test]
+    fn controlled_font_pack_preserves_root_priority_and_deduplicates_paths() {
+        let font_mgr = fmgr();
+        let typeface = font_mgr
+            .legacy_make_typeface(None::<&str>, FontStyle::normal())
+            .expect("system has no default typeface");
+        let (bytes, _) = typeface
+            .to_font_data()
+            .expect("system default typeface has no font bytes");
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("face.ttf"), &bytes).unwrap();
+        fs::write(second.join("face.ttf"), &bytes).unwrap();
+
+        let pack = FontPack::load_dirs(&font_mgr, [&first, &second, &first]).unwrap();
+        assert_eq!(pack.roots(), &[first, second, temp.path().join("first")]);
+        assert_eq!(pack.files_scanned(), 2);
+        assert_eq!(pack.faces.len(), 2);
+
+        let family = pack.faces[0].family.clone();
+        let style = pack.faces[0].style;
+        let registry = FontRegistry::build_with_font_pack(
+            font_mgr,
+            &[],
+            std::slice::from_ref(&family),
+            Some(&pack),
+        )
+        .unwrap();
+        assert_eq!(
+            registry.resolve(&family, style).origin,
+            TypefaceOrigin::Packaged {
+                id: PackagedFontId(0)
+            }
+        );
+    }
+
+    #[test]
+    fn controlled_font_pack_requires_at_least_one_root() {
+        let error = FontPack::load_dirs::<Vec<PathBuf>, PathBuf>(&fmgr(), Vec::new()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

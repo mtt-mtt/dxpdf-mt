@@ -539,8 +539,10 @@ mod tests {
     }
 
     fn numbering_style(num_id: i64) -> ResolvedStyle {
-        let mut paragraph = ParagraphProperties::default();
-        paragraph.numbering = Some(NumberingReference { num_id, level: 0 });
+        let paragraph = ParagraphProperties {
+            numbering: Some(NumberingReference { num_id, level: 0 }),
+            ..ParagraphProperties::default()
+        };
         ResolvedStyle {
             paragraph,
             run: RunProperties::default(),

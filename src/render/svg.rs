@@ -718,10 +718,10 @@ fn validate_svg_input(data: &[u8]) -> bool {
                 if !inspect_element(&start, &reader, &mut state, false) {
                     return false;
                 }
-                if start.local_name().as_ref().eq_ignore_ascii_case(b"style") {
-                    if state.style_depth.replace(state.depth).is_some() {
-                        return false;
-                    }
+                if start.local_name().as_ref().eq_ignore_ascii_case(b"style")
+                    && state.style_depth.replace(state.depth).is_some()
+                {
+                    return false;
                 }
                 state
                     .element_stack
@@ -889,10 +889,10 @@ fn inspect_element(
             }
             id = Some(value.to_owned());
         }
-        if attr_name == b"href" {
-            if name != b"image" || image_href.replace(value.to_owned()).is_some() {
-                return false;
-            }
+        if attr_name == b"href"
+            && (name != b"image" || image_href.replace(value.to_owned()).is_some())
+        {
+            return false;
         }
         if name == b"image" && attr_name == b"width" {
             image_width = parse_positive_svg_length(value);
@@ -909,10 +909,10 @@ fn inspect_element(
             };
             state.clip_references.push(reference.to_owned());
         }
-        if attr_name == b"style" {
-            if inside_clip || name == b"clipPath" || !validate_inline_style(value, state) {
-                return false;
-            }
+        if attr_name == b"style"
+            && (inside_clip || name == b"clipPath" || !validate_inline_style(value, state))
+        {
+            return false;
         }
         if attr_name == b"overflow" && (name != b"svg" || value != "hidden") {
             return false;

@@ -35,10 +35,18 @@ reintroduce a global typeface cache.
 ## Controlled font packs
 
 `FontPack::load_dir` recursively loads `.ttf`, `.otf`, and `.ttc` files into a
-process-local collection. It does not install or modify operating-system
-fonts. Servers should retain one `FontMgr` and one `FontPack`, then call
-`convert_with_options_and_font_pack`; CLI `--font-dir` and Python `font_dir=`
-are single-conversion convenience interfaces and reload the directory.
+process-local collection. `FontPack::load_dirs` accepts ordered roots; an
+earlier root wins when two files expose the same family and style. Neither API
+installs or modifies operating-system fonts. Servers should retain one
+`FontMgr` and one `FontPack`, then call `convert_with_options_and_font_pack`;
+CLI `--font-dir` and Python `font_dir=` are single-conversion convenience
+interfaces and reload the selected paths.
+
+The Python wrapper accepts either one path or an iterable. It appends
+`DXPDF_FONT_DIR`, the per-user dxpdf font directory, and the wheel's bundled
+font directory before entering Rust. This keeps path discovery and platform
+conventions in Python while the Rust renderer receives one deterministic,
+ordered `FontPack`.
 
 The effective priority is: DOCX-embedded face, controlled-pack exact face,
 then the ordered metric-compatible substitution candidates. For each

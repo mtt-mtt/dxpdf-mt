@@ -31,6 +31,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Test Python package API
+        run: python3 -m unittest discover -s python/tests -v
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -180,6 +183,12 @@ jobs:
         with:
           args: --release --out dist --features python
           target: ${{ matrix.target.triple }}
+
+      - name: Install and verify mixed Python package
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall dist/*.whl
+          python scripts/verify_python_package.py dist/*.whl
 
       - name: Verify FreeType is embedded (linux/macos)
         if: matrix.target.os != 'windows'

@@ -205,7 +205,7 @@ mod tests {
 
         let actual_tip = tip(&shape);
         assert_close(actual_tip.x.raw(), -3.362_404_6);
-        assert_close(actual_tip.y.raw(), 88.044_144);
+        assert_close(actual_tip.y.raw(), 88.044_14);
 
         let PathVerb::LineTo(first_attachment) = subpath.verbs[1] else {
             panic!("expected the first wedge attachment");

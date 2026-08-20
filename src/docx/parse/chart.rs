@@ -227,6 +227,7 @@ fn build_pie(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_data_label(
     label: Option<DataLabelXml>,
     global_style: &ChartTextStyle,
@@ -724,7 +725,7 @@ impl BoolValXml {
     fn resolved(&self) -> bool {
         // DrawingML CT_Boolean treats a present element with omitted `val` as
         // enabled, matching the toggle convention used by Office producers.
-        self.val.map_or(true, |value| value.0)
+        self.val.is_none_or(|value| value.0)
     }
 }
 

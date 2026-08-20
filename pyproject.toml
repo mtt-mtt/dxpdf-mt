@@ -21,9 +21,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://nerdy.pro"
-Repository = "https://github.com/nerdy-pro/dxpdf"
-Documentation = "https://github.com/nerdy-pro/dxpdf#readme"
+Homepage = "https://github.com/mtt-mtt/dxpdf-mt"
+Repository = "https://github.com/mtt-mtt/dxpdf-mt"
+Documentation = "https://github.com/mtt-mtt/dxpdf-mt#readme"
 
 [tool.maturin]
 features = ["python"]
+python-source = "python"
+module-name = "dxpdf._native"

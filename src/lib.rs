@@ -81,8 +81,24 @@ pub fn convert_with_options_and_font_dir(
     limits: &PackageLimits,
     font_dir: impl AsRef<std::path::Path>,
 ) -> Result<Vec<u8>, Error> {
+    convert_with_options_and_font_dirs(docx_bytes, options, limits, [font_dir])
+}
+
+/// Convenience entry point that loads multiple font paths in priority order
+/// for one conversion. Earlier paths win when they contain the same family and
+/// style. The fonts remain process-local and are never installed system-wide.
+pub fn convert_with_options_and_font_dirs<I, P>(
+    docx_bytes: &[u8],
+    options: &RenderOptions,
+    limits: &PackageLimits,
+    font_dirs: I,
+) -> Result<Vec<u8>, Error>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<std::path::Path>,
+{
     let font_mgr = skia_safe::FontMgr::new();
-    let font_pack = FontPack::load_dir(&font_mgr, font_dir)?;
+    let font_pack = FontPack::load_dirs(&font_mgr, font_dirs)?;
     convert_with_options_and_font_pack(docx_bytes, options, limits, &font_mgr, &font_pack)
 }
 
@@ -98,15 +114,19 @@ mod python {
     /// `image_dpi` sets the target resolution (pixels per inch) embedded raster
     /// images are downsampled to; defaults to 220.
     #[pyfunction]
-    #[pyo3(signature = (docx_bytes, image_dpi = crate::DEFAULT_IMAGE_DPI, font_dir = None))]
-    fn convert(docx_bytes: &[u8], image_dpi: f32, font_dir: Option<&str>) -> PyResult<Vec<u8>> {
+    #[pyo3(signature = (docx_bytes, image_dpi = crate::DEFAULT_IMAGE_DPI, font_dirs = None))]
+    fn convert(
+        docx_bytes: &[u8],
+        image_dpi: f32,
+        font_dirs: Option<Vec<String>>,
+    ) -> PyResult<Vec<u8>> {
         let options = crate::RenderOptions::default().with_image_dpi(image_dpi);
-        let result = if let Some(font_dir) = font_dir {
-            crate::convert_with_options_and_font_dir(
+        let result = if let Some(font_dirs) = font_dirs.filter(|dirs| !dirs.is_empty()) {
+            crate::convert_with_options_and_font_dirs(
                 docx_bytes,
                 &options,
                 &crate::PackageLimits::default(),
-                font_dir,
+                font_dirs,
             )
         } else {
             crate::convert_with_options(docx_bytes, &options)
@@ -119,22 +139,22 @@ mod python {
     /// `image_dpi` sets the target resolution (pixels per inch) embedded raster
     /// images are downsampled to; defaults to 220.
     #[pyfunction]
-    #[pyo3(signature = (input, output, image_dpi = crate::DEFAULT_IMAGE_DPI, font_dir = None))]
+    #[pyo3(signature = (input, output, image_dpi = crate::DEFAULT_IMAGE_DPI, font_dirs = None))]
     fn convert_file(
         input: &str,
         output: &str,
         image_dpi: f32,
-        font_dir: Option<&str>,
+        font_dirs: Option<Vec<String>>,
     ) -> PyResult<()> {
         let docx_bytes = crate::path_io::read(input)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to read {input}: {e}")))?;
         let options = crate::RenderOptions::default().with_image_dpi(image_dpi);
-        let pdf_bytes = if let Some(font_dir) = font_dir {
-            crate::convert_with_options_and_font_dir(
+        let pdf_bytes = if let Some(font_dirs) = font_dirs.filter(|dirs| !dirs.is_empty()) {
+            crate::convert_with_options_and_font_dirs(
                 &docx_bytes,
                 &options,
                 &crate::PackageLimits::default(),
-                font_dir,
+                font_dirs,
             )
         } else {
             crate::convert_with_options(&docx_bytes, &options)
@@ -147,7 +167,7 @@ mod python {
 
     /// A fast DOCX-to-PDF converter powered by Skia.
     #[pymodule]
-    fn dxpdf(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(convert, m)?)?;
         m.add_function(wrap_pyfunction!(convert_file, m)?)?;
         Ok(())
