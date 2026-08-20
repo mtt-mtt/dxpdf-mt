@@ -1,11 +1,11 @@
-# dxpdf-mt 项目介绍
+# mtdxpdf 项目介绍
 
-dxpdf-mt 是一个用 Rust 编写、由 Skia 驱动的独立 DOCX 转 PDF 引擎。它直接解析
+mtdxpdf 是一个用 Rust 编写、由 Skia 驱动的独立 DOCX 转 PDF 引擎。它直接解析
 Office Open XML，不依赖 Microsoft Office、LibreOffice、WPS 或云端转换服务，可通过
 命令行、Rust API 和 Python 包使用。
 
 本仓库基于 MIT 许可的上游 dxpdf 0.4，重点补强真实 Word/WPS 文档兼容性、受控字体、
-复杂页面布局、发布工程和批量转换稳定性。目前它是正在验证的兼容性候选版本，不承诺
+复杂页面布局、发布工程和批量转换稳定性。首个 mtdxpdf 发布版本为 `0.4.0`，不承诺
 任意 DOCX 都能与 Word/WPS 像素级完全一致。
 
 ## 项目目标
@@ -62,8 +62,10 @@ DOCX bytes
 安装发布后的 wheel：
 
 ```bash
-pip install dxpdf
+pip install mtdxpdf==0.4.0
 ```
+
+PyPI 分发名是 `mtdxpdf`，为了保持现有 API 兼容，Python 导入名仍是 `dxpdf`：
 
 文件转换：
 
@@ -127,7 +129,7 @@ Linux/macOS 使用 `:`。
 6. 系统字体；
 7. dxpdf 字体替代和默认回退。
 
-所有外部字体只在当前进程内加载。dxpdf 不会安装、删除或修改操作系统字体。wheel 已包含
+所有外部字体只在当前进程内加载。mtdxpdf 不会安装、删除或修改操作系统字体。wheel 已包含
 字体目录、manifest 和许可证目录，但通用开源字体只有在许可与来源审计完成后才会加入。
 
 ## CLI 使用
@@ -197,8 +199,8 @@ Python 扩展使用 CPython stable ABI，构建产物为 `cp38-abi3` wheel，可
 - macOS Intel；
 - macOS Apple Silicon。
 
-正式发布前必须确认 PyPI distribution 名称、项目所有权、签名/权限和字体许可证。Python
-导入名可以继续保持 `dxpdf`，即使最终 distribution 名需要与上游项目区分。
+本项目的 PyPI distribution 名称为 `mtdxpdf`，Python 导入名为 `dxpdf`。正式发布前必须确认
+项目所有权、签名/权限和字体许可证。
 
 ## 质量保证
 
@@ -256,5 +258,5 @@ scripts/             验证、构建和回归辅助脚本
 4. 修改后运行格式、测试、wheel 安装和相关视觉门禁。
 5. 不提交私有文档、未审计字体或无许可证的二进制资产。
 
-dxpdf-mt 的近期方向是先成为可控、可复现、便于 Python 部署的业务文档转换器，再逐步
+mtdxpdf 的近期方向是先成为可控、可复现、便于 Python 部署的业务文档转换器，再逐步
 扩大对一般 Word/WPS 文档的兼容覆盖面。

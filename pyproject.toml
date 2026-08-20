@@ -3,7 +3,7 @@ requires = ["maturin>=1.7"]
 build-backend = "maturin"
 
 [project]
-name = "dxpdf"
+name = "mtdxpdf"
 dynamic = ["version"]
 description = "A fast DOCX-to-PDF converter powered by Skia, written in Rust"
 readme = "README.md"

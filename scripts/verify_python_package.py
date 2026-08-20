@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from email.parser import Parser
 import json
 import zipfile
 from pathlib import Path
@@ -14,6 +15,28 @@ import dxpdf
 def verify(wheel: Path) -> None:
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        metadata_files = sorted(
+            name for name in names if name.endswith(".dist-info/METADATA")
+        )
+        if len(metadata_files) != 1:
+            raise SystemExit(
+                f"{wheel.name}: expected one distribution METADATA file, "
+                f"got {metadata_files}"
+            )
+        metadata = Parser().parsestr(
+            archive.read(metadata_files[0]).decode("utf-8")
+        )
+
+    if metadata.get("Name") != "mtdxpdf":
+        raise SystemExit(
+            f"{wheel.name}: expected distribution Name mtdxpdf, "
+            f"got {metadata.get('Name')!r}"
+        )
+    if metadata.get("Version") != dxpdf.__version__:
+        raise SystemExit(
+            f"{wheel.name}: metadata version {metadata.get('Version')!r} "
+            f"does not match dxpdf.__version__ {dxpdf.__version__!r}"
+        )
 
     required = {
         "dxpdf/__init__.py",

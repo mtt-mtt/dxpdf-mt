@@ -1,10 +1,11 @@
-# dxpdf — Fast DOCX to PDF Converter in Rust
+# mtdxpdf — Fast DOCX to PDF Converter in Rust
 
 **Convert Microsoft Word DOCX files to PDF without Microsoft Office, LibreOffice, or any cloud API.**
 
-dxpdf is an open-source, standalone DOCX-to-PDF conversion engine written in Rust and powered by [Skia](https://skia.org). It reads `.docx` files and produces high-fidelity PDF output — preserving text formatting, tables, images, headers, footers, hyperlinks, and page layout. Available as a CLI tool, a Rust library, and a Python package.
+mtdxpdf is an open-source, standalone DOCX-to-PDF conversion engine written in Rust and powered by [Skia](https://skia.org). It reads `.docx` files and produces high-fidelity PDF output — preserving text formatting, tables, images, headers, footers, hyperlinks, and page layout. Available as a CLI tool, a Rust library, and a Python package.
 
 [![Crates.io](https://img.shields.io/crates/v/dxpdf)](https://crates.io/crates/dxpdf)
+[![PyPI](https://img.shields.io/pypi/v/mtdxpdf)](https://pypi.org/project/mtdxpdf/)
 [![Documentation](https://img.shields.io/docsrs/dxpdf)](https://docs.rs/dxpdf)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -14,9 +15,9 @@ Built by [nerdy.pro](https://nerdy.pro).
 
 This repository is the `mtt-mtt` compatibility and production-hardening branch
 of the upstream MIT-licensed project. It preserves upstream attribution and
-tracks additional Word/OOXML compatibility work. Until this repository creates
-its own tagged release, the crates.io and PyPI installation commands below refer
-to the upstream `dxpdf` 0.4 package.
+tracks additional Word/OOXML compatibility work. The Python distribution is
+named `mtdxpdf`; it deliberately keeps the compatible `import dxpdf` module,
+Rust crate, and `dxpdf` CLI names.
 
 ## Project status
 
@@ -61,7 +62,13 @@ dxpdf = "0.4.0"
 ### Python Package
 
 ```bash
-pip install dxpdf
+pip install mtdxpdf==0.4.0
+```
+
+The distribution and import names intentionally differ:
+
+```python
+import dxpdf
 ```
 
 ## Usage
@@ -457,7 +464,7 @@ Validated against ISO 29500 (Office Open XML). **69 entries fully implemented, 1
 
 ### How do I convert a DOCX file to PDF?
 
-Install dxpdf with `cargo install dxpdf`, then run `dxpdf input.docx`. The PDF will be created in the same directory. You can also specify an output path with `-o output.pdf`.
+Install the Rust CLI with `cargo install dxpdf`, then run `dxpdf input.docx`. For Python, install `mtdxpdf`. The PDF will be created in the same directory. You can also specify an output path with `-o output.pdf`.
 
 ### Does dxpdf require Microsoft Office or LibreOffice?
 
@@ -465,13 +472,13 @@ No. dxpdf is a standalone converter that reads DOCX files directly and renders P
 
 ### Can I use dxpdf as a library in my Rust or Python project?
 
-Yes. In Rust, add `dxpdf` as a dependency and call `dxpdf::convert(&docx_bytes)`. In Python, install with `pip install dxpdf` and call `dxpdf.convert(bytes)` or `dxpdf.convert_file("input.docx", "output.pdf")`.
+Yes. In Rust, add `dxpdf` as a dependency and call `dxpdf::convert(&docx_bytes)`. In Python, install with `pip install mtdxpdf` and call `dxpdf.convert(bytes)` or `dxpdf.convert_file("input.docx", "output.pdf")`.
 
 ### What DOCX features are supported?
 
 dxpdf supports text formatting, paragraphs, tables (including nested, merged and floating tables with conditional formatting), inline and floating images, shapes and text boxes, styles with inheritance, headers/footers, multi-level lists, hyperlinks and a navigable PDF outline, footnotes and endnotes, section breaks, and automatic pagination. See the full [feature matrix](#ooxml-feature-coverage) above.
 
-Notable gaps: complex-script shaping (Arabic joining, Indic reordering), RTL text, automatic hyphenation, tracked changes and comments, and SmartArt and charts.
+Notable gaps: complex-script shaping (Arabic joining, Indic reordering), RTL text, automatic hyphenation, tracked changes and comments, SmartArt, and chart types beyond the supported pie/doughnut subset.
 
 ### How fast is dxpdf?
 

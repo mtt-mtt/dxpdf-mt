@@ -15,7 +15,7 @@ from ._paths import (
 )
 
 try:
-    __version__ = version("dxpdf")
+    __version__ = version("mtdxpdf")
 except PackageNotFoundError:  # pragma: no cover - source-tree imports only
     __version__ = "0.0.0"
 
