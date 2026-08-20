@@ -450,6 +450,12 @@ pub struct TileFill {
 pub struct Blip {
     /// r:embed — relationship ID for embedded image.
     pub embed: Option<RelId>,
+    /// Office SVG extension — preferred vector source for this same picture.
+    ///
+    /// When present, `embed` remains the ordinary bitmap fallback.  This is a
+    /// paint-source preference inside the selected DrawingML picture, not a
+    /// separate MCE branch.
+    pub svg_embed: Option<RelId>,
     /// r:link — relationship ID for linked (external) image.
     pub link: Option<RelId>,
     /// §20.1.10.7: compression state.

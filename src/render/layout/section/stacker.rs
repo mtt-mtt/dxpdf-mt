@@ -513,6 +513,7 @@ mod tests {
             image_data: MediaEntry {
                 data: std::sync::Arc::from(&b""[..]),
                 format: ImageFormat::Png,
+                fallback: None,
             },
             size: PtSize::new(Pt::new(50.0), Pt::new(height)),
             src_rect: None,

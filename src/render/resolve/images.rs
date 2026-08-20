@@ -1,5 +1,6 @@
-//! Image extraction — navigate DrawingML hierarchy to extract image RelIds.
+//! Image extraction and preferred-source selection for DrawingML pictures.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::model::dimension::{Dimension, ThousandthPercent};
@@ -17,6 +18,40 @@ use crate::render::geometry::PtRect;
 pub struct MediaEntry {
     pub data: Arc<[u8]>,
     pub format: ImageFormat,
+    /// One paint-time bitmap fallback for a preferred SVG source.
+    ///
+    /// This deliberately cannot contain another fallback, preventing cycles
+    /// and recursive fallback chains by construction.
+    pub fallback: Option<FallbackMedia>,
+}
+
+impl MediaEntry {
+    /// Empty paint carrier used when a picture relationship was resolved but
+    /// no permitted source exists. Keeping it as `Some` prevents later legacy
+    /// media population from resurrecting a rejected preferred relationship.
+    pub(crate) fn empty_placeholder() -> Self {
+        Self {
+            data: Arc::from(&[][..]),
+            format: ImageFormat::Unknown,
+            fallback: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FallbackMedia {
+    pub data: Arc<[u8]>,
+    pub format: ImageFormat,
+}
+
+/// Source selected for one already-live DrawingML picture.
+///
+/// `media == None` still carries a relationship identity so inline layout can
+/// retain the authored extent as an empty paint placeholder.
+#[derive(Clone, Debug)]
+pub struct ResolvedPictureMedia {
+    pub display_rel_id: RelId,
+    pub media: Option<MediaEntry>,
 }
 
 /// Extract the embedded image relationship ID from a DrawingML Image.
@@ -28,6 +63,62 @@ pub fn extract_image_rel_id(image: &Image) -> Option<&RelId> {
         | GraphicContent::WordProcessingGroup(_)
         | GraphicContent::Chart(_) => None,
     }
+}
+
+/// Resolve the paint source for a DrawingML picture without changing its
+/// layout geometry or the MCE branch that selected it.
+///
+/// A valid Office SVG relationship is preferred.  The ordinary `a:blip`
+/// relationship then remains attached as a single paint-time bitmap fallback.
+/// Missing or wrongly typed preferred media selects the ordinary source
+/// directly instead of feeding arbitrary bytes to the SVG parser.
+pub fn resolve_picture_media(
+    image: &Image,
+    media: &HashMap<RelId, MediaEntry>,
+) -> Option<ResolvedPictureMedia> {
+    let GraphicContent::Picture(picture) = image.graphic.as_ref()? else {
+        return None;
+    };
+    let blip = picture.blip_fill.blip.as_ref()?;
+    let ordinary = blip.embed.as_ref().and_then(|id| media.get(id));
+
+    if let Some(svg_rel_id) = blip.svg_embed.as_ref() {
+        if let Some(svg) = media
+            .get(svg_rel_id)
+            .filter(|entry| entry.format == ImageFormat::Svg)
+        {
+            let fallback = ordinary.map(|entry| FallbackMedia {
+                data: Arc::clone(&entry.data),
+                format: entry.format,
+            });
+            return Some(ResolvedPictureMedia {
+                display_rel_id: svg_rel_id.clone(),
+                media: Some(MediaEntry {
+                    data: Arc::clone(&svg.data),
+                    format: svg.format,
+                    fallback,
+                }),
+            });
+        }
+
+        if let (Some(ordinary_rel_id), Some(ordinary)) = (blip.embed.as_ref(), ordinary) {
+            return Some(ResolvedPictureMedia {
+                display_rel_id: ordinary_rel_id.clone(),
+                media: Some(ordinary.clone()),
+            });
+        }
+
+        return Some(ResolvedPictureMedia {
+            display_rel_id: svg_rel_id.clone(),
+            media: None,
+        });
+    }
+
+    let ordinary_rel_id = blip.embed.as_ref()?;
+    Some(ResolvedPictureMedia {
+        display_rel_id: ordinary_rel_id.clone(),
+        media: ordinary.cloned(),
+    })
 }
 
 /// §20.1.10.48 CT_RelativeRect → the visible source region as a fraction rect
@@ -115,6 +206,7 @@ mod tests {
                     dpi: None,
                     blip: Some(Blip {
                         embed: Some(RelId::new(rel_id)),
+                        svg_embed: None,
                         link: None,
                         compression: None,
                     }),
@@ -139,6 +231,82 @@ mod tests {
         let img = make_image_with_blip("rId5");
         let rel_id = extract_image_rel_id(&img);
         assert_eq!(rel_id.map(|r| r.as_str()), Some("rId5"));
+    }
+
+    fn with_svg(mut image: Image, rel_id: &str) -> Image {
+        let Some(GraphicContent::Picture(picture)) = image.graphic.as_mut() else {
+            unreachable!();
+        };
+        picture.blip_fill.blip.as_mut().unwrap().svg_embed = Some(RelId::new(rel_id));
+        image
+    }
+
+    fn media_entry(byte: u8, format: ImageFormat) -> MediaEntry {
+        MediaEntry {
+            data: Arc::from([byte]),
+            format,
+            fallback: None,
+        }
+    }
+
+    #[test]
+    fn preferred_svg_carries_one_level_bitmap_fallback() {
+        let image = with_svg(make_image_with_blip("rIdPng"), "rIdSvg");
+        let svg = media_entry(b'<', ImageFormat::Svg);
+        let png = media_entry(0x89, ImageFormat::Png);
+        let media = HashMap::from([
+            (RelId::new("rIdSvg"), svg.clone()),
+            (RelId::new("rIdPng"), png.clone()),
+        ]);
+
+        let resolved = resolve_picture_media(&image, &media).expect("picture source");
+        assert_eq!(resolved.display_rel_id.as_str(), "rIdSvg");
+        let primary = resolved.media.expect("preferred media");
+        assert_eq!(primary.format, ImageFormat::Svg);
+        assert!(Arc::ptr_eq(&primary.data, &svg.data));
+        let fallback = primary.fallback.expect("bitmap fallback");
+        assert_eq!(fallback.format, ImageFormat::Png);
+        assert!(Arc::ptr_eq(&fallback.data, &png.data));
+    }
+
+    #[test]
+    fn missing_or_wrongly_typed_preferred_source_selects_bitmap_directly() {
+        let image = with_svg(make_image_with_blip("rIdPng"), "rIdSvg");
+        let png = media_entry(0x89, ImageFormat::Png);
+        for preferred in [None, Some(media_entry(0x89, ImageFormat::Png))] {
+            let mut media = HashMap::from([(RelId::new("rIdPng"), png.clone())]);
+            if let Some(preferred) = preferred {
+                media.insert(RelId::new("rIdSvg"), preferred);
+            }
+            let resolved = resolve_picture_media(&image, &media).expect("picture source");
+            assert_eq!(resolved.display_rel_id.as_str(), "rIdPng");
+            let selected = resolved.media.expect("ordinary media");
+            assert_eq!(selected.format, ImageFormat::Png);
+            assert!(Arc::ptr_eq(&selected.data, &png.data));
+            assert!(selected.fallback.is_none());
+        }
+    }
+
+    #[test]
+    fn valid_svg_only_picture_resolves_without_fallback() {
+        let mut image = with_svg(make_image_with_blip("unused"), "rIdSvg");
+        let Some(GraphicContent::Picture(picture)) = image.graphic.as_mut() else {
+            unreachable!();
+        };
+        picture.blip_fill.blip.as_mut().unwrap().embed = None;
+        let media = HashMap::from([(RelId::new("rIdSvg"), media_entry(b'<', ImageFormat::Svg))]);
+
+        let resolved = resolve_picture_media(&image, &media).expect("picture source");
+        assert_eq!(resolved.display_rel_id.as_str(), "rIdSvg");
+        assert!(resolved.media.unwrap().fallback.is_none());
+    }
+
+    #[test]
+    fn missing_picture_media_retains_relationship_identity_for_placeholder() {
+        let image = with_svg(make_image_with_blip("rIdPng"), "rIdSvg");
+        let resolved = resolve_picture_media(&image, &HashMap::new()).expect("placeholder");
+        assert_eq!(resolved.display_rel_id.as_str(), "rIdSvg");
+        assert!(resolved.media.is_none());
     }
 
     #[test]

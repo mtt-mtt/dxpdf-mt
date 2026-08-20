@@ -22,6 +22,7 @@ pub mod resolve;
 pub mod skia_conv;
 #[cfg(feature = "subset-fonts")]
 pub mod subset;
+pub(crate) mod svg;
 
 use crate::model::Document;
 

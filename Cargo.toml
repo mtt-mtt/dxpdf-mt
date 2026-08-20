@@ -20,7 +20,7 @@ bitflags = "2"
 quick-xml = { version = "0.39", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
-skia-safe = { version = "0.93", features = ["embed-freetype", "textlayout"] }
+skia-safe = { version = "0.93", features = ["embed-freetype", "textlayout", "svg"] }
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
@@ -39,6 +39,11 @@ unicode-normalization = "0.1.25"
 # (hot path, short keys). std's SipHash made an earlier width cache net-negative
 # on small docs; FxHash keeps the probe cheap enough to win across the doc mix.
 rustc-hash = "2"
+
+# rust-skia's published 0.93.1 SVG archive for Windows is keyed with GL.
+# Target-scoping keeps Linux/macOS on their existing native feature set.
+[target.'cfg(windows)'.dependencies]
+skia-safe = { version = "0.93", features = ["gl"] }
 
 [features]
 default = ["subset-fonts"]

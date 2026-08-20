@@ -147,7 +147,16 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
         font_families,
         media: media
             .into_iter()
-            .map(|(id, (data, format))| (id, MediaEntry { data, format }))
+            .map(|(id, (data, format))| {
+                (
+                    id,
+                    MediaEntry {
+                        data,
+                        format,
+                        fallback: None,
+                    },
+                )
+            })
             .collect(),
         charts,
         pic_bullets: numbering.pic_bullets,

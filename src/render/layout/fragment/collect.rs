@@ -689,6 +689,14 @@ pub struct FragmentCtx<'a> {
     /// callers without a font registry (most unit tests) pass `None` and
     /// emoji codepoints flow through the existing text path unchanged.
     pub measurer: Option<&'a crate::render::layout::measurer::TextMeasurer<'a>>,
+    /// Package media used only to choose a picture's paint source.  It is
+    /// read-only and never feeds dimensions back into fragment layout.
+    pub media: Option<
+        &'a std::collections::HashMap<
+            crate::model::RelId,
+            crate::render::resolve::images::MediaEntry,
+        >,
+    >,
     /// §20.1.2.1.18: the `a:normAutofit` shrink of the enclosing shape text
     /// body. [`ShapeAutoFit::NONE`] everywhere else.
     ///
@@ -1035,15 +1043,33 @@ where
                     // Only render INLINE images as fragments.
                     // Anchor (floating) images are handled separately in build.rs.
                     if matches!(img.placement, crate::model::ImagePlacement::Inline { .. }) {
-                        if let Some(rel_id) =
-                            crate::render::resolve::images::extract_image_rel_id(img)
+                        let resolved = ctx.media.and_then(|media| {
+                            crate::render::resolve::images::resolve_picture_media(img, media)
+                        });
+                        if let Some((rel_id, image_data)) = resolved
+                            .map(|source| {
+                                (
+                                    source.display_rel_id,
+                                    Some(source.media.unwrap_or_else(|| {
+                                        crate::render::resolve::images::MediaEntry::empty_placeholder()
+                                    })),
+                                )
+                            })
+                            .or_else(|| {
+                                // Pure fragment tests and callers with no media
+                                // context retain the pre-existing ordinary-blip
+                                // behaviour.
+                                crate::render::resolve::images::extract_image_rel_id(img)
+                                    .cloned()
+                                    .map(|id| (id, None))
+                            })
                         {
                             let w = Pt::from(img.extent.width);
                             let h = Pt::from(img.extent.height);
                             fragments.push(Fragment::Image {
                                 size: PtSize::new(w, h),
                                 rel_id: rel_id.as_str().to_string(),
-                                image_data: None,
+                                image_data,
                                 src_rect: crate::render::resolve::images::extract_src_rect(img),
                             });
                         }
@@ -1433,6 +1459,7 @@ where
                                                 .as_ref(),
                                             theme,
                                             measurer: ctx.measurer,
+                                            media: ctx.media,
                                             auto_fit: ctx.auto_fit,
                                         };
                                         let mut sub = collect_fragments(
@@ -1500,6 +1527,7 @@ mod tests {
             paragraph_mark_properties: None,
             theme: None,
             measurer: None,
+            media: None,
             auto_fit: crate::render::layout::ShapeAutoFit::NONE,
         }
     }
@@ -2353,6 +2381,7 @@ mod tests {
                     dpi: None,
                     blip: Some(Blip {
                         embed: Some(RelId::new("rId7")),
+                        svg_embed: None,
                         link: None,
                         compression: None,
                     }),

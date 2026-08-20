@@ -579,6 +579,7 @@ pub(super) fn build_fragments(
         paragraph_mark_properties: para.mark_run_properties.as_ref(),
         theme: ctx.resolved.theme.as_ref(),
         measurer: Some(ctx.measurer),
+        media: Some(ctx.media()),
         auto_fit: state.shape_auto_fit,
     };
     let mut fragments = collect_fragments(

@@ -642,6 +642,7 @@ mod tests {
                     image_data: crate::render::resolve::images::MediaEntry {
                         data: std::sync::Arc::from(&[0u8][..]),
                         format: crate::model::ImageFormat::Png,
+                        fallback: None,
                     },
                     src_rect: None,
                 },

@@ -326,6 +326,48 @@ pub struct BlipXml {
     pub link: Option<String>,
     #[serde(rename = "@cstate", default)]
     pub cstate: Option<StBlipCompression>,
+    #[serde(rename = "extLst", default)]
+    pub ext_lists: Vec<BlipExtensionListXml>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlipExtensionListXml {
+    #[serde(rename = "ext", default)]
+    pub entries: Vec<BlipExtensionXml>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlipExtensionXml {
+    #[serde(rename = "@uri", default)]
+    pub uri: Option<String>,
+    // quick-xml intentionally matches the local name.  The enclosing URI gate
+    // below is therefore what prevents an unrelated extension's same-named
+    // child from being accepted as the Office SVG source.
+    #[serde(rename = "svgBlip", default)]
+    pub svg_blips: Vec<SvgBlipXml>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SvgBlipXml {
+    #[serde(rename = "@r:embed", alias = "@embed", default)]
+    pub embed: Option<String>,
+}
+
+const OFFICE_SVG_EXTENSION_URI: &str = "{96DAC541-7B7A-43D3-8B79-37D633B846F1}";
+
+fn preferred_svg_embed(ext_lists: Vec<BlipExtensionListXml>) -> Option<String> {
+    ext_lists
+        .into_iter()
+        .flat_map(|list| list.entries)
+        .filter(|ext| {
+            ext.uri
+                .as_deref()
+                .is_some_and(|uri| uri.trim().eq_ignore_ascii_case(OFFICE_SVG_EXTENSION_URI))
+        })
+        .flat_map(|ext| ext.svg_blips)
+        .filter_map(|svg_blip| svg_blip.embed)
+        .map(|id| id.trim().to_owned())
+        .find(|id| !id.is_empty())
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -415,6 +457,7 @@ impl From<BlipFillXml> for BlipFill {
         use crate::docx::model::RelId;
         let blip = x.blip.map(|b| Blip {
             embed: b.embed.map(RelId::new),
+            svg_embed: preferred_svg_embed(b.ext_lists).map(RelId::new),
             link: b.link.map(RelId::new),
             compression: b.cstate.map(Into::into),
         });
@@ -705,6 +748,86 @@ mod tests {
                     Some("rId1")
                 );
                 assert!(matches!(b.fill_kind, BlipFillKind::Stretch(_)));
+            }
+            other => panic!("expected Blip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blip_fill_captures_known_office_svg_extension_with_renamed_prefix() {
+        match parse(
+            r#"<blipFill xmlns:renamed="http://schemas.microsoft.com/office/drawing/2016/SVG/main"
+                    xmlns:rel="urn:r">
+                <blip r:embed="rIdPng">
+                    <extLst>
+                        <ext uri="{96dac541-7b7a-43d3-8b79-37d633b846f1}">
+                            <renamed:svgBlip rel:embed=" rIdSvg "/>
+                        </ext>
+                    </extLst>
+                </blip>
+            </blipFill>"#,
+        ) {
+            DrawingFill::Blip(fill) => {
+                let blip = fill.blip.expect("blip");
+                assert_eq!(blip.embed.as_ref().map(|id| id.as_str()), Some("rIdPng"));
+                assert_eq!(
+                    blip.svg_embed.as_ref().map(|id| id.as_str()),
+                    Some("rIdSvg")
+                );
+            }
+            other => panic!("expected Blip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blip_fill_ignores_svg_blip_under_unknown_extension_uri() {
+        match parse(
+            r#"<blipFill xmlns:asvg="urn:office-svg">
+                <blip r:embed="rIdPng">
+                    <extLst><ext uri="{NOT-THE-OFFICE-SVG-GUID}">
+                        <asvg:svgBlip r:embed="rIdWrong"/>
+                    </ext></extLst>
+                </blip>
+            </blipFill>"#,
+        ) {
+            DrawingFill::Blip(fill) => {
+                let blip = fill.blip.expect("blip");
+                assert_eq!(blip.embed.as_ref().map(|id| id.as_str()), Some("rIdPng"));
+                assert!(blip.svg_embed.is_none());
+            }
+            other => panic!("expected Blip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blip_fill_uses_first_nonempty_svg_id_from_known_extensions() {
+        match parse(
+            r#"<blipFill xmlns:s="urn:office-svg">
+                <blip>
+                    <extLst>
+                        <ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">
+                            <s:svgBlip r:embed="   "/>
+                            <s:svgBlip r:embed="rIdFirst"/>
+                        </ext>
+                        <ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">
+                            <s:svgBlip r:embed="rIdSecond"/>
+                        </ext>
+                    </extLst>
+                    <extLst>
+                        <ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">
+                            <s:svgBlip r:embed="rIdThird"/>
+                        </ext>
+                    </extLst>
+                </blip>
+            </blipFill>"#,
+        ) {
+            DrawingFill::Blip(fill) => {
+                let blip = fill.blip.expect("blip");
+                assert!(blip.embed.is_none(), "SVG-only pictures remain valid");
+                assert_eq!(
+                    blip.svg_embed.as_ref().map(|id| id.as_str()),
+                    Some("rIdFirst")
+                );
             }
             other => panic!("expected Blip, got {other:?}"),
         }

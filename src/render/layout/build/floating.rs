@@ -211,16 +211,22 @@ pub(super) fn extract_floating_images_in_context(
         let ImagePlacement::Anchor(ref anchor) = img.placement else {
             continue;
         };
-        let Some(rel_id) = crate::render::resolve::images::extract_image_rel_id(img) else {
+        let Some(source) =
+            crate::render::resolve::images::resolve_picture_media(img, &ctx.resolved.media)
+        else {
             continue;
         };
-        let Some(image_data) = ctx.resolved.media.get(rel_id).cloned() else {
-            log::warn!(
-                "anchor image: rel_id={} missing from media table ({} entries)",
-                rel_id.as_str(),
-                ctx.resolved.media.len(),
-            );
-            continue;
+        let image_data = match source.media {
+            Some(image_data) => image_data,
+            None => {
+                log::warn!(
+                    "anchor image: rel_id={} missing from media table ({} entries); \
+                     retaining its authored empty layout carrier",
+                    source.display_rel_id.as_str(),
+                    ctx.resolved.media.len(),
+                );
+                crate::render::resolve::images::MediaEntry::empty_placeholder()
+            }
         };
 
         let w = Pt::from(img.extent.width);
@@ -4490,6 +4496,7 @@ mod tests {
                 dpi: None,
                 blip: Some(Blip {
                     embed: Some(RelId::new("rId7")),
+                    svg_embed: None,
                     link: None,
                     compression: None,
                 }),

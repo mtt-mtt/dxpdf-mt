@@ -227,6 +227,7 @@ mod tests {
             image_data: MediaEntry {
                 data: std::sync::Arc::from([]),
                 format: crate::model::ImageFormat::Png,
+                fallback: None,
             },
             size: PtSize::new(Pt::new(80.0), Pt::new(height)),
             src_rect: None,
@@ -4253,6 +4254,7 @@ mod tests {
                 image_data: crate::render::resolve::images::MediaEntry {
                     data: std::sync::Arc::from(&[][..]),
                     format: crate::model::ImageFormat::Png,
+                    fallback: None,
                 },
                 size: PtSize::new(Pt::new(fw), Pt::new(fh)),
                 src_rect: None,

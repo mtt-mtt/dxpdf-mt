@@ -185,6 +185,14 @@ fn rewrite_blip(blip: &mut Blip, remap: &HashMap<RelId, RelId>) {
     if let Some(new) = blip.embed.as_ref().and_then(|id| remap.get(id)).cloned() {
         blip.embed = Some(new);
     }
+    if let Some(new) = blip
+        .svg_embed
+        .as_ref()
+        .and_then(|id| remap.get(id))
+        .cloned()
+    {
+        blip.svg_embed = Some(new);
+    }
     if let Some(new) = blip.link.as_ref().and_then(|id| remap.get(id)).cloned() {
         blip.link = Some(new);
     }
@@ -315,6 +323,7 @@ mod tests {
                     dpi: None,
                     blip: Some(Blip {
                         embed: Some(RelId::new(rel_id)),
+                        svg_embed: None,
                         link: None,
                         compression: None,
                     }),
@@ -359,6 +368,38 @@ mod tests {
         };
         let new = crate::render::resolve::images::extract_image_rel_id(img).unwrap();
         assert_eq!(new.as_str(), "header3.xml::rId1");
+    }
+
+    #[test]
+    fn rewrites_picture_svg_and_bitmap_rel_ids_independently() {
+        let mut image = picture_with_blip("rIdPng");
+        let Some(GraphicContent::Picture(picture)) = image.graphic.as_mut() else {
+            panic!();
+        };
+        picture.blip_fill.blip.as_mut().unwrap().svg_embed = Some(RelId::new("rIdSvg"));
+        let mut blocks = vec![paragraph_with_image(image)];
+        let remap = HashMap::from([
+            (RelId::new("rIdPng"), RelId::new("header1.xml::rIdPng")),
+            (RelId::new("rIdSvg"), RelId::new("header1.xml::rIdSvg")),
+        ]);
+
+        rewrite_part_rels_in_blocks(&mut blocks, &remap);
+
+        let Block::Paragraph(paragraph) = &blocks[0] else {
+            panic!();
+        };
+        let Inline::Image(image) = &paragraph.content[0] else {
+            panic!();
+        };
+        let Some(GraphicContent::Picture(picture)) = image.graphic.as_ref() else {
+            panic!();
+        };
+        let blip = picture.blip_fill.blip.as_ref().unwrap();
+        assert_eq!(blip.embed.as_ref().unwrap().as_str(), "header1.xml::rIdPng");
+        assert_eq!(
+            blip.svg_embed.as_ref().unwrap().as_str(),
+            "header1.xml::rIdSvg"
+        );
     }
 
     #[test]
@@ -421,6 +462,7 @@ mod tests {
     fn rewrites_blip_link_too() {
         let mut blip = Blip {
             embed: None,
+            svg_embed: None,
             link: Some(RelId::new("rId7")),
             compression: None,
         };
@@ -564,6 +606,7 @@ mod tests {
                 dpi: None,
                 blip: Some(Blip {
                     embed: Some(RelId::new(rel_id)),
+                    svg_embed: None,
                     link: None,
                     compression: None,
                 }),
@@ -664,6 +707,7 @@ mod tests {
                 dpi: None,
                 blip: Some(Blip {
                     embed: Some(RelId::new("rId7")),
+                    svg_embed: None,
                     link: None,
                     compression: None,
                 }),

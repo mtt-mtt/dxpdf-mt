@@ -17,7 +17,7 @@ use crate::render::layout::draw_command::{
     ResolvedLineCap, ResolvedLineJoin, ResolvedStroke,
 };
 use crate::render::resolve::drawing_color::Rgba;
-use crate::render::resolve::images::MediaEntry;
+use crate::render::resolve::images::{FallbackMedia, MediaEntry};
 use crate::render::resolve::shape_geometry::{PathVerb, SubPath};
 use crate::render::skia_conv::{to_color4f, to_line, to_point, to_rect, to_size};
 use crate::render::RenderOptions;
@@ -38,13 +38,25 @@ const POINTS_PER_INCH: f32 = 72.0;
 /// are spec-identical hash alike. `None` marks an uncropped placement.
 type CropKey = Option<(i32, i32, i32, i32)>;
 
-/// Decoded-image cache, keyed by media data-pointer identity, the downsample
-/// target size, **and** the crop baked into the cached bitmap. Two placements
-/// of the same media get distinct entries when they draw at different sizes or
-/// under different `srcRect` crops — each caches its own correctly-scaled,
-/// pre-cropped bitmap, so neither reuses the other's resolution or crop.
-type ImageCacheKey = (*const [u8], i32, i32, CropKey);
+/// Decoded-image cache, keyed by primary/fallback media identity, downsample
+/// target, crop, and the authored frame size used as an SVG logical viewport.
+/// The frame bits matter even when two placements resolve to the same visible
+/// destination: percentage-root SVG geometry depends on the original frame.
+type ImageCacheKey = (
+    *const [u8],
+    Option<*const [u8]>,
+    i32,
+    i32,
+    CropKey,
+    u32,
+    u32,
+);
 type ImageCache = HashMap<ImageCacheKey, skia_safe::Image>;
+
+/// Across one render, bound cached SVG-derived surfaces to 128 MiB of N32
+/// pixels. A placement over this aggregate budget is still painted correctly;
+/// it simply is not retained for later placements.
+const MAX_CACHED_SVG_PIXELS: usize = 32_000_000;
 
 /// Downsample target dimensions (in pixels) for a display rect at `image_dpi`.
 /// Shared by the image cache key and the downsample passes so both agree on the
@@ -207,6 +219,12 @@ struct PaintState {
     /// Decoded Skia images across pages — avoids re-decoding the same bytes on
     /// every page (e.g. a logo repeated in headers/footers). See [`ImageCache`].
     image_cache: ImageCache,
+    /// Composite source keys that failed both primary and one-level fallback.
+    /// Negative caching prevents a malformed SVG repeated in a header from
+    /// reparsing and warning once per page.
+    failed_image_cache: FxHashSet<ImageCacheKey>,
+    /// Pixel count of SVG-primary entries currently retained in `image_cache`.
+    cached_svg_pixels: usize,
     /// Emoji rasterizer — clusters that recur across pages (footer 📞 etc.) are
     /// rasterized once and shared.
     emoji_rasterizer: EmojiRasterizer,
@@ -226,6 +244,8 @@ impl PaintState {
         Self {
             font_cache: fonts::FontCache::new(),
             image_cache: HashMap::new(),
+            failed_image_cache: FxHashSet::default(),
+            cached_svg_pixels: 0,
             emoji_rasterizer: EmojiRasterizer::default(),
             blob_cache: FxHashMap::default(),
             warned: FxHashSet::default(),
@@ -253,6 +273,8 @@ fn render_page(
     let PaintState {
         font_cache,
         image_cache,
+        failed_image_cache,
+        cached_svg_pixels,
         emoji_rasterizer,
         blob_cache,
         warned,
@@ -451,56 +473,80 @@ fn render_page(
                     let (target_w, target_h) = downsample_target(draw_rect, image_dpi);
                     let key = (
                         std::sync::Arc::as_ptr(&image_data.data),
+                        image_data
+                            .fallback
+                            .as_ref()
+                            .map(|fallback| std::sync::Arc::as_ptr(&fallback.data)),
                         target_w,
                         target_h,
                         crop.as_ref().map(quantize_crop),
+                        rect.size.width.raw().to_bits(),
+                        rect.size.height.raw().to_bits(),
                     );
+                    if failed_image_cache.contains(&key) {
+                        continue;
+                    }
                     if let Some(image) = image_cache.get(&key) {
                         // The cached bitmap already has any crop baked in → the
                         // whole bitmap maps to `dst`.
                         canvas.draw_image_rect(image, None, dst, &default_paint);
-                    } else if let Some(decoded) = decode_image(image_data) {
-                        match &crop {
-                            // Bake the visible sub-region into a right-sized
-                            // bitmap so the PDF never carries the cropped-away
-                            // pixels at full resolution (finding 3).
-                            Some(crop) => {
-                                match prepare_cropped(&decoded, crop, draw_rect, image_dpi) {
-                                    Some(image) => {
-                                        canvas.draw_image_rect(&image, None, dst, &default_paint);
-                                        image_cache.insert(key, image);
-                                    }
-                                    // Near-OOM: the raster surface could not be
-                                    // allocated. Fall back to a draw-time crop of
-                                    // the full image — correct pixels, just
-                                    // unoptimized — and leave it uncached (the key
-                                    // implies a baked crop).
-                                    None => {
-                                        let src = src_pixel_rect(&decoded, crop);
-                                        canvas.draw_image_rect(
-                                            &decoded,
-                                            Some((&src, SrcRectConstraint::Strict)),
-                                            dst,
-                                            &default_paint,
-                                        );
-                                    }
+                    } else if let Some(prepared) = prepare_media_entry(
+                        image_data,
+                        *rect,
+                        draw_rect,
+                        crop.as_ref(),
+                        image_dpi,
+                        registry.font_mgr(),
+                    ) {
+                        match prepared {
+                            PreparedImage::Baked(image) => {
+                                canvas.draw_image_rect(&image, None, dst, &default_paint);
+                                let cache = if image_data.format == crate::model::ImageFormat::Svg {
+                                    let pixels =
+                                        usize::try_from(image.width()).ok().and_then(|width| {
+                                            usize::try_from(image.height())
+                                                .ok()
+                                                .and_then(|height| width.checked_mul(height))
+                                        });
+                                    pixels.is_some_and(|pixels| {
+                                        cached_svg_pixels
+                                            .checked_add(pixels)
+                                            .is_some_and(|total| total <= MAX_CACHED_SVG_PIXELS)
+                                            && {
+                                                *cached_svg_pixels += pixels;
+                                                true
+                                            }
+                                    })
+                                } else {
+                                    true
+                                };
+                                if cache {
+                                    image_cache.insert(key, image);
                                 }
                             }
-                            None => {
-                                let image = downsample_if_oversize(decoded, draw_rect, image_dpi);
-                                canvas.draw_image_rect(&image, None, dst, &default_paint);
-                                image_cache.insert(key, image);
+                            PreparedImage::DrawTimeCrop { image, src } => {
+                                // Near-OOM while baking a raster crop: retain
+                                // the old correct draw-time crop and leave the
+                                // placement uncached.
+                                canvas.draw_image_rect(
+                                    &image,
+                                    Some((&src, SrcRectConstraint::Strict)),
+                                    dst,
+                                    &default_paint,
+                                );
                             }
                         }
                     } else {
                         let magic = &image_data.data[..image_data.data.len().min(4)];
                         log::warn!(
-                            "[paint] unsupported image format {:?} — could not decode {} bytes \
-                             (magic: {:02x?}); image will be blank",
+                            "[paint] image source {:?} could not render {} bytes (magic: {:02x?}); \
+                             one-level fallback {:?} also unavailable; image will be blank",
                             image_data.format,
                             image_data.data.len(),
                             magic,
+                            image_data.fallback.as_ref().map(|fallback| fallback.format),
                         );
+                        failed_image_cache.insert(key);
                     }
                 }
             }
@@ -853,12 +899,114 @@ fn paint_effect(
 /// Decode a `MediaEntry` to a Skia image, dispatching on format.
 ///
 /// Returns `None` if the format is unsupported or the data is malformed.
-fn decode_image(entry: &MediaEntry) -> Option<skia_safe::Image> {
+fn decode_image_data(data: &[u8], format: crate::model::ImageFormat) -> Option<skia_safe::Image> {
     use crate::model::ImageFormat;
-    match entry.format {
-        ImageFormat::Emf => crate::render::emf::decode_emf_bitmap(&entry.data),
+    match format {
+        ImageFormat::Svg => None,
+        ImageFormat::Emf => crate::render::emf::decode_emf_bitmap(data),
         // All other formats are handled by Skia's built-in decoder.
-        _ => skia_safe::Image::from_encoded(Data::new_copy(&entry.data)),
+        _ => skia_safe::Image::from_encoded(Data::new_copy(data)),
+    }
+}
+
+enum PreparedImage {
+    /// Crop/downsample already baked; draw the entire image to destination.
+    Baked(skia_safe::Image),
+    /// Raster crop surface allocation failed; crop the decoded image at draw.
+    DrawTimeCrop {
+        image: skia_safe::Image,
+        src: skia_safe::Rect,
+    },
+}
+
+fn prepare_media_entry(
+    entry: &MediaEntry,
+    frame_rect: crate::render::geometry::PtRect,
+    display_rect: crate::render::geometry::PtRect,
+    crop: Option<&crate::render::geometry::PtRect>,
+    image_dpi: f32,
+    font_mgr: &skia_safe::FontMgr,
+) -> Option<PreparedImage> {
+    prepare_image_source(
+        &entry.data,
+        entry.format,
+        frame_rect,
+        display_rect,
+        crop,
+        image_dpi,
+        font_mgr,
+    )
+    .or_else(|| {
+        let fallback = entry.fallback.as_ref()?;
+        prepare_fallback_source(
+            fallback,
+            frame_rect,
+            display_rect,
+            crop,
+            image_dpi,
+            font_mgr,
+        )
+    })
+}
+
+fn prepare_fallback_source(
+    fallback: &FallbackMedia,
+    frame_rect: crate::render::geometry::PtRect,
+    display_rect: crate::render::geometry::PtRect,
+    crop: Option<&crate::render::geometry::PtRect>,
+    image_dpi: f32,
+    font_mgr: &skia_safe::FontMgr,
+) -> Option<PreparedImage> {
+    // This calls the raw source dispatcher exactly once. FallbackMedia cannot
+    // own another fallback, so even an ordinary source whose bytes are also
+    // SVG cannot form a recursive retry chain.
+    prepare_image_source(
+        &fallback.data,
+        fallback.format,
+        frame_rect,
+        display_rect,
+        crop,
+        image_dpi,
+        font_mgr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_image_source(
+    data: &[u8],
+    format: crate::model::ImageFormat,
+    frame_rect: crate::render::geometry::PtRect,
+    display_rect: crate::render::geometry::PtRect,
+    crop: Option<&crate::render::geometry::PtRect>,
+    image_dpi: f32,
+    font_mgr: &skia_safe::FontMgr,
+) -> Option<PreparedImage> {
+    if format == crate::model::ImageFormat::Svg {
+        return crate::render::svg::rasterize_svg(
+            data,
+            frame_rect,
+            display_rect,
+            crop,
+            image_dpi,
+            font_mgr.clone(),
+        )
+        .map(PreparedImage::Baked);
+    }
+
+    let decoded = decode_image_data(data, format)?;
+    match crop {
+        Some(crop) => match prepare_cropped(&decoded, crop, display_rect, image_dpi) {
+            Some(image) => Some(PreparedImage::Baked(image)),
+            None => Some(PreparedImage::DrawTimeCrop {
+                src: src_pixel_rect(&decoded, crop),
+                image: decoded,
+            }),
+        },
+        None => Some(PreparedImage::Baked(downsample_if_oversize(
+            decoded,
+            display_rect,
+            image_dpi,
+        ))),
     }
 }
 
@@ -1292,6 +1440,82 @@ mod tests {
             .to_vec()
     }
 
+    fn baked_image(prepared: PreparedImage) -> skia_safe::Image {
+        match prepared {
+            PreparedImage::Baked(image) => image,
+            PreparedImage::DrawTimeCrop { .. } => panic!("expected a baked image"),
+        }
+    }
+
+    #[test]
+    fn malformed_svg_uses_exactly_one_attached_fallback_source() {
+        use crate::model::ImageFormat;
+
+        let png = std::sync::Arc::<[u8]>::from(textured_png(32).into_boxed_slice());
+        let entry = MediaEntry {
+            data: std::sync::Arc::from(b"<svg><broken".as_slice()),
+            format: ImageFormat::Svg,
+            fallback: Some(FallbackMedia {
+                data: std::sync::Arc::clone(&png),
+                format: ImageFormat::Png,
+            }),
+        };
+        let frame = rect(72.0, 72.0);
+        let via_fallback = baked_image(
+            prepare_media_entry(&entry, frame, frame, None, 72.0, &test_font_mgr())
+                .expect("bitmap fallback"),
+        );
+        let direct = baked_image(
+            prepare_image_source(
+                &png,
+                ImageFormat::Png,
+                frame,
+                frame,
+                None,
+                72.0,
+                &test_font_mgr(),
+            )
+            .expect("direct bitmap"),
+        );
+        let encode = |image: &skia_safe::Image| {
+            image
+                .encode(None, skia_safe::EncodedImageFormat::PNG, None)
+                .expect("encode comparison")
+                .as_bytes()
+                .to_vec()
+        };
+        assert_eq!(encode(&via_fallback), encode(&direct));
+
+        let no_fallback = MediaEntry {
+            fallback: None,
+            ..entry
+        };
+        assert!(
+            prepare_media_entry(&no_fallback, frame, frame, None, 72.0, &test_font_mgr()).is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_svg_source_renders_without_recursive_wrapping() {
+        use crate::model::ImageFormat;
+
+        let entry = MediaEntry {
+            data: std::sync::Arc::from(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+                    <rect width="20" height="10" fill="red"/></svg>"#
+                    .as_slice(),
+            ),
+            format: ImageFormat::Svg,
+            fallback: None,
+        };
+        let frame = rect(72.0, 36.0);
+        let rendered = baked_image(
+            prepare_media_entry(&entry, frame, frame, None, 220.0, &test_font_mgr())
+                .expect("ordinary SVG"),
+        );
+        assert_eq!((rendered.width(), rendered.height()), (220, 110));
+    }
+
     #[test]
     fn render_to_pdf_image_dpi_controls_embedded_resolution() {
         // End-to-end: a large source image drawn small is embedded at the
@@ -1303,6 +1527,7 @@ mod tests {
         let media = MediaEntry {
             data: std::sync::Arc::from(textured_png(1200).into_boxed_slice()),
             format: ImageFormat::Png,
+            fallback: None,
         };
         let page = || LayoutedPage {
             page_background: None,
@@ -1340,6 +1565,7 @@ mod tests {
         let media = MediaEntry {
             data: std::sync::Arc::from(textured_png(1200).into_boxed_slice()),
             format: ImageFormat::Png,
+            fallback: None,
         };
         let page = || LayoutedPage {
             page_background: None,
